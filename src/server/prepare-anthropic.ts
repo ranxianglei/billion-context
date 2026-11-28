@@ -45,7 +45,7 @@ import { isAutoModeClassifier } from "../auto-mode-forge.js";
 import { countSystemAndToolsTokens, emergencyNudgeArmed, emergencyNudgeForConfig, projectThinkingMass } from "./budget.js";
 import { effectiveAbsorbBlock } from "./prepare-responses.js";
 import { effectiveBlockOpsEnabled } from "./prepare-responses.js";
-import { injectSystem, injectTool } from "./inject.js";
+import { injectSystem, injectTool, renderSessionMemoryToc } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgIdPin, applyMsgSeqStamps, applyWireMsgIdPin, validateMsgIds, validateMsgSeqs, validateWireMsgIds, wirePinGroups } from "../msgid-pin.js";
@@ -592,7 +592,7 @@ export async function prepareAnthropic(
             rebuiltMessages = insertBeforeTrailingSystemRun(rebuiltMessages, sysNotes.map((text) => ({ role: "user" as const, content: text })));
         }
 
-        systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers, laneDecisions.compressSurfaceOff, laneDecisions.mcpDialect, detectGenerationBoundary(session, processedMessages, log));
+        systemOut = injectSystem(parsed, opts, prompts, loopConfig, surface, visibilityMarkers, laneDecisions.compressSurfaceOff, laneDecisions.mcpDialect, detectGenerationBoundary(session, processedMessages, log), renderSessionMemoryToc(session, loopConfig, log));
         // #7398 all-lanes (ruling 7439-4/5): the single shared authority
         // seam (egress-lane-io). This lane sits POST-kernel: the swapped
         // core becomes the outbound rebuild and the recorded bytes. Turn 1

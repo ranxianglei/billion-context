@@ -49,7 +49,7 @@ import { runStage0 } from "../snapshot/stage0.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { clampOutgoingOutput, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudgeArmed, emergencyNudgeForConfig } from "./budget.js";
 import { effectiveAbsorbBlock, effectiveBlockOpsEnabled } from "./prepare-responses.js";
-import { injectOpenaiTool, injectTool } from "./inject.js";
+import { injectOpenaiTool, injectTool, renderSessionMemoryToc } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
 import { recordEgressTurn, EgressAuthorityRejectError } from "../storage/egress-record.js";
@@ -719,6 +719,9 @@ export async function prepareOpenai(
         if (acpStandingPushed && detectGenerationBoundary(session, processedMessages, log)) sysParts.push(GENERATION_BOUNDARY_NOTE);
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         if (blockOpsActive) sysParts.push(buildBlockOpsSystemPrompt("function"));
+        // #memory-toc: appended last, same cache-anchor rules as the compress prompt.
+        const memoryToc = renderSessionMemoryToc(session, loopConfig, log);
+        if (memoryToc) sysParts.push(memoryToc);
         openaiOutboundSystem = sysParts.join("\n\n");
         if (!isTitleGen && egressPlaneGateOn() && !(egressArmed && !egressSwapApplied)) {
             const st = getStore().egressOpLogStore();
