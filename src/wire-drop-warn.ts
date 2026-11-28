@@ -10,12 +10,26 @@
 // (stringContent), so parts riding them (assistant-carried
 // images/attachments some clients emit) still vanish. Mid-conversation
 // system/developer messages ride verbatim via the rawOpenaiMessage sidecar
-// since #4166 and no longer belong to the drop class. This detector scans
-// the RAW body for that surviving drop class so the proxy can log a one-time
-// warn instead of staying silent.
+// since #4166 and no longer belong to the drop class. One exception:
+// #6875 carries DSH read_image attachment parts ({type:"image",
+// attachment:{attachmentId}}) on TOOL results through the
+// rawOpenaiContentParts sidecar, so those are preserved, not dropped.
+// This detector scans the RAW body for that surviving drop class so the
+// proxy can log a one-time warn instead of staying silent.
 
 function isObj(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null;
+}
+
+// #6875: mirror of the codec's isDshAttachmentPart (kernel/src/wire/openai.ts)
+// — a {type:"image", attachment:{attachmentId}} part rides the tool-result
+// sidecar instead of being dropped, so the detector must not count it.
+function isDshAttachmentPart(p: Record<string, unknown>): boolean {
+    if (p.type !== "image") return false;
+    const attachment = p.attachment;
+    if (!isObj(attachment)) return false;
+    const id = attachment.attachmentId;
+    return typeof id === "string" && id.length > 0;
 }
 
 interface DroppedOpenaiPartsReport {
@@ -47,6 +61,9 @@ export function droppedOpenaiParts(body: unknown): DroppedOpenaiPartsReport | nu
         if (m.role === "user") continue;
         for (const p of m.content) {
             if (!isObj(p) || DEFAULT_PRESERVED.has(typeof p.type === "string" ? p.type : "<no-type>")) continue;
+            // #6875: a DSH attachment part on a tool result is preserved by
+            // the codec (rawOpenaiContentParts sidecar) — not dropped.
+            if (isDshAttachmentPart(p)) continue;
             count++;
             types.add(typeof p.type === "string" ? p.type : "<no-type>");
             if (firstIndex < 0) firstIndex = i;
