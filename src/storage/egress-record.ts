@@ -70,7 +70,7 @@ export { EGRESS_SYSTEM_MSGID } from "./egress-state.js";
  * machinery is retired — the rid IS the message number (see the module
  * header's NUMBERING paragraph). Kept as an empty marker type only for the
  * import path; nothing reads it any more. */
-export interface EgressRefMap {
+interface EgressRefMap {
     byRaw?: Record<string, string>;
 }
 
