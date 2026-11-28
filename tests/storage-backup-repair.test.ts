@@ -312,6 +312,61 @@ test("repair (no --from): a corrupt WITHOUT ROWID table is reported as loss, not
     }
 });
 
+test("repair (no --from): FK orphans (readable child, lost content parent) are counted as lost, not an abort", { skip: SKIP_NO_ENGINE }, async () => {
+    const dir = tmpDir();
+    try {
+        const dbPath = join(dir, "index.db");
+        const { db } = openSqliteDatabase(dbPath);
+        migrateSchema(db);
+        const now = Date.now();
+        db.prepare("INSERT INTO sessions (session_id, protocol, status, created_at, updated_at, meta_json, stats_json) VALUES (?, ?, 'active', ?, ?, '{}', ?)").run("s-orphan", "openai", now, now, "{}");
+        const insContent = db.prepare("INSERT INTO content (hash, byte_len, refcount, algo, bytes) VALUES (?, ?, 1, 'sha256', ?)");
+        const insMsg = db.prepare("INSERT INTO messages (session_id, seq, msg_id, role, content_hash) VALUES (?, ?, ?, 'user', ?)");
+        const insMedia = db.prepare("INSERT INTO message_media (session_id, seq, media_hash) VALUES (?, ?, ?)");
+        for (let i = 0; i < 40; i++) {
+            const b = Buffer.from(`orphan-test content ${i} — padding padding padding`);
+            insContent.run(`hash-orphan-${i}`, b.length, b);
+            insMsg.run("s-orphan", i, `m-orphan-${i}`, `hash-orphan-${i}`);
+        }
+        for (let i = 0; i < 3; i++) insMedia.run("s-orphan", i, `hash-orphan-${i}`);
+        db.close();
+
+        // Corrupt the content btree root page: the content table becomes
+        // unreadable (skipped), so every messages / message_media row is an
+        // FK orphan (its content parent is gone) while the child rows
+        // themselves are fully readable. Before the fix this aborted the
+        // WHOLE salvage with "FOREIGN KEY constraint failed"; after the fix
+        // the orphans are counted as lost and the salvage completes.
+        const ro = openSqliteDatabase(dbPath);
+        const root = ro.db.prepare("SELECT rootpage FROM sqlite_master WHERE name = 'content'").get() as { rootpage: number };
+        const ps = ro.db.prepare("PRAGMA page_size").get() as { page_size: number };
+        ro.db.close();
+        const buf = readFileSync(dbPath);
+        const off = (root.rootpage - 1) * ps.page_size;
+        for (let i = 0; i < ps.page_size; i++) buf[off + i] ^= 0xff;
+        writeFileSync(dbPath, buf);
+        assert.equal(quickCheckVerdict(dbPath).ok, false, "precondition: the corrupt index must fail quick_check");
+
+        const r = await runStorageRepairCommand({ dir, json: true });
+        assert.ok(!/salvage aborted mid-run/.test(r.text), `FK orphans must not abort the whole salvage (got: ${r.text.slice(0, 200)})`);
+        const data = JSON.parse(r.text) as {
+            mode: string;
+            tables: Array<{ table: string; salvaged: number; lost: number; note?: string }>;
+        };
+        assert.equal(data.mode, "salvage", "a completed salvage, not an abort");
+        const content = data.tables.find((t) => t.table === "content");
+        assert.ok(content && content.salvaged === 0, `the corrupt content table salvages nothing (${JSON.stringify(content)})`);
+        const msgs = data.tables.find((t) => t.table === "messages");
+        assert.ok(msgs && msgs.salvaged === 0 && msgs.lost === 40, `every messages row is an FK orphan — counted as lost, not an abort (${JSON.stringify(msgs)})`);
+        const media = data.tables.find((t) => t.table === "message_media");
+        assert.ok(media && media.salvaged === 0 && media.lost === 3, `WITHOUT ROWID orphans counted as lost, not a skipped table (${JSON.stringify(media)})`);
+        assert.equal(media.note, undefined, "a processed (lossy) WITHOUT ROWID table must not carry a skipped note");
+        assert.equal(quickCheckVerdict(dbPath).ok, true, "the salvaged db self-verifies before it counts");
+    } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
 test("repair refuses while another live process holds index.db.lock", { skip: SKIP_NO_ENGINE }, async () => {
     const dir = tmpDir();
     try {
