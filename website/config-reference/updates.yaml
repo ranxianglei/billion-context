@@ -75,12 +75,12 @@ entries:
     desc_ja: "#3619 スタグダードロールアウト: このマシンのベースアップグレード遅延ウィンドウの下限; ms 数値または期間文字列 (15m / 2d / 1d12h); 0 で遅延を無効化 (従来の即時実行)。リモートポリシーのデフォルトウィンドウとバージョン別の上書きがこれに重ねて適用される。"
   - key: update.staggerMaxDelayMs
     type: "number | string"
-    default: "172800000 (built-in 48 h)"
+    default: "604800000 (built-in 7 days)"
     env: BILI_UPDATE_STAGGER_MAX_MS
     group: updates
-    desc_en: "#3619 staggered rollout: upper bound of this machine's base upgrade-delay window; ms number or duration string (48h / 2d); together with min 0 restores legacy immediate upgrades."
-    desc_zh: "#3619 错峰升级：本机基础升级延迟窗口上限；毫秒数字或时长字符串（48h / 2d）；与 min=0 一起恢复立即升级。"
-    desc_ja: "#3619 スタグダードロールアウト: このマシンのベースアップグレード遅延ウィンドウの上限; ms 数値または期間文字列 (48h / 2d); min とともに 0 に設定すると従来の即時アップグレードに戻る。"
+    desc_en: "#3619 staggered rollout: upper bound of this machine's base upgrade-delay window; ms number or duration string (7d / 168h); together with min 0 restores legacy immediate upgrades."
+    desc_zh: "#3619 错峰升级：本机基础升级延迟窗口上限；毫秒数字或时长字符串（7d / 168h）；与 min=0 一起恢复立即升级。"
+    desc_ja: "#3619 スタグダードロールアウト: このマシンのベースアップグレード遅延ウィンドウの上限; ms 数値または期間文字列 (7d / 168h); min とともに 0 に設定すると従来の即時アップグレードに戻る。"
   - key: update.policyUrl
     type: string
     default: "official repo raw URL"

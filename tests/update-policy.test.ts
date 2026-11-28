@@ -3,7 +3,7 @@
  *
  * Coverage map (issue acceptance boxes):
  *  ① draw uniformity (fixed random source) + persistence no-re-roll  — §D, §H1
- *  ② default window 15min..48h, local config/env override            — §C
+ *  ② default window 15min..7d, local config/env override            — §C
  *  ③ remote policy fetch: ETag cache, 304, failure fallback          — §E
  *  ④ overrides by version/range; hold/blocked/pinned each tested     — §C, §G, §H
  *  ⑤ security: file cannot induce arbitrary version/URL installs     — §A5, §G, §H6
@@ -235,12 +235,12 @@ test("parseSemverRange: garbage is unparseable; prereleases need same-tuple tags
 // C. stagger window composition (acceptance ②)
 // ---------------------------------------------------------------------------
 
-test("resolveStaggerWindow: built-in default is 15min..48h with no policy/local", () => {
+test("resolveStaggerWindow: built-in default is 15min..7d with no policy/local", () => {
     const w = resolveStaggerWindow("0.1.200", undefined);
     assert.equal(w.minMs, STAGGER_MIN_DELAY_DEFAULT_MS);
     assert.equal(w.maxMs, STAGGER_MAX_DELAY_DEFAULT_MS);
     assert.equal(STAGGER_MIN_DELAY_DEFAULT_MS, 15 * MIN);
-    assert.equal(STAGGER_MAX_DELAY_DEFAULT_MS, 48 * 3_600_000);
+    assert.equal(STAGGER_MAX_DELAY_DEFAULT_MS, 7 * 86_400_000);
 });
 
 test("resolveStaggerWindow: remote default applies; local override replaces the base", () => {
@@ -273,7 +273,7 @@ test("resolveStaggerWindow: overrides stack on top; exact version beats range; f
         overrides: [{ version: "0.1.201", minDelay: 12 * MIN }],
     })).doc!;
     assert.deepEqual(resolveStaggerWindow("0.1.201", oneSided), { minMs: 12 * MIN, maxMs: 20 * MIN });
-    // one-sided override crossing the inherited base (15min..48h + max 1min)
+    // one-sided override crossing the inherited base (15min..7d + max 1min)
     // collapses to the operator's tighter bound instead of being dropped
     const crossed = normalizePolicyDoc(doc({
         overrides: [{ version: "0.1.202", maxDelay: MIN }],
@@ -925,7 +925,7 @@ test("H6: security boundary — the policy file cannot steer installs to foreign
 
 test("H7: unreachable policy source fails open to local defaults (stagger still applies)", async () => {
     await withPolicyScenario("fail-open on policy outage", { policyFail: true }, async (mod, harness) => {
-        // drop the narrow local window so the built-in 15min..48h defaults apply
+        // drop the narrow local window so the built-in 15min..7d defaults apply
         delete process.env.BILI_UPDATE_STAGGER_MIN_MS;
         delete process.env.BILI_UPDATE_STAGGER_MAX_MS;
         await runCheck(mod, harness, false);
