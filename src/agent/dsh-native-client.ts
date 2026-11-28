@@ -56,8 +56,14 @@ import { createElement, useEffect, useLayoutEffect, useRef, useState } from "rea
 
 type Dict = Record<string, string>;
 
+// #5274: every slot `label` must be a plain STRING resolved at registration,
+// never a function — the dsh host measures tab width by iterating the label's
+// glyphs (labelNeedsTooltip's `for (const glyph of label)`), so a function
+// throws "label is not iterable" and the slot error boundary blanks the whole
+// conversation.session.header subtree. Resolve lazily inside the inject callback
+// (host calls it after locale dicts are registered) but hand back a string.
 type SlotOptions =
-    | { name: string; id: string; order: number; label: () => string; locale: string }
+    | { name: string; id: string; order: number; label: string; locale: string }
     | { name: string; key: string; locale: string };
 
 type ClientContext = {
@@ -1143,7 +1149,7 @@ export function apply(ctx: ClientContext): void {
     };
     ctx.slots.inject(
         "settings.section",
-        () => ctx.slots.register({ name: "settings.section", id: "bili", order: 100, label: () => t("nav"), locale: NS }, panel(true)),
+        () => ctx.slots.register({ name: "settings.section", id: "bili", order: 100, label: t("nav"), locale: NS }, panel(true)),
     );
     ctx.slots.inject(
         "plugins.bundle.config",
@@ -1162,7 +1168,7 @@ export function apply(ctx: ClientContext): void {
     if (!ctxGate.hidden) {
         ctx.slots.inject(
             "conversation.view",
-            () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: () => ctxGate.label ?? t("tab_ctx"), locale: NS }, contextPanel()),
+            () => ctx.slots.register({ name: "conversation.view", id: "bili-context", order: 30, label: ctxGate.label ?? t("tab_ctx"), locale: NS }, contextPanel()),
         );
     }
     // #4254 defect ②: frame-level upstream-unavailable pill. Deferred injection
@@ -1170,6 +1176,6 @@ export function apply(ctx: ClientContext): void {
     // discipline as the session Context tab above).
     ctx.slots.inject(
         "shell.overlay",
-        () => ctx.slots.register({ name: "shell.overlay", id: "bili-upstreams", order: 100, label: () => t("upstreams_label"), locale: NS }, upstreamBanner()),
+        () => ctx.slots.register({ name: "shell.overlay", id: "bili-upstreams", order: 100, label: t("upstreams_label"), locale: NS }, upstreamBanner()),
     );
 }
