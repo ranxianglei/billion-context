@@ -85,7 +85,8 @@ export function noteKnownAttachmentIds(sessionId: string | undefined, text: stri
 /** Response side: warn once per unique identifier that appears in this turn's
  *  model output but nowhere in the session's request history. Each warned id
  *  joins the known set at warn time, so repeats within the same output or in
- *  later turns do not re-warn. */
+ *  later turns do not re-warn. At the session cap, stop admitting and warning
+ *  about new ids, matching request-side admission. */
 export function scanModelOutputForPhantomAttachments(sessionId: string | undefined, text: string): void {
     if (!sessionId || text.length === 0) return;
     const found = new Set<string>();
@@ -94,6 +95,7 @@ export function scanModelOutputForPhantomAttachments(sessionId: string | undefin
     const l = ledgerFor(sessionId);
     const phantoms: string[] = [];
     for (const id of found) {
+        if (l.known.size >= MAX_IDS_PER_SESSION) break;
         if (l.known.has(id)) continue;
         l.known.add(id);
         phantoms.push(id);
