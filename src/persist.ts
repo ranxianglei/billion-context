@@ -37,7 +37,7 @@ import { markDirty } from "./session.js";
 import { validCostUsd } from "./billing.js";
 import { mergeState } from "./state-hydration.js";
 import { restampRefsToLedger, restampContentStore } from "acp-kernel";
-import { LazyBlockContents, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
+import { LazyBlockContents, invalidateResidentWeight, isDroppedContentStore, isDroppedMetadata, lazyContentStore, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, hadIntegrityQuickCheckFailure, type StorageMode } from "./storage/shadow.js";
 import { noteColdLoad } from "./attach-heartbeat.js";
@@ -3959,6 +3959,7 @@ export class SessionStore {
         if (!raw || raw.length === 0) return;
         session.lastMessages = boundedFoldedSnapshot(session);
         session.lastMessagesFolded = true;
+        invalidateResidentWeight(session);
     }
 
     /** #5506: the EXACT metadata shape buildRecord persists ({...live,
@@ -4028,6 +4029,7 @@ export class SessionStore {
         session.metadata = lazyMetadata(session.id, { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin }, (id, m) => {
             return this.loadResidentFields(id, m, { metadata: true })?.metadata ?? null;
         });
+        invalidateResidentWeight(session);
     }
 
     /** #3050 R3 ②b: after a successful save, an idle session's block
@@ -4042,6 +4044,7 @@ export class SessionStore {
         const existing = session.blockContents;
         if (existing instanceof LazyBlockContents) {
             existing.drop();
+            invalidateResidentWeight(session);
             return;
         }
         if (existing.size === 0) return;
@@ -4051,6 +4054,7 @@ export class SessionStore {
         });
         lazy.drop();
         session.blockContents = lazy;
+        invalidateResidentWeight(session);
     }
 
     /** #4788 phase 2 (owner decision 2026-10-31, discussion #3916-E): the CCR
@@ -4087,6 +4091,7 @@ export class SessionStore {
         session.contentStore = lazyContentStore(session.id, (id) =>
             this.unifiedCcrFor(id)
             ?? this.contentStoreById(id, { protocol: meta?.protocol, upstreamOrigin: meta?.upstreamOrigin }));
+        invalidateResidentWeight(session);
     }
 
     /** #4788 phase 2, landing proof for dropResidentContentStore: mirrors the
