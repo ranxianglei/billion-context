@@ -21,7 +21,7 @@ import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, s
 import { configDir, defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
 import { clearPinAction, installVersionAction, pinCurrentAction, triggerManualCheck, updateActionsAvailable, updateStateSnapshot } from "./update-actions.js";
-import { getUnrecognizedPathStats } from "./observability.js";
+import { getRefusedForeignPathStats, getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { r3FaultTracker } from "../snapshot/plane.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
@@ -1436,7 +1436,7 @@ function sendStats(res: http.ServerResponse): void {
         };
     });
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), conflicts: summarizeConflicts(all) }, null, 2));
+    res.end(JSON.stringify({ sessions, blindTunnels: getBlindTunnelStats(), unrecognizedPaths: getUnrecognizedPathStats(), refusedForeignPaths: getRefusedForeignPathStats(), conflicts: summarizeConflicts(all) }, null, 2));
 }
 
 /** #2152: the `advisory` field exposed by BOTH /__bili/status and /__bili/overview —
