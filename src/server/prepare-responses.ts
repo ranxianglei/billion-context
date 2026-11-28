@@ -407,7 +407,9 @@ export async function prepareResponses(
                     if (dshHit) {
                         // #3733: our own <bili-snapshot v1 …/> tag = authored checkpoint.
                         if (dshAuthored) session.metadata.dshAuthoredCheckpointLanded = true;
-                        recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
+                        recordConflict(session, "native-compaction", dshAuthored
+                            ? `bili authored checkpoint (intercepted, answered locally): ${missing}/${localGap.expected} covered id(s) replaced by the bili snapshot; ACP state rebased (#3733)`
+                            : `dsh native compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
                         log(dshAuthored ? "info" : "warn", `[${sessionId}] dsh ${dshAuthored ? "AUTHORED checkpoint landed" : "native compaction detected"} (${localGap.matched}/${localGap.expected} covered id(s) retained, checkpoint framing in resent history) — ${dshAuthored ? "rebasing ACP state onto the authored bili-snapshot checkpoint (#3733)" : "rebasing ACP state onto the compacted history (#2432)"}`);
                     } else {
                         recordConflict(session, "native-compaction", `codex local auto-compaction: ${missing}/${localGap.expected} covered id(s) replaced by the compacted history; rebasing ACP state (#2372)`);

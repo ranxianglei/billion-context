@@ -460,7 +460,9 @@ export async function prepareOpenai(
                     // as a foreign one, but recorded + logged as the intended event.
                     const authored = carriesBiliSnapshotCheckpoint(msgs, knownRefsBefore);
                     if (authored) session.metadata.dshAuthoredCheckpointLanded = true;
-                    recordConflict(session, "native-compaction", `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
+                    recordConflict(session, "native-compaction", authored
+                        ? `bili authored checkpoint (intercepted, answered locally): ${missing}/${dshGap.expected} covered id(s) replaced by the bili snapshot; ACP state rebased (#3733)`
+                        : `dsh native compaction: ${missing}/${dshGap.expected} covered id(s) replaced by the compacted history; ACP state rebased (#2432)`);
                     log(authored ? "info" : "warn", `[${sessionId}] dsh ${authored ? "AUTHORED checkpoint landed" : "native compaction detected"} (${dshGap.matched}/${dshGap.expected} covered id(s) retained, checkpoint framing in resent history) — ${authored ? "rebasing ACP state onto the authored bili-snapshot checkpoint (#3733)" : "rebasing ACP state onto the compacted history (#2432)"}`);
                     markNativeCompactionBoundary(session);
                     dshRebased = reconcileNativeCompactionBoundary(session);

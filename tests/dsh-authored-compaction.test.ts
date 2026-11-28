@@ -444,6 +444,14 @@ test("e2e: landed checkpoint is recognized on replay — rebase + authored-lande
         assert.equal(r.status, 200, r.body);
         const s = h.sessionOf("s-land")!;
         assert.equal(s.metadata["dshAuthoredCheckpointLanded"], true, "authored landing recognized");
+        // #6817: the ledger detail must name bili's own authored checkpoint — not
+        // "dsh native compaction" — so the web UI / acp_status don't read an
+        // intended, intercepted landing as a foreign one that slipped past.
+        const events = s.metadata["conflictEvents"] as Array<{ kind: string; detail: string }> | undefined;
+        const landing = events?.find((e) => e.kind === "native-compaction");
+        assert.ok(landing, "a native-compaction ledger event was recorded");
+        assert.ok(landing!.detail.startsWith("bili authored checkpoint (intercepted, answered locally):"), `authored landing detail names the bili snapshot, got: ${landing!.detail}`);
+        assert.ok(!landing!.detail.includes("dsh native compaction"), "authored landing detail must not say 'dsh native compaction'");
     });
 });
 
