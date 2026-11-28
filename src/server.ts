@@ -710,6 +710,10 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         mitmDomains: opts.mitm.enabled ? [...opts.mitm.domains] : [],
         modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
         modelMaxOutputs: { ...LAUNCHER_MODEL_MAX_OUTPUTS },
+        // #7878: store identity joins the shape — a same-build same-lane holder
+        // serving a DIFFERENT sessions dir is a drift (ladder off, coexist),
+        // not a twin (yield/adopt would write our sessions into its store).
+        sessionsDir: sessionsDir(),
     };
     // #4762: arm the event-loop wedge detector as EARLY as startServer runs —
     // startup phases (twin probes, engine/storage init, hydrate) carry their

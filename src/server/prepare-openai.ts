@@ -63,7 +63,7 @@ interface EgressRecordSourceMsg {
     text?: unknown;
 }
 import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
-import { resolveEgressAuthority, egressAuthorityArmed, egressBlockLedgerFor, stampEgressSeqs } from "./egress-lane-io.js";
+import { resolveEgressAuthority, egressAuthorityArmed, egressBlockLedgerFor, buildEgressIdentityInput, stampEgressSeqs } from "./egress-lane-io.js";
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
@@ -613,6 +613,20 @@ export async function prepareOpenai(
         if (!session.meta.title || isAutoInjectedNotification(session.meta.title) || isSubagentPrompt(session.meta.title)) {
             const t = deriveTitle(msgs);
             if (t) session.meta.title = t;
+        }
+        // #B3: resolveEgressAuthority (above) upserted the egress identity row
+        // BEFORE this derived-title block, so a fresh session's turn-1 title
+        // was stored as null and only landed on the next turn (the upsert runs
+        // per turn; a single-turn egress-on session then listed with a NULL
+        // title). Re-upsert now that session.meta.title is set. egressArmed
+        // excludes title-gen side requests, so this is a no-op there.
+        if (egressArmed && session.meta.title) {
+            try {
+                const st = getStore().egressOpLogStore();
+                st?.ensureEgressIdentity?.(buildEgressIdentityInput(session));
+            } catch (err) {
+                log("warn", `[${sessionId}] egress: turn-1 title re-upsert failed (best-effort): ${String((err as { message?: unknown })?.message ?? err).slice(0, 200)}`);
+            }
         }
         log("info", diagTagSummary(turn.messages, sessionId, renderStrategy));
         // #3004: a tier-1 arm that would route through the model-decided gate.

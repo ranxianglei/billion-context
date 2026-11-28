@@ -37,7 +37,9 @@
 import type { BiliMessage } from "acp-kernel/wire";
 import { getStore } from "../persist.js";
 import { featureEnabled } from "../rollout.js";
-import { applyMsgIdPin, applyWireMsgIdPin, SIBMARK, renderCoreId, validateMsgIds, validateWireMsgIds, wireElementIds, wirePinGroups } from "../msgid-pin.js";
+import { applyMsgIdPin, applyWireMsgIdPin, SIBMARK, elementOfCore, renderCoreId, validateMsgIds, validateWireMsgIds, wireElementIds, wirePinGroups } from "../msgid-pin.js";
+import { egressPlaneGateOn } from "../knobs.js";
+import { EGRESS_SYSTEM_MSGID } from "../storage/egress-state.js";
 import { checkR3Identity, FoundationRejectError, r3FaultTracker } from "./plane.js";
 
 export interface Stage0Input {
@@ -392,6 +394,17 @@ export function tryIncrementalPin(
             return null; // a store fault degrades — never a 500 on the pin path
         }
     }
+    // #B2: egress-on sessions (the op-log ledger, element-granular under Path A)
+    // take the ID-anchored, never-null pin instead of the positional tail-align
+    // below — the positional model deadlocks post-fold (the client's full list
+    // outruns the folded view, L > T, and the fold-summary row sits in the
+    // ledger while the client can never echo it, so the overlap drifts on every
+    // fold and the pin degrades to null forever → new rows record as h_). See
+    // tryEgressPin. Non-egress sessions keep the positional contract below (its
+    // null-degrade expectations are pinned by tests/issue5874-2x2-p3 I2/I3).
+    if (isEgressPinLedger(sessionId)) {
+        return tryEgressPin(sessionId, lane, msgs, tailIds, log, liveIds);
+    }
     // #7439 follow-up (Part 2): the ledger is CORE-granular (a multi-core
     // wire element carries derived `#pN` ids on its siblings) while the host
     // tail list is WIRE-ELEMENT-granular — the old per-core math drifted on
@@ -476,7 +489,19 @@ export function tryIncrementalPin(
         }
     }
     const out: BiliMessage[] = new Array(msgs.length);
-    for (let i = 0; i < C0; i++) out[i]! = { ...msgs[i]!, id: liveIds[i]! };
+    // #7836 Path A: the egress ledger stores a message's parts under ONE
+    // element msgid ("no #pN in the log") while the kernel keeps per-core
+    // uniqueness (compression/CCR need per-core ids). A run of consecutive
+    // identical ledger rows is one split element — re-derive the parts' ids
+    // with the SAME renderCoreId scheme as applyWireMsgIdPin and the
+    // new-core loop below. Legacy ledgers never repeat an id → the restamp
+    // is byte-identical to the old positional copy.
+    let partRun = 0;
+    for (let i = 0; i < C0; i++) {
+        const id = liveIds[i]!;
+        partRun = i > 0 && liveIds[i - 1] === id ? partRun + 1 : 0;
+        out[i]! = { ...msgs[i]!, id: partRun === 0 ? id : renderCoreId(id, partRun) };
+    }
     let slot = 0;
     let sibling = 0;
     let leaderId = "";
@@ -500,6 +525,153 @@ export function tryIncrementalPin(
             slot += 1;
             leaderId = t === "?" ? m.id : renderCoreId(t, 0);
             out[i]! = t === "?" ? { ...m } : { ...m, id: leaderId };
+        }
+    }
+    return out;
+}
+
+// #B2: true when this sid's pin ledger is the egress op-log (the plane is on
+// for this install AND the materialized live view is populated) — mirrors the
+// source pick in store.snapPinLiveIds, so the branch agrees with which ledger
+// the caller already read. An empty/corrupt view falls back to the legacy
+// (messages) ledger = the positional path above, exactly as pre-#B2.
+function isEgressPinLedger(sessionId: string): boolean {
+    if (!egressPlaneGateOn()) return false;
+    try {
+        // Non-empty AFTER dropping the system row — a system-only view means
+        // snapPinLiveIds reads the empty (messages) ledger, so stay legacy.
+        return (getStore()?.egressOpLogStore()?.egressStateView(sessionId) ?? []).some((r) => r.msgid !== EGRESS_SYSTEM_MSGID);
+    } catch {
+        return false; // corrupt view → the legacy messages ledger is in play
+    }
+}
+
+// #B2: the egress-branch pin — ID-anchored, element-granular, and NEVER null.
+// egress = server authority, so an unsatisfiable claim re-anchors (the next
+// recordEgressTurn diff rebuilds the ledger under the host ids); it is not a
+// 400 (the R3 400 stays on the separate full-form validateMsgIds path). Every
+// incoming shape is one classification:
+//   · ANCHORED — the client's list shares a consistent uniform offset d with
+//     the ledger (a matched id at list index j sits at ledger rank p, d = j-p;
+//     every matched must agree). View element k ↔ ledger element at rank k-d,
+//     restamped with the ledger's canonical host id; ranks past the ledger are
+//     fresh increments (the client's id for that view element, 1:1 by index).
+//   · REANCHOR_NOW — zero matched (an h_-poisoned ledger, a restart, a
+//     rolled-back host): every declared id is a fresh increment stamped 1:1 by
+//     view index; the #7851 occurrence-aware flow diff (−old / +new) rebuilds
+//     the ledger, so the turn after that anchors for real.
+// The fold-summary row OCCUPIES a ledger rank (the client's "?" slot does too —
+// that is what keeps the offset uniform) but is excluded from identity
+// matching (validateIdEntries rejects the reserved prefix, so the client can
+// never echo it); the corresponding view element keeps its content-derived id.
+// The id-set reconciliation (snapStage0 egress-on is pure id-set algebra;
+// diffEgressView #7851 is occurrence-aware) is what makes the pin's single job
+// — "no h_ re-enters the ledger" — sufficient: a residual mis-stamp heals on
+// the next turn's diff, it is never a hard failure.
+function tryEgressPin(
+    sessionId: string,
+    lane: string,
+    msgs: BiliMessage[],
+    tailIds: string[],
+    log: (level: string, msg: string) => void,
+    liveIds: string[],
+): BiliMessage[] {
+    // The fold-summary reserved prefix (msgid-pin keeps its own unexported copy).
+    const SUMMARY_PREFIX = "acp_summary_";
+    const valid = (id: unknown): id is string =>
+        typeof id === "string" && id.length > 0 && id.length <= 512 &&
+        id !== "?" &&
+        !id.startsWith(SUMMARY_PREFIX) && !id.startsWith(SIBMARK) &&
+        !/[\s\p{C}]/u.test(id);
+
+    // 1. Ledger element sequence: first-seen, consecutive-deduped (Path A
+    //    shares one msgid across a split element's part-rows). A fold-summary
+    //    occupies a rank but is out of identity matching.
+    const ledgerEls: string[] = [];
+    const elRank = new Map<string, number>();
+    const elHostId = new Map<string, string>();
+    for (const id of liveIds) {
+        const { element, ordinal } = elementOfCore(id);
+        if (ordinal !== 0) continue; // a #pN sibling — the head row carries the element
+        if (ledgerEls[ledgerEls.length - 1] === element) continue; // consecutive part-row dedupe
+        ledgerEls.push(element);
+        if (!element.startsWith(SUMMARY_PREFIX)) {
+            elRank.set(element, ledgerEls.length - 1);
+            if (!elHostId.has(element)) elHostId.set(element, id);
+        }
+    }
+
+    // 2. Elementize the view: a wire group (shared wireIndex) is one element,
+    //    its cores in order (head + #pN siblings); a lone core is its own element.
+    const groups = wirePinGroups(msgs);
+    const viewEls: { cores: number[]; summary: boolean }[] = [];
+    if (groups) {
+        const wires = [...groups.groups.keys()].sort((a, b) => a - b);
+        for (const w of wires) {
+            const cores = groups.groups.get(w)!;
+            viewEls.push({ cores, summary: msgs[cores[0]!]!.id.startsWith(SUMMARY_PREFIX) });
+        }
+    } else {
+        for (let i = 0; i < msgs.length; i++) viewEls.push({ cores: [i], summary: msgs[i]!.id.startsWith(SUMMARY_PREFIX) });
+    }
+
+    // 3. Classify the client's list against the ledger.
+    const matched: { j: number; p: number }[] = [];
+    for (let j = 0; j < tailIds.length; j++) {
+        const id = tailIds[j]!;
+        if (!valid(id)) continue;
+        const { element } = elementOfCore(id);
+        if (element.startsWith(SUMMARY_PREFIX)) continue;
+        const p = elRank.get(element);
+        if (p !== undefined) matched.push({ j, p });
+    }
+
+    // 4. The uniform offset d; an inconsistent match set (a rewritten /
+    //    rolled-back host) falls through to REANCHOR_NOW — never null.
+    let d = 0;
+    let anchored = false;
+    if (matched.length > 0) {
+        d = matched[0]!.j - matched[0]!.p;
+        if (matched.every((m) => m.j - m.p === d)) {
+            anchored = true;
+        } else {
+            log("info", `[${sessionId}] [2x2:${lane}] egress pin: inconsistent client/ledger offset (matched=${matched.length}) — reanchor now`);
+        }
+    }
+    if (!anchored) {
+        log("debug", `[${sessionId}] [2x2:${lane}] egress pin: no consistent overlap (list=${tailIds.length}, view=${viewEls.length}, ledger=${ledgerEls.length}) — reanchor now (append-all)`);
+    }
+
+    // 5. Pick each view element's id. The view mirrors the ledger's element
+    //    sequence (view element k ↔ ledgerEls[k] — a fold keeps its rank, so a
+    //    summary view element lands on the summary ledger rank → content-
+    //    derived). When the overlap anchors, the aligned prefix takes the
+    //    ledger's CANONICAL host id (server authority). The client's list
+    //    covers [anchor..end] (tail form, d<0) or [0..end] (full form, d=0),
+    //    so the list slot for view element k is k+d — used for fresh
+    //    increments past the ledger, and (when nothing anchors) for the whole
+    //    view under REANCHOR_NOW, where it REPLACES the ledger's (possibly
+    //    h_-poisoned) ids; the #7851 occurrence-aware diff then rebuilds the
+    //    ledger under the host ids. L > view surplus trailing ids are simply
+    //    unused — the diff prunes them.
+    const idFor = (k: number): string | undefined => {
+        const el = viewEls[k]!;
+        if (el.summary) return undefined; // fold summary keeps its content-derived id
+        if (anchored && k < ledgerEls.length) {
+            return elHostId.get(ledgerEls[k]!) ?? undefined; // fold-summary rank → content-derived
+        }
+        // REANCHOR_NOW (no overlap) or a fresh increment past the ledger.
+        const t = tailIds[k + d];
+        return t !== undefined && valid(t) ? elementOfCore(t).element : undefined;
+    };
+
+    const out: BiliMessage[] = new Array(msgs.length);
+    for (let k = 0; k < viewEls.length; k++) {
+        const el = viewEls[k]!;
+        const id = idFor(k);
+        for (let ord = 0; ord < el.cores.length; ord++) {
+            const ci = el.cores[ord]!;
+            out[ci]! = id !== undefined ? { ...msgs[ci]!, id: renderCoreId(id, ord) } : msgs[ci]!;
         }
     }
     return out;

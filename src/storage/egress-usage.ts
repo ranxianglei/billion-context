@@ -166,16 +166,19 @@ export function writeUsageStats(db: SqliteDatabase, sessionId: string, json: str
 }
 
 /** Best-effort write for the hot path (settlement): the stream already
- *  holds the truth — a stats-row failure must not kill the request, it
- *  warns once per process. */
-let statsWarned = false;
+ *  holds the truth — a stats-row failure must not kill the request. Warns
+ *  once PER SESSION (a stuck session is the unit that matters; a global
+ *  once-flag would silence every later session behind the first failure). */
+const statsWarned = new Set<string>();
+const STATS_WARNED_CAP = 4096;
 export function writeUsageStatsBestEffort(db: SqliteDatabase, sessionId: string, json: string, log: (msg: string) => void): boolean {
   try {
     writeUsageStats(db, sessionId, json);
     return true;
   } catch (err) {
-    if (!statsWarned) {
-      statsWarned = true;
+    if (!statsWarned.has(sessionId)) {
+      if (statsWarned.size >= STATS_WARNED_CAP) statsWarned.clear();
+      statsWarned.add(sessionId);
       log(`[storage] egress usage stats row for session=${sessionId} not written (${err instanceof Error ? err.message : String(err)}) — the egress_usage stream keeps the truth; the stats row stays stale until a successful write`);
     }
     return false;

@@ -682,7 +682,7 @@ test("C5: a latched record-only turn still refreshes the identity row (title lan
         assert.equal(row.title, null, "title not derived yet on turn 1");
         assert.equal(JSON.parse(row.metadata_json).egressAuthority, true, "the latch PERSISTS in the row (load restores it from metadata_json)");
         // The turn-1 record (what recordAuthorityTurn appends for the lane).
-        store.egressAppendTurn(sid, [{ type: "I", msgid: "m1", after: null, ref: "m00001", tokens: 5, typeTag: "text", bytes: "hello" }], 0, Date.now());
+        store.egressAppendTurn(sid, [{ type: "I", rid: 1, msgid: "m1", after: null, ref: "m00001", tokens: 5, typeTag: "text", bytes: "hello" }], 0, Date.now());
         // Turn 2 — the pin FAILED this turn (host declared no ids): the lane
         // calls the seam with armed=false. The record-only path must STILL
         // refresh the identity row (meta.title now carries the lane's

@@ -65,7 +65,7 @@ test("#7574 a library interrupted between the two egress tables completes on its
         assert.ok(names.includes("egress_flow"), "the missing egress_flow is created");
         const idx = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_egress_state_msgid', 'idx_egress_flow_msgid') ORDER BY name").all() as unknown as { name: string }[])
             .map((r) => r.name);
-        assert.deepEqual(idx, ["idx_egress_flow_msgid"], "only the flow index of the group exists (7773: the state PK covers msgid lookups)");
+        assert.deepEqual(idx, ["idx_egress_flow_msgid", "idx_egress_state_msgid"], "both msgid lookup indexes exist (PK is now (session_id, rid) — 2026-11-27 owner ruling)");
         assert.ok(
             (db.prepare("SELECT COUNT(*) AS n FROM pragma_table_info('egress_state') WHERE name = 'pos'").get() as { n: number }).n === 1,
             "the rebuilt state table carries the 7773 materialized shape (pos column)",
