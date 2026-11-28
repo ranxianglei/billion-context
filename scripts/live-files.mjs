@@ -172,6 +172,10 @@ export const LIVE_FILES = [
     // mkdtemp-isolated per test, so the zone band is irrelevant; the entry is
     // for the tripwire, like #5046/#4612.
     "tests/storage-backup-repair.test.ts",
+    // #5449: spawns one bare `node -e` child purely as a live/dead PID fixture
+    // (like #5046/B's) plus in-process eval workers (like #4762's); binds no
+    // ports — the entry is for the SPAWN_RE tripwire alone
+    "tests/issue5449-offloop-owner-reap.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
