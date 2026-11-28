@@ -2638,7 +2638,13 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                     degenerateRetryCfg?.maxAttempts,
                 );
             } else {
-                await pipeThrough(toClient, res);
+                // #5175: the non-SSE twin of the strip pipe above. A native
+                // compaction that answers as plain JSON hands its whole text
+                // field back verbatim, and a compaction turn's context is by
+                // definition tag-laden — the model's echoed drift residue is
+                // the likeliest leak here. Same pipe as the JSON egress in the
+                // proxy branch below; no session, so usage accounting stays off.
+                await pipePluginJson(toClient, res, undefined, prepared.protocol, undefined, undefined, undefined, reply);
             }
             const terminal = await observed;
             if (terminal === "completed") {

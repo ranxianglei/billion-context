@@ -74,7 +74,7 @@ export type Mysql2Module = typeof import("mysql2/promise");
  *  DDL block below exactly once on first open (information_schema probe +
  *  ALTER ADD INDEX); fresh installs pick the keys up from the CREATE TABLE
  *  DDL. */
-const MYSQL_SCHEMA_VERSION = 11;
+export const MYSQL_SCHEMA_VERSION = 11;
 
 /** Parity constants with the sqlite v8 streaming backfill
  *  (src/storage/schema.ts, #4677): same page size, same printable absent
