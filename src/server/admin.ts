@@ -1592,7 +1592,7 @@ async function sendDiagnostics(res: http.ServerResponse, url: string | null): Pr
     res.end(JSON.stringify(await buildDiagnostics(topic), null, 2));
 }
 
-/** #1937：携带搜索、协议、客户端、状态或分页参数时，启用服务端筛选分页。
+/** #1937：携带搜索、协议、客户端、状态、层级、side/sub 开关或分页参数时，启用服务端筛选分页。
  *  无参数时保留原响应结构，兼容旧界面；每页最多返回 200 条。 */
 async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessage): Promise<void> {
     const u = new URL(req.url ?? "/__bili/sessions", "http://localhost");
@@ -1605,7 +1605,8 @@ async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessa
             u.searchParams.has("protocol") ||
             u.searchParams.has("client") ||
             u.searchParams.has("state") ||
-            u.searchParams.has("kind");
+            u.searchParams.has("kind") ||
+            u.searchParams.has("children");
         if (paged) {
             const rawSize = Number(u.searchParams.get("pageSize"));
             const pageSize = Number.isFinite(rawSize) && rawSize > 0 ? Math.min(Math.floor(rawSize), 200) : 50;
@@ -1622,6 +1623,7 @@ async function sendWebSessions(res: http.ServerResponse, req: http.IncomingMessa
                     client: u.searchParams.get("client") ?? undefined,
                     state,
                     kind,
+                    showChildren: u.searchParams.get("children") === "1",
                     page,
                     pageSize,
                 })),

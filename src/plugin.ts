@@ -817,7 +817,7 @@ export function pluginRuntimeInfoFor(agent: string | undefined, model: string | 
 const CHILD_CONVERSATION_SUFFIX = /:(?:side(?::conversation)?|sub):[^:]+$/;
 const MAX_CHILD_CONVERSATION_DEPTH = 4;
 
-function parentConversationId(conversationId: string): string | undefined {
+export function parentConversationId(conversationId: string): string | undefined {
     const parent = conversationId.replace(CHILD_CONVERSATION_SUFFIX, "");
     return parent !== conversationId && parent.length > 0 ? parent : undefined;
 }

@@ -264,6 +264,10 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-fam
 .badge.ext { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); font-family: var(--mono); font-weight: 500; }
 .badge.warn { background: var(--amber-soft); color: var(--amber); border-color: var(--amber); }
 .badge.ok { background: var(--green-soft); color: var(--green); border-color: var(--green); }
+/* #7876: child (:side:/:sub:) session marker — muted, distinct from live/proto. */
+.badge.child { background: var(--bg-muted); color: var(--text-muted); border-color: var(--border); font-family: var(--mono); font-weight: 500; }
+.ses-toggle { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-muted); cursor: pointer; user-select: none; margin-left: 4px; }
+.ses-toggle input { margin: 0; cursor: pointer; }
 
 .bar-track { height: 6px; border-radius: 3px; background: var(--bg-muted); overflow: hidden; min-width: 70px; }
 .bar-fill { height: 100%; border-radius: 3px; background: var(--accent); }
