@@ -100,6 +100,19 @@ test("clientConversationHeader: reads known session header names in priority ord
     assert.equal(clientConversationHeader({ "x-mavis-session-id": "M", "x-opencode-session-id": "N" }), "M");
     // Explicit plugin identity still outranks everything else.
     assert.equal(clientConversationHeader({ "x-bili-plugin": "opencode", "x-bili-plugin-conversation": "P", "x-opencode-session-id": "N" }), "P");
+    // #5488: CodeBuddy / WorkBuddy stamp their per-conversation UUID in
+    // x-conversation-id and send nothing else from this list, so it must resolve
+    // to that id. Before the fix this returned undefined, falling to
+    // prefix-affinity and forking a fresh anonymous session on every host
+    // compaction (the two-compactor loop).
+    assert.equal(clientConversationHeader({ "x-conversation-id": "conv-1" }), "conv-1");
+    // It ranks below the client-specific headers and the acp tier...
+    assert.equal(clientConversationHeader({ "x-claude-code-session-id": "S", "x-conversation-id": "C" }), "S");
+    assert.equal(clientConversationHeader({ "x-opencode-session-id": "N", "x-conversation-id": "C" }), "N");
+    assert.equal(clientConversationHeader({ "x-acp-session": "B", "x-conversation-id": "C" }), "B");
+    // ...but above the bare generic names that follow it in the list.
+    assert.equal(clientConversationHeader({ "x-conversation-id": "C", "x-session-id": "I" }), "C");
+    assert.equal(clientConversationHeader({ "x-conversation-id": "C", "session-id": "E" }), "C");
 });
 
 test("affinityToken: client-provided identity passes through verbatim (credentials never in scope)", () => {
