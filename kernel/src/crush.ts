@@ -1786,6 +1786,26 @@ export interface ApplyCrushResult {
  *  between absorb-hide and absorb-prompt so the prompt node re-decides on
  *  post-crush sizes in the same turn (atomic two-tier gate). Returns the
  *  input array unchanged when nothing qualifies. */
+/** The forced absorb prompt is APPENDED at the very end (text + "\n\n" +
+ *  prompt), so only a canonical prompt occupying the tail is a stale marker.
+ *  A payload that legitimately CONTAINS the marker string (a transcript, a log,
+ *  this project's own source) must pass through intact: slicing at the first
+ *  occurrence silently deleted everything after it. */
+const ABSORB_PROMPT_TAIL_RE =
+  /^\[ACP absorb\] This tool result \(~[^\n)]*\) will be REMOVED from context\.[\s\S]*\(nothing needed\)"\.[ \t]*$/;
+
+export function stripTrailingAbsorbPrompt(text: string): string {
+  const at = text.lastIndexOf(ABSORB_PROMPT_MARKER);
+  if (at < 0) return text;
+  const tail = text.slice(at);
+  if (tail.includes("\n")) return text;
+  if (!ABSORB_PROMPT_TAIL_RE.test(tail)) return text;
+  if (at === 0) return "";
+  const before = text.slice(at - 2, at);
+  if (before !== "\n\n") return text;
+  return text.slice(0, at - 2);
+}
+
 export function applyCrushToMessages(
   messages: CoreMessage[],
   config: Config,
@@ -1805,11 +1825,10 @@ export function applyCrushToMessages(
       continue;
     }
     const text = msg.text ?? "";
-    // If a marker is present anyway (host-resent rendered text), crush the
-    // payload only and drop the stale marker — appendAbsorbPrompts
-    // re-decides on the post-crush size later in this turn.
-    const markerAt = text.indexOf(ABSORB_PROMPT_MARKER);
-    const payload = markerAt >= 0 ? text.slice(0, markerAt) : text;
+    // If a stale prompt rides the host-resent text, crush the payload only and
+    // drop the prompt; appendAbsorbPrompts re-decides on the post-crush size
+    // later in this turn.
+    const payload = stripTrailingAbsorbPrompt(text);
     const ev = evaluateToolResult({
       text: payload,
       absorb,
