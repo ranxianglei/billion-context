@@ -191,7 +191,7 @@ test("#2189 anthropic summary carries the client billing-attribution block at sy
     const { proxy, upstream, proxyPort, upstreamPort } = await makePair(calls, 200, "");
     try {
         const r1 = await drive(proxyPort, upstreamPort, "s2189-main", {
-            model: "claude-big", max_tokens: 1024, stream: true, system: ccSystem(), messages: [{ role: "user", content: "hello" }],
+            model: "claude-small", max_tokens: 1024, stream: true, system: ccSystem(), messages: [{ role: "user", content: "hello" }],
         });
         assert.equal(r1.status, 200);
         await r1.text();
@@ -233,7 +233,7 @@ test("#2189 legacy string system keeps the byte-identical summary shape", async 
     try {
         const sys = "You are a helpful assistant.";
         const r1 = await drive(proxyPort, upstreamPort, "s2189-legacy", {
-            model: "claude-big", max_tokens: 1024, stream: true, system: sys, messages: [{ role: "user", content: "hello" }],
+            model: "claude-small", max_tokens: 1024, stream: true, system: sys, messages: [{ role: "user", content: "hello" }],
         });
         assert.equal(r1.status, 200);
         await r1.text();
@@ -268,10 +268,18 @@ test("#2189 bare-Error 429 fails fast after ONE attempt, retryable=false, retrie
     const { proxy, upstream, proxyPort, upstreamPort } = await makePair(calls, 429, SHAPE_429_BODY, true);
     try {
         const r1 = await drive(proxyPort, upstreamPort, "s2189-shape", {
-            model: "claude-big", max_tokens: 1024, stream: true, system: ccSystem(), messages: [{ role: "user", content: "hello" }],
+            model: "claude-small", max_tokens: 1024, stream: true, system: ccSystem(), messages: [{ role: "user", content: "hello" }],
         });
         assert.equal(r1.status, 200);
         await r1.text();
+
+        // Pin a stated upstream wall: the session's same-origin+model usage
+        // reality (300k) would otherwise open the identity fast path and
+        // forward the over-window outbound instead of failing fast, bypassing
+        // the 429 handling under test (#7532). The wall demotes the fast path.
+        const seed = listSessions().find((s) => s.id.includes("s2189-shape"));
+        assert.ok(seed, "session exists after r1");
+        seed.stats.overflowArmTokens = 12_000;
 
         const body2 = { model: "claude-small", max_tokens: 1024, stream: true, system: ccSystem(), messages: bigConversation() };
         const r2 = await drive(proxyPort, upstreamPort, "s2189-shape", body2);
@@ -314,10 +322,18 @@ test("#2189 a genuine rate limit keeps the legacy 3-attempt replay and retryable
     const { proxy, upstream, proxyPort, upstreamPort } = await makePair(calls, 429, GENUINE_429_BODY, true);
     try {
         const r1 = await drive(proxyPort, upstreamPort, "s2189-genuine", {
-            model: "claude-big", max_tokens: 1024, stream: true, system: ccSystem(), messages: [{ role: "user", content: "hello" }],
+            model: "claude-small", max_tokens: 1024, stream: true, system: ccSystem(), messages: [{ role: "user", content: "hello" }],
         });
         assert.equal(r1.status, 200);
         await r1.text();
+
+        // Pin a stated upstream wall: the session's same-origin+model usage
+        // reality (300k) would otherwise open the identity fast path and
+        // forward the over-window outbound instead of failing fast, bypassing
+        // the 429 handling under test (#7532). The wall demotes the fast path.
+        const seed = listSessions().find((s) => s.id.includes("s2189-genuine"));
+        assert.ok(seed, "session exists after r1");
+        seed.stats.overflowArmTokens = 12_000;
 
         const r2 = await drive(proxyPort, upstreamPort, "s2189-genuine", {
             model: "claude-small", max_tokens: 1024, stream: true, system: ccSystem(), messages: bigConversation(),

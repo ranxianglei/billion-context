@@ -585,13 +585,20 @@ export type Session = {
          *  provider says nothing about whether another accepts the payload.
          *  Absent on legacy session files → baseline keeps legacy behavior. */
         lastInputTokensOrigin?: string;
-         /** Identity-fast-path: the REQUEST MODEL that measured lastInputTokens
-          *  — stamped at usage settlement (settleUsageReport / applyUsageSample)
-          *  and at overflow arming, alongside lastInputTokensOrigin. Acceptance
-          *  evidence on one model says nothing about another model's wall on
-          *  the same origin (#2189: 300k billed on claude-big does not bind
-          *  claude-small). Absent on legacy session files → the gate demotes
-          *  conservatively and the protection chain judges. */
+        /** #6430 / identity-fast-path: the REQUEST MODEL that measured
+         *  lastInputTokens — stamped at usage settlement (settleUsageReport /
+         *  applyUsageSample) and at overflow arming, alongside
+         *  lastInputTokensOrigin. Two gates demote on model mismatch: the
+         *  preflight baseline floor (tokenizers bill differently across
+         *  models, so a cross-model baseline — e.g. a 282K opus reading on a
+         *  fable lane — is not authoritative for this request's size; the k̂
+         *  read gate (currentCalibrationFactor) already demotes on model
+         *  mismatch and the baseline floor must match it) and the identity
+         *  fast path (acceptance evidence on one model says nothing about
+         *  another model's wall on the same origin, #2189: 300k billed on
+         *  claude-big does not bind claude-small). Absent on legacy session
+         *  files → the baseline keeps legacy behavior and the fast path
+         *  demotes conservatively. */
         lastInputTokensModel?: string;
          /** #1933 F1: calibrated scale factor k̂ = mean of up to 3 recent
           *  consistent same-route samples of (upstream-billed input ÷ local
@@ -1894,6 +1901,7 @@ export function resetSessionCompression(session: Session): void {
     // learned against the pre-compaction content class, and the baseline's
     // measuring route no longer bounds this rebuilt session.
     delete session.stats.lastInputTokensOrigin;
+    // #6430: the baseline's model provenance dies with the baseline.
     delete session.stats.lastInputTokensModel;
     delete session.stats.calibratedEstimate;
     delete session.stats.calibratedEstimateOrigin;

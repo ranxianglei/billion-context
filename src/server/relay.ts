@@ -1782,6 +1782,8 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
             // probe-forward gate) treat the arm as current-route evidence
             // instead of demoting it against a stale settle origin.
             s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl);
+            // #6430: model provenance for the armed baseline — the preflight gate
+            // demotes it when the current request runs on a different model.
             if (typeof reqModel === "string" && reqModel !== "") s.stats.lastInputTokensModel = reqModel;
             // #1110: record the arm SEPARATELY so the side-request guard
             // can read it without ever touching the nudge baseline. The guard
@@ -1859,7 +1861,7 @@ const reply = prepared && !prepared.sidePassthrough ? createHandoffReply(prepare
                 s.stats.lastInputTokensSource = "overflow-arm";
                 s.stats.overflowArmTokens = arm; // #1110: guard reads this, not the baseline
                 s.stats.lastInputTokensOrigin = normalizeUpstreamOrigin(upstreamUrl); // #2313: same-route evidence, see the window branch above
-                if (typeof reqModel === "string" && reqModel !== "") s.stats.lastInputTokensModel = reqModel;
+                if (typeof reqModel === "string" && reqModel !== "") s.stats.lastInputTokensModel = reqModel; // #6430: model provenance, see the window branch above
             }
             log("warn", `[${s.id}] upstream context overflow (window not parseable, model=${reqModel ?? "unknown"}) — armed emergency shrink at ~${arm} tokens (min of judging window ${judging} and payload estimate), nothing learned (#987): ${info.message}`);
         }

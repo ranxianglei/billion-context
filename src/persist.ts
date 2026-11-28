@@ -206,6 +206,7 @@ interface PersistedSession {
         emergencyShrinkAt?: number;
         emergencyShrinkEstimate?: number;
         lastInputTokensOrigin?: string;
+        lastInputTokensModel?: string;
         overflowArmTokens?: number;
         preflightRuns?: number;
         overflowArmCompletionReserve?: number;
@@ -4572,6 +4573,7 @@ function buildSession(parsed: PersistedSession): Session {
             localInputEstimate: typeof stats.localInputEstimate === "number" && Number.isFinite(stats.localInputEstimate) && stats.localInputEstimate > 0 ? stats.localInputEstimate : undefined,
             lastUsageGradeTokens: typeof stats.lastUsageGradeTokens === "number" && Number.isFinite(stats.lastUsageGradeTokens) && stats.lastUsageGradeTokens >= 0 ? stats.lastUsageGradeTokens : undefined,
             lastInputTokensOrigin: typeof stats.lastInputTokensOrigin === "string" && stats.lastInputTokensOrigin.trim().length > 0 ? stats.lastInputTokensOrigin : undefined,
+            lastInputTokensModel: typeof stats.lastInputTokensModel === "string" && stats.lastInputTokensModel.trim().length > 0 ? stats.lastInputTokensModel : undefined,
             calibratedEstimate: restoreCalibratedEstimate(stats.calibratedEstimate),
             calibratedEstimateOrigin: typeof stats.calibratedEstimateOrigin === "string" && stats.calibratedEstimateOrigin.trim().length > 0 ? stats.calibratedEstimateOrigin : undefined,
             calibratedEstimateModel: typeof stats.calibratedEstimateModel === "string" && stats.calibratedEstimateModel.trim().length > 0 ? stats.calibratedEstimateModel : undefined,
