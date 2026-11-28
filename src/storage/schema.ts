@@ -155,7 +155,15 @@ export const STORAGE_PRAGMAS = storagePragmas(WAL_JOURNAL_SIZE_LIMIT);
 import { identityOfStoredContent } from "./identity.js";
 import { log as loggerLog } from "../logger.js";
 
-const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
+/** egress-mode table creation gate (KDD #25, discussions/7735). The CORE
+ *  group — sessions (identity rows + R3 latch + point-fork children),
+ *  session_ext (pf:state), kv_store (small config rows) — is created on
+ *  EVERY instance; the LEGACY group (the 9 unified-projection tables) is
+ *  created unless the store opens in egress mode (featureEnabled(
+ *  "egressPlane")). Both groups are pure CREATE ... IF NOT EXISTS with the
+ *  v12 (#5874) probe-first convergence: nothing is ever dropped, and a
+ *  later open with the gate flipped recreates whatever is missing. */
+const STORAGE_DDL_V1_CORE = `CREATE TABLE IF NOT EXISTS sessions (
     session_id          TEXT PRIMARY KEY,
     parent_session_id   TEXT,
     fork_point_seq      INTEGER,
@@ -182,7 +190,34 @@ const STORAGE_DDL_V1 = `CREATE TABLE IF NOT EXISTS sessions (
     r3_latched_at       INTEGER
 );
 
-CREATE TABLE IF NOT EXISTS content (
+-- Per-session arbitrary state (#3069 v4): the escape hatch for host /
+-- plugin / UI state that must survive restarts but is NOT kernel session
+-- state. Keys are namespaced by convention ("r3:...", "web:...",
+-- "plugin:<name>:..."); values are inline JSON (small, frequently
+-- rewritten — the content CAS is wrong for this shape). Rows are swept
+-- with the session (no pin semantics; checkpoint the session instead).
+CREATE TABLE IF NOT EXISTS session_ext (
+    session_id      TEXT NOT NULL,
+    key             TEXT NOT NULL,
+    value_json      TEXT NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (session_id, key)
+) WITHOUT ROWID;
+
+-- Namespaced key/value store (#3069 v4): cross-session state (lane-level,
+-- per-agent, global). Lifecycle is caller-managed — deleting a session
+-- never touches kv_store rows; namespace owners clean up after themselves
+-- (e.g. "lane:<id>:*" when a lane retires).
+CREATE TABLE IF NOT EXISTS kv_store (
+    namespace       TEXT NOT NULL,
+    key             TEXT NOT NULL,
+    value_json      TEXT NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    PRIMARY KEY (namespace, key)
+) WITHOUT ROWID;
+`;
+
+const STORAGE_DDL_V1_LEGACY = `CREATE TABLE IF NOT EXISTS content (
     hash        TEXT PRIMARY KEY,
     byte_len    INTEGER NOT NULL,
     refcount    INTEGER NOT NULL DEFAULT 0,
@@ -297,32 +332,6 @@ CREATE TABLE IF NOT EXISTS conversations (
 -- (store.ts snapSessRawOf: WHERE session_id = ?) — the PK cannot serve it.
 CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id);
 
--- Per-session arbitrary state (#3069 v4): the escape hatch for host /
--- plugin / UI state that must survive restarts but is NOT kernel session
--- state. Keys are namespaced by convention ("r3:...", "web:...",
--- "plugin:<name>:..."); values are inline JSON (small, frequently
--- rewritten — the content CAS is wrong for this shape). Rows are swept
--- with the session (no pin semantics; checkpoint the session instead).
-CREATE TABLE IF NOT EXISTS session_ext (
-    session_id      TEXT NOT NULL,
-    key             TEXT NOT NULL,
-    value_json      TEXT NOT NULL,
-    updated_at      INTEGER NOT NULL,
-    PRIMARY KEY (session_id, key)
-) WITHOUT ROWID;
-
--- Namespaced key/value store (#3069 v4): cross-session state (lane-level,
--- per-agent, global). Lifecycle is caller-managed — deleting a session
--- never touches kv_store rows; namespace owners clean up after themselves
--- (e.g. "lane:<id>:*" when a lane retires).
-CREATE TABLE IF NOT EXISTS kv_store (
-    namespace       TEXT NOT NULL,
-    key             TEXT NOT NULL,
-    value_json      TEXT NOT NULL,
-    updated_at      INTEGER NOT NULL,
-    PRIMARY KEY (namespace, key)
-) WITHOUT ROWID;
-
 -- #3762 media CAS: one row per (message, media blob) reference. The message
 -- content stores {"$media": hash} in the imageBase64 slot; the bytes live in
 -- the content CAS, refcounted by these mapping rows. Swept with the session
@@ -355,7 +364,17 @@ CREATE INDEX IF NOT EXISTS idx_ccr_entries_content_hash ON ccr_entries(content_h
 CREATE INDEX IF NOT EXISTS idx_ccr_entries_orig_hash ON ccr_entries(orig_hash);
 CREATE INDEX IF NOT EXISTS idx_message_media_media_hash ON message_media(media_hash);
 CREATE INDEX IF NOT EXISTS idx_checkpoints_state_hash ON checkpoints(state_hash);
+-- v9's refcount sweep index (#4796) rides the legacy group too, so an
+-- egress-mode fresh DB that later converges back to legacy (flag off)
+-- gets it in the same probe pass instead of full-scanning on first gc().
+CREATE INDEX IF NOT EXISTS idx_content_refcount ON content(refcount);
 `;
+
+/** The full v1 shape (core + legacy). INTERNAL_ONLY — migrateSchema uses
+ *  _CORE/_LEGACY directly and the only consumer is the test alias below
+ *  (STORAGE_DDL_V1_FOR_TESTS); the egress-mode open path splits it (see
+ *  migrateSchema's opts). */
+const STORAGE_DDL_V1 = STORAGE_DDL_V1_CORE + "\n" + STORAGE_DDL_V1_LEGACY;
 
 /** #5874 snapshot foundation v2 (pure-incremental, 2026-11-15 owner ruling) —
  *  one additive table for the stage-0 identity ledger. The original four-table
@@ -440,28 +459,53 @@ CREATE TABLE IF NOT EXISTS state_fields (
 `;
 
 /** #6785 perf (proposal discussions/7398 + revised design discussions/7439,
- *  owner design 2026-11-20/21): the EGRESS STATE LOG — the op-log view of the
- *  outbound conversation (B base / I insert / D delete-range / U
- *  update-content; anchors are msgids, never positions). DUAL TABLES:
- *  egress_state is what serving reads and compaction physically trims below
- *  the watermark; egress_flow is the record — compaction trims it below the
- *  watermark as well (#7574: it used to keep every row AND gain one full
- *  snapshot per fold, so a long session grew without bound), so every op_seq
- *  from the newest base on stays reconstructible — rollback is based on this
- *  table, not on client resends. SELF-CONTAINED BYTES (ruling 7439-1): the `bytes` column holds
- *  the message's final core JSON for I/U rows — no hash refs, no content
- *  table; replay needs only this table pair. TWO SEQUENCES (ruling 7439,
- *  canonical message number): op_seq orders EVERY row (the primary key);
- *  log_seq is the canonical message number set ONLY on I rows (one number
- *  per message, session-scoped, never re-issued — U/D/B carry NULL). The
- *  secondary index serves +U targeting and -D endpoint resolution.
- *  Probe-first, no version bump. */
-const EGRESS_STATE_DDL = `-- #6785 perf (proposals discussions/7398 + 7439): op-log outbound view (state + flow), self-contained bytes, canonical per-message numbers.
+ *  owner design 2026-11-20/21, MATERIALIZED form discussions/7773 owner
+ *  ruling 2026-11-26): the EGRESS STATE LOG — the op-log view of the
+ *  outbound conversation. DUAL TABLES:
+ *  egress_flow is the RECORD — every I/D/U op in order, append-only,
+ *  physically NEVER deleted (the B base row never existed in the 7773
+ *  ruling: not written, not read, no letter in this CHECK); growth
+ *  optimization is a separate, deferred project (#7475 family), nothing
+ *  here ever prunes it. egress_state is the MATERIALIZED live view — one
+ *  row per LIVE message (PK (session_id, msgid), pos = its position in the
+ *  current view); I inserts (suffix shifts), U edits in place, D physically
+ *  deletes the range. Serving reads are `ORDER BY pos` DIRECT reads — no
+ *  replay, no compaction, no base concept. SELF-CONTAINED BYTES (ruling
+ *  7439-1): the `bytes` column holds the message's final core JSON; replay
+ *  needs only the flow table. TWO NUMBER COLUMNS on the state row (7773
+ *  dual clocks of citation): log_seq = the number the I op assigned,
+ *  IMMUTABLE (the row's anchor to its I twin in the flow — same msgid AND
+ *  same I-time log_seq); num = the row's CURRENT canonical number (a U with
+ *  an explicit num changes it; 0 = demoted/uncited — the system row is 0 by
+ *  construction, outside the citation space). The number frontier is the
+ *  flow's MAX(log_seq) — the ONLY source (the flow is never pruned). The
+ *  state PK covers (session_id, msgid), so no separate state index. The
+ *  flow index serves +U targeting and -D endpoint resolution.
+ *  Probe-first, no version bump (the tables never shipped). */
+const EGRESS_STATE_DDL = `-- #6785 perf (proposals discussions/7398 + 7439, materialized at 7773): op-log outbound view (flow record + materialized live state), self-contained bytes, canonical per-message numbers.
 CREATE TABLE IF NOT EXISTS egress_state (
+    session_id TEXT NOT NULL,
+    rid INTEGER NOT NULL,
+    msgid TEXT NOT NULL,
+    pos INTEGER NOT NULL,
+    log_seq INTEGER NOT NULL,
+    num INTEGER NOT NULL,
+    ref TEXT NOT NULL,
+    tokens INTEGER NOT NULL,
+    type TEXT NOT NULL,
+    role TEXT,
+    ts INTEGER,
+    sys_in TEXT,
+    bytes TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, rid)
+);
+CREATE TABLE IF NOT EXISTS egress_flow (
     session_id TEXT NOT NULL,
     op_seq INTEGER NOT NULL,
     log_seq INTEGER,
-    row_type TEXT NOT NULL CHECK (row_type IN ('B','I','D','U')),
+    row_type TEXT NOT NULL CHECK (row_type IN ('I','D','U')),
+    rid INTEGER,
     msgid TEXT,
     payload TEXT NOT NULL,
     bytes TEXT,
@@ -469,29 +513,24 @@ CREATE TABLE IF NOT EXISTS egress_state (
     PRIMARY KEY (session_id, op_seq)
 );
 CREATE INDEX IF NOT EXISTS idx_egress_state_msgid ON egress_state (session_id, msgid);
-CREATE TABLE IF NOT EXISTS egress_flow (
-    session_id TEXT NOT NULL,
-    op_seq INTEGER NOT NULL,
-    log_seq INTEGER,
-    row_type TEXT NOT NULL CHECK (row_type IN ('B','I','D','U')),
-    msgid TEXT,
-    payload TEXT NOT NULL,
-    bytes TEXT,
-    created_at INTEGER NOT NULL,
-    PRIMARY KEY (session_id, op_seq)
-);
+CREATE INDEX IF NOT EXISTS idx_egress_flow_rid ON egress_flow (session_id, rid);
 CREATE INDEX IF NOT EXISTS idx_egress_flow_msgid ON egress_flow (session_id, msgid);
 `;
 
 /** #7577 (follow-up to #7439, owner design 2026-11-23): the BLOCK LIFECYCLE
  *  log — the op-log of the fold blocks, symmetric to the message egress log.
- *  egress_block_flow is append-only (row types B base / I block-born / U
- *  block-state-change; NEVER deleted) and carries the bounded kstate residual
- *  snapshot in `kstate_json` on every row (D4: no fifth table — the sidecar
- *  rides the block-change rows, whose count = fold count, 2-3 orders of
- *  magnitude below the message count). egress_block_state is the current
- *  block-set read replica (PK (session_id, block_id), one latest snapshot per
- *  block; compaction may physically trim it). SELF-CONTAINED BYTES (D2,
+ *  egress_block_flow is append-only (row types I block-born / U
+ *  block-state-change / D reaped — the D row carries the TERMINAL full
+ *  snapshot, re-lettered from the old terminal-U at discussions/7773; there
+ *  is no B base row and no compaction; NEVER deleted) and carries the
+ *  bounded kstate residual snapshot in `kstate_json` on every row (D4: no
+ *  fifth table — the sidecar rides the block-change rows, whose count = fold
+ *  count, 2-3 orders of magnitude below the message count).
+ *  egress_block_state is the MATERIALIZED live view (7773): one row per
+ *  LIVE block (PK (session_id, block_id), pos = its position in the current
+ *  set) — I inserts, U edits in place, D physically deletes the row;
+ *  serving reads are `ORDER BY pos` DIRECT reads, no replay.
+ *  SELF-CONTAINED BYTES (D2,
  *  ruling 7439-1): the one/full block content is inlined in the payload —
  *  zero content-CAS refs, zero hash columns. DUAL CLOCKS (owner ruling
  *  2026-11-24): the block tables number THEMSELVES (op_seq dense within
@@ -500,7 +539,7 @@ CREATE INDEX IF NOT EXISTS idx_egress_flow_msgid ON egress_flow (session_id, msg
  *  original shared-clock design was rejected in review because it broke the
  *  flow's density invariant on the first fold. Probe-first, no version
  *  bump (the tables never shipped, like the egress pair). */
-const EGRESS_BLOCK_DDL = `-- #7577: block lifecycle log (flow + state), self-contained bytes, kstate sidecar.
+const EGRESS_BLOCK_DDL = `-- #7577: block lifecycle log (flow + materialized live state), self-contained bytes, kstate sidecar.
 -- Dual clocks (owner ruling 2026-11-24): the block tables number THEMSELVES
 -- (op_seq dense within egress_block_flow); flow_op_seq is the pointer to the
 -- egress_flow clock (its MAX at write time) used for cross-table alignment at
@@ -509,7 +548,7 @@ CREATE TABLE IF NOT EXISTS egress_block_flow (
     session_id TEXT NOT NULL,
     op_seq INTEGER NOT NULL,
     flow_op_seq INTEGER NOT NULL DEFAULT 0,
-    row_type TEXT NOT NULL CHECK (row_type IN ('B','I','U')),
+    row_type TEXT NOT NULL CHECK (row_type IN ('I','U','D')),
     block_id TEXT,
     payload TEXT NOT NULL,
     kstate_json TEXT,
@@ -520,6 +559,7 @@ CREATE INDEX IF NOT EXISTS idx_egress_block_flow_block ON egress_block_flow (ses
 CREATE TABLE IF NOT EXISTS egress_block_state (
     session_id TEXT NOT NULL,
     block_id TEXT NOT NULL,
+    pos INTEGER NOT NULL,
     op_seq INTEGER NOT NULL,
     flow_op_seq INTEGER NOT NULL DEFAULT 0,
     payload TEXT NOT NULL,
@@ -528,12 +568,57 @@ CREATE TABLE IF NOT EXISTS egress_block_state (
 );
 `;
 
+/** Usage-event stream (owner ruling 2026-11-27): the per-request usage /
+ *  cache-hit samples (S) and fold events (F), plus restart-boundary marks
+ *  (M), for egress-on sessions — where the in-memory cache ledger's inputs
+ *  were previously LOST on restart (the ledger lived in session metadata /
+ *  the legacy projection, neither of which exists for an egress-on session).
+ *  Append-only like egress_flow: rows are NEVER deleted (the session-scope
+ *  sweep only), op_seq dense per session, payload = the exact arguments the
+ *  in-memory ledger consumed. REBUILD BY REPLAY (same discipline as
+ *  egressStateAt): rows are replayed through recordCacheSample /
+ *  recordCacheFolds in order; replay must reproduce the ledger field-for-
+ *  field (golden-tested) — a failed replay is session-level damage on the
+ *  existing ladder, never a fuzzy merge. The MATIALIZED summary is a
+ *  session_ext row (`usage:stats`, <=1024 chars, re-derived from the stream)
+ *  — dual clock: this stream is the authority, the ext row is a derived
+ *  view that is rebuilt, never written back into the stream.
+ *  Never shipped: probe-first, no version bump (same rule as the rest of
+ *  the egress family). */
+const EGRESS_USAGE_DDL = `-- usage event stream for egress-on sessions (S samples / F folds / M restart marks).
+CREATE TABLE IF NOT EXISTS egress_usage (
+    session_id TEXT NOT NULL,
+    op_seq INTEGER NOT NULL,
+    row_type TEXT NOT NULL CHECK (row_type IN ('S','F','M')),
+    at INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, op_seq)
+);
+CREATE INDEX IF NOT EXISTS idx_egress_usage_at ON egress_usage (session_id, at, op_seq);
+`;
+
+/** egress-mode table creation gate (KDD #25, discussions/7735).
+ *  INTERNAL_ONLY — callers pass an object literal (structural typing);
+ *  no other module imports the name. */
+interface MigrateSchemaOptions {
+    /** When false, the 9 legacy unified-projection tables are NOT created
+     *  on a fresh database (only the core trio sessions/session_ext/
+     *  kv_store plus the probed l1/orphan/state/egress groups follow the
+     *  gates below). Already-created tables are NEVER dropped, and an
+     *  open with the gate true recreates any missing legacy table — a
+     *  fresh eg DB that later turns egressPlane off converges on the next
+     *  open (probe-first, #5874 discipline). */
+    legacyTables?: boolean;
+}
+
 /** Applied inside one transaction whenever user_version < STORAGE_SCHEMA_VERSION. */
 export function migrateSchema(db: {
     exec(sql: string): void;
     prepare(sql: string): { get(...a: unknown[]): unknown; all(...a: unknown[]): unknown[]; run(...a: unknown[]): unknown };
     transaction<T>(fn: () => T): T;
-}): { from: number; to: number } {
+}, opts: MigrateSchemaOptions = {}): { from: number; to: number } {
+    const legacy = opts.legacyTables ?? true;
     const row = db.prepare("PRAGMA user_version").get() as { user_version: number } | undefined;
     const from = row?.user_version ?? 0;
     // #6785 review fix (owner): DROP COLUMN needs SQLite ≥ 3.35. The host
@@ -561,19 +646,29 @@ export function migrateSchema(db: {
     const hasL1World = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'l1_world'")
         .get();
-    if (!hasL1World) db.transaction(() => db.exec(L1WORLD_DDL_V12));
+    if (legacy && !hasL1World) db.transaction(() => db.exec(L1WORLD_DDL_V12));
     // #6785 step 7: orphan blocks — own probe (a db written between the
     // egress_snapshot and orphan_blocks landings picks it up here; fresh dbs
     // pass through — same discipline, no version bump).
     const hasOrphanBlocks = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'orphan_blocks'")
         .get();
-    if (!hasOrphanBlocks) db.exec(ORPHAN_BLOCKS_DDL);
+    if (legacy && !hasOrphanBlocks) db.exec(ORPHAN_BLOCKS_DDL);
     // #6785 step 8: kstate rows — own probe (same discipline, no bump).
     const hasStateFields = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'state_fields'")
         .get();
-    if (!hasStateFields) db.exec(STATE_FIELDS_DDL);
+    if (legacy && !hasStateFields) db.exec(STATE_FIELDS_DDL);
+    // egress-mode convergence (KDD #25, discussions/7735): an eg-mode fresh
+    // DB skipped the legacy group at v1 time (and never takes the versioned
+    // steps again once user_version reached the current one), so a flag-off
+    // open must recreate the WHOLE missing group in one pass. The probe
+    // asks for every table of the group; one exec converges any partial
+    // state too (pure CREATE IF NOT EXISTS, #5874 discipline).
+    const hasAllLegacyTables = ["content", "messages", "blocks", "dead_refs", "refs", "checkpoints", "ccr_entries", "conversations", "message_media"].every(
+        (name) => db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(name) !== undefined,
+    );
+    if (legacy && !hasAllLegacyTables) db.exec(STORAGE_DDL_V1_LEGACY);
     // #6785 perf (proposal discussions/7398): the egress state log — own
     // probe (same discipline, no version bump).
     const hasEgressState = db
@@ -597,25 +692,63 @@ export function migrateSchema(db: {
     // whole migration.
     const egressCols = (db.prepare("PRAGMA table_info(egress_state)").all() as unknown as { name?: unknown }[])
         .map((c) => c.name);
-    if (egressCols.length > 0 && !egressCols.includes("op_seq")) {
+    const egressFlowSql = String((db
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'egress_flow'")
+        .get() as { sql?: unknown } | undefined)?.sql ?? "");
+    // 7773: the OLD shapes are (a) the pre-7773 op-copy state shape
+    // (egress_state with an op_seq column — it was an op mirror, now it is
+    // the materialized live view), (b) an interrupted state table that has
+    // neither op_seq nor pos, and (c) any flow table whose row_type CHECK
+    // still names the retired 'B'. The two tables NEVER shipped in any
+    // release, so a fresh recreate is the whole migration for every variant
+    // (the group is probed as a pair above, so the flow CHECK is replaced
+    // together with the state shape whenever the state is old — the sql
+    // check stays for a DB where only the flow row survived). The NEW shape
+    // is recognized by the ABSENCE of op_seq plus the presence of pos —
+    // that is the exact opposite of the old op-copy shape, never "old".
+    // 2026-11-27 (owner ruling, discussion follow-up to #7773): log
+    // addressing moved off msgid onto the self-issued row id `rid` (dense
+    // per-session, issued at I, NEVER re-issued — retired rows keep their
+    // rid forever; msgid stayed the CLIENT-facing identity but is no longer
+    // the state PK and no longer an op anchor). A state table without the
+    // rid column is an old-shape dev DB — same never-shipped rule, one-step
+    // drop + recreate (the owner's live DBs are rebuilt by the operator).
+    const egressOldShape = (egressCols.length > 0 && (egressCols.includes("op_seq") || !egressCols.includes("pos") || !egressCols.includes("rid")))
+        || egressFlowSql.includes("('B','I','D','U')");
+    if (egressOldShape) {
         // #7574 item 10: drop + recreate is one step (same transaction rule).
         db.transaction(() => {
             db.exec("DROP TABLE IF EXISTS egress_flow");
             db.exec("DROP TABLE IF EXISTS egress_state");
+            db.exec("DROP INDEX IF EXISTS idx_egress_state_msgid");
             db.exec(EGRESS_STATE_DDL);
         });
     }
     // #7577: the block lifecycle log — own probe (same discipline, no bump).
+    // Usage event stream (owner ruling 2026-11-27): third table of the
+    // egress group — same never-shipped probe-first rule (a missing table
+    // recreates the group in one step).
+    const hasEgressUsage = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_usage'")
+        .get();
+    if (!hasEgressUsage) db.transaction(() => db.exec(EGRESS_USAGE_DDL));
     const hasEgressBlockFlow = db
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'egress_block_flow'")
         .get();
     const blockCols = hasEgressBlockFlow
         ? (db.prepare("PRAGMA table_info(egress_block_flow)").all() as unknown as { name?: unknown }[]).map((c) => c.name)
         : [];
-    if (!hasEgressBlockFlow || !blockCols.includes("flow_op_seq")) {
-        // Never-shipped dev table; a dev DB that created the old-shape
-        // (shared-clock) layout is dropped and recreated (one step, same
-        // #7574 rule). Data loss is the accepted dev cost.
+    const blockStateCols = (db.prepare("PRAGMA table_info(egress_block_state)").all() as unknown as { name?: unknown }[])
+        .map((c) => c.name);
+    const blockFlowSql = String((db
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'egress_block_flow'")
+        .get() as { sql?: unknown } | undefined)?.sql ?? "");
+    // 7773 old shapes: the shared-clock dev layout (no flow_op_seq), the
+    // pre-7773 state replica (no pos column), or a flow whose row_type
+    // CHECK still names the retired 'B'. Never-shipped dev tables; a dev DB
+    // with any of them is dropped and recreated (one step, same #7574
+    // rule). Data loss is the accepted dev cost.
+    if (!hasEgressBlockFlow || !blockCols.includes("flow_op_seq") || (blockStateCols.length > 0 && !blockStateCols.includes("pos")) || blockFlowSql.includes("'B'")) {
         db.transaction(() => {
             db.exec("DROP TABLE IF EXISTS egress_block_flow");
             db.exec("DROP TABLE IF EXISTS egress_block_state");
@@ -727,7 +860,10 @@ export function migrateSchema(db: {
     if (from >= STORAGE_SCHEMA_VERSION) return { from, to: from };
     let needV8Backfill = false;
     db.transaction(() => {
-        if (from < 1) db.exec(STORAGE_DDL_V1);
+        if (from < 1) {
+            db.exec(STORAGE_DDL_V1_CORE);
+            if (legacy) db.exec(STORAGE_DDL_V1_LEGACY);
+        }
         if (from < 2) {
             // v2 identity columns — probe first: dev-window builds whose V1
             // DDL already carried them must not fail on duplicate columns.
@@ -740,7 +876,7 @@ export function migrateSchema(db: {
                 db.exec("ALTER TABLE sessions ADD COLUMN origin TEXT");
             }
         }
-        if (from < 3) {
+        if (from < 3 && legacy) {
             // v3 identity index (#2960 R2.1): create + backfill from the
             // sessions rows themselves. Both statements are idempotent
             // (IF NOT EXISTS / OR IGNORE) so any dev-window lib that already
@@ -756,7 +892,7 @@ export function migrateSchema(db: {
             db.exec("CREATE TABLE IF NOT EXISTS session_ext (\n                session_id      TEXT NOT NULL,\n                key             TEXT NOT NULL,\n                value_json      TEXT NOT NULL,\n                updated_at      INTEGER NOT NULL,\n                PRIMARY KEY (session_id, key)\n            ) WITHOUT ROWID");
             db.exec("CREATE TABLE IF NOT EXISTS kv_store (\n                namespace       TEXT NOT NULL,\n                key             TEXT NOT NULL,\n                value_json      TEXT NOT NULL,\n                updated_at      INTEGER NOT NULL,\n                PRIMARY KEY (namespace, key)\n            ) WITHOUT ROWID");
         }
-        if (from < 7) {
+        if (from < 7 && legacy) {
             // v7 media CAS (#3762): message→media mapping table. Idempotent
             // CREATE — pre-v7 rows keep their inline bytes and read back
             // verbatim (lazy: no backfill rehash).
@@ -785,7 +921,7 @@ export function migrateSchema(db: {
                 db.exec("ALTER TABLE sessions ADD COLUMN orphans_json TEXT");
             }
         }
-        if (from < 8) {
+        if (from < 8 && legacy) {
             // v8 position-independent identity + historian tombstones
             // (#4390). identity: the cross-save JOIN key (stored-bytes
             // serialization minus id/wireIndex) — content_hash stays the
@@ -812,7 +948,7 @@ export function migrateSchema(db: {
             // migration and re-OMM'd: permanently unopenable stores (#4677).
             needV8Backfill = true;
         }
-        if (from < 9) {
+        if (from < 9 && legacy) {
             // v9 zero-ref collection index (#4796): gc()'s sweep and the
             // dry-run count address content BY refcount — without this index
             // every run full-scans the CAS table. Field report: 766K rows /
@@ -825,7 +961,7 @@ export function migrateSchema(db: {
             // dev-window lib that already carried it re-lands cleanly.
             db.exec("CREATE INDEX IF NOT EXISTS idx_content_refcount ON content(refcount)");
         }
-        if (from < 10) {
+        if (from < 10 && legacy) {
             // v10 (#4313): immutable message wall-clock stamp. Nullable, no
             // backfill — pre-feature rows read NULL and render without the
             // time attribute (legacy bytes unchanged). Probe-first like v8.
@@ -839,7 +975,7 @@ export function migrateSchema(db: {
         // version early return (a #5855-era db already at user_version 12
         // must pick the column up; the in-transaction probe it was at never
         // ran there). See the probe-first note before the early return.
-        if (from < 11) {
+        if (from < 11 && legacy) {
             // v11 (#5539): FK child indexes on content.hash — see the header
             // note and the DDL comment above for the mechanism and field
             // evidence. Idempotent CREATEs, same discipline as v9; a
@@ -867,10 +1003,13 @@ export function migrateSchema(db: {
     // lookup stayed a full scan. Probe the index itself and create it on the
     // first open that misses it (the table exists on every path: v1 DDL on a
     // fresh file, the `from < 3` step, or already).
-    const hasConversationsIndex = db
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_conversations_session'")
+    const hasConversations = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'conversations'")
         .get();
-    if (hasConversationsIndex === undefined) {
+    const hasConversationsIndex = hasConversations ? db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_conversations_session'")
+        .get() : undefined;
+    if (hasConversations && hasConversationsIndex === undefined) {
         db.exec("CREATE INDEX IF NOT EXISTS idx_conversations_session ON conversations(session_id)");
     }
     return { from, to: STORAGE_SCHEMA_VERSION };

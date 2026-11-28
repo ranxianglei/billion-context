@@ -30,6 +30,7 @@ class MemStore implements EgressOpLogStore {
     seq = 0;
     reads = 0;
     scans = 0;
+    walks = 0;
     truncations = 0;
     egressAppendTurn(sessionId: string, ops: EgressOp[], baseSeq: number): EgressViewRow[] {
         if (this.race) throw new EgressConcurrentWriteError(sessionId, baseSeq, baseSeq + 2);
@@ -44,6 +45,10 @@ class MemStore implements EgressOpLogStore {
     }
     egressStateViewAt(): EgressViewRow[] {
         this.scans++;
+        throw new EgressStateCorruptError("s", "payload at op_seq=3 is not an object");
+    }
+    egressFlowWalkBack(): { seq: number; view: EgressViewRow[] } | null {
+        this.walks++;
         throw new EgressStateCorruptError("s", "payload at op_seq=3 is not an object");
     }
     egressStateMaxSeq(): number {
@@ -72,14 +77,14 @@ test("an authority session with an unreadable log fails at once, is remembered, 
     );
     assert.equal(session.metadata["egressFlowUnreadable"], true, "the session is latched");
     assert.equal(session.metadata["egressAuthority"], undefined, "a session that never reached a healthy point is not marked as the authority");
-    const scansAfterFailure = st.scans;
-    assert.ok(scansAfterFailure > 0, "the first failure looked for a healthy point");
+    const walksAfterFailure = st.walks;
+    assert.ok(walksAfterFailure > 0, "the first failure looked for a healthy point (single full-history pass, 7773)");
     const readsAfterFailure = st.reads;
 
     // 2. the next request fails again WITHOUT touching the log
     assert.throws(() => resolveEgressAuthority({ session, st, sessionId: "s", core: CORE, log, armed: true }), EgressAuthorityRejectError);
     assert.equal(st.reads, readsAfterFailure, "no read");
-    assert.equal(st.scans, scansAfterFailure, "no walk-back");
+    assert.equal(st.walks, walksAfterFailure, "no walk-back");
 
     // 3. the operator resets the log: the latch clears and the session bootstraps again
     st.unreadable = false;
@@ -103,7 +108,8 @@ test("a session that is not on the log keeps working when the log is unreadable"
     assert.deepEqual(out, { base: [], baseSeq: 0, bootstrapping: false, swappedCore: null, recordCore: null });
     assert.equal(session.metadata["egressFlowUnreadable"], undefined, "a record-only session is never latched");
     assert.equal(st.reads, 1, "the damaged log is opened exactly once — enough to know it cannot be used");
-    assert.equal(st.scans, 0, "no walk-back: a mirror log is never repaired by deleting rows");
+    assert.equal(st.scans, 0, "no per-point scans");
+    assert.equal(st.walks, 0, "no walk-back: a mirror log is never repaired by deleting rows");
     assert.equal(st.truncations, 0, "nothing was deleted");
     assert.equal(recordAuthorityTurn(st, "s", out, "sys", log), null, "nothing to record — the lane keeps its own outbound");
     assert.ok(lines.some((l) => l.includes("turn not recorded")), `the skip is logged (log: ${lines.slice(-3).join(" | ")})`);

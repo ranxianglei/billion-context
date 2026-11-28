@@ -66,6 +66,16 @@ export interface BiliMessage extends CoreMessage {
    *  pairs; without it the request is rejected. Stored alongside the
    *  reasoning text so coreToAnthropic can reattach it. */
   thinkingSignature?: string;
+  /** #5495/#7684: this reasoning core came from an Anthropic WIRE thinking
+   *  block (parsed by anthropicToCore, or accumulated by the compress loop
+   *  on an anthropic lane). Unsigned upstreams on that lane (DeepSeek's
+   *  /anthropic endpoint) accepted the block without a signature and REQUIRE
+   *  it passed back verbatim — so coreToAnthropic re-emits it as a thinking
+   *  block even without thinkingSignature. An unsigned reasoning core
+   *  WITHOUT this marker is cross-lane (e.g. openai reasoning_content
+   *  re-rendered onto the anthropic wire after a model switch) and degrades
+   *  to a visible text block instead. */
+  anthropicThinking?: true;
   /** Google/Gemini thought signature (thoughtSignature). Gemini 3 validates
    *  the signature of every replayed thought part, so a reasoning core
    *  carries it here for coreToGoogle to reattach. */
@@ -95,6 +105,12 @@ export interface BiliMessage extends CoreMessage {
   /** The base64 data of an image (without the data: prefix). Lets the
    *  reverse conversion rebuild the full image payload. */
   imageBase64?: string;
+  /** Responses wire: the exact source input_image part of this image core
+   *  message, bound at parse. Renderers re-emit it verbatim instead of
+   *  consuming a shared cursor across one raw message's parts — cursor
+   *  drift (multi-item user runs, marker-text collision) silently DROPPED
+   *  images (#7824). */
+  rawResponseImagePart?: { type: "input_image"; image_url: string; [key: string]: unknown };
   /** OpenAI chat: ALL original image_url content parts (data: or remote
    *  URL) for a user message carrying more than one image, in wire order.
    *  coreToOpenai re-emits these verbatim (after the text part). The
