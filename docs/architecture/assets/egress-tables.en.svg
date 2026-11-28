@@ -5,16 +5,16 @@
 <text x="52" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_flow — message op log (authority)</text>
 <text x="52" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, op_seq), dense within the table</text>
 <text x="52" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">row_type: I insert / D delete / U update (no B)</text>
-<text x="52" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">I rows: msgid + log_seq (canonical, never</text>
-<text x="52" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">reissued); frontier = MAX(log_seq) on the flow</text>
-<text x="52" y="170" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">D rows: (start_msgid, end_msgid) + terminal</text>
-<text x="52" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">full snapshot; U: new bytes (+num on re-cite)</text>
+<text x="52" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">I rows: msgid + rid (canonical, one-shot;</text>
+<text x="52" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">never reissued); frontier = MAX(rid) flow</text>
+<text x="52" y="170" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">D rows: (start, end) rid range + terminal</text>
+<text x="52" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">full snapshot; U: new bytes, never a number</text>
 <text x="52" y="200" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">append-only: nothing ever prunes it (#7439);</text>
 <text x="52" y="215" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">any point stays reconstructible (egressStateAt)</text>
 <text x="52" y="230" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" font-weight="bold">the retired B base row is gone (#7773)</text>
 <rect x="40" y="290" width="360" height="120" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
 <text x="52" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_state — materialized live view</text>
-<text x="52" y="330" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, msgid); pos-ordered, one row</text>
+<text x="52" y="330" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, rid); pos-ordered, one row</text>
 <text x="52" y="345" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">per LIVE message; no compaction, no base row</text>
 <text x="52" y="360" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">Same-tx apply: I inserts + shifts, U in-place,</text>
 <text x="52" y="375" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">D physically deletes + shifts (7773)</text>

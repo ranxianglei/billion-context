@@ -24,7 +24,7 @@
 | 7439-3/5 | **服务端权威 + 硬失败**——kernel 输入从 flow 重放；日志**没有任何健康点**时响亮地硬失败，而不是静默地拿客户端字节应答。 | 「答错但没声音」正是本平面要消灭的失败模式；响亮的 500 + 恢复日志可接受。 |
 | KDD #23 | **`messages` 降级为惰性投影**——egress-on 会话停止逐轮统一 ingest；messages 表只在平面回滚 / web 读 / 恢复时一次性 O(n) 重建。 | 存储开销曾正比于 messages 账本**总行数**（~20µs/行，10w 行 2× 双账本放大）。op log 每轮写入 = O(新增消息)，serving 读与 live 上下文本身一样小（state 表即物化 live 视图，#7773）。 |
 | 双时钟（#7581） | **块表自己编号**；每个块行用 `flow_op_seq` 指向 flow 时钟（单调不减 ⇒ `<= X` 是前缀）。 | 共用一个时钟时，折叠的块行（**保存时**写）落在该轮最后一条 flow 行（**准备时**写）之后两个 op_seq 处，下一轮第一次读就击穿 flow 的密度不变量。两时钟 + 单向指针让两张表各自稠密、互不阻塞。 |
-| 无状态身份（#7617） | egress-on 的 stage-0 直接从 op log 前沿计算（`MAX(op_seq)` + flow 的 `MAX(log_seq)` 前沿），无 `l1_world` 游标、无 resync。 | 日志本身已经是身份账本——第二个游标就是第三个时钟。R3 故障 latch 迁到 `sessions.r3_latched_at`（与旧列双载体读/清）。 |
+| 无状态身份（#7617） | egress-on 的 stage-0 直接从 op log 前沿计算（`MAX(op_seq)` + flow 的 `MAX(rid)` 前沿），无 `l1_world` 游标、无 resync。 | 日志本身已经是身份账本——第二个游标就是第三个时钟。R3 故障 latch 迁到 `sessions.r3_latched_at`（与旧列双载体读/清）。 |
 
 **为什么压缩（折叠）能在 flow 上做。** 折叠就是一组操作：`D` × 被覆盖原文 + `I`（摘要消息——它是上下文，所以进 flow），同一事务。摘要的**块对象**（生命周期 active/superseded/reaped、覆盖区间、被覆盖原文的 `one`/`full` 全文）住在**块表**里——flow 记「上下文现在是什么」，块表记「折叠做了什么得到它」。按需取全文（`decompress`）读块行，不读 flow。折叠**物化**：被覆盖的行从 **state 表**（服务视图）里被物理删除，而 **flow 保留它写过的每一行**——append-only 是 #7439 裁定，任意历史点位永远可重建。（2026-11-23 起实现曾把 flow 也删到最新 base 以下，本 PR 恢复裁定——见 issue 历史。曾用来给 state 副本封顶的 base 行/压实机制已整体退役——讨论 [#7773](https://github.com/ranxianglei/billion-context/discussions/7773)。）
 
@@ -34,8 +34,8 @@
 
 | 表 | 主键 | 作用 | 关键列 |
 |---|---|---|---|
-| `egress_flow` | `(session_id, op_seq)` | **消息**操作日志。表内稠密（#7574 不变量）。**append-only：任何机制都不裁剪它**（#7439）；恢复 = 回退到最新健康点；任意点位可完整重建（`egressStateAt`）。 | `row_type` I/D/U（退役的 `B` base 行已不存在，#7773）· I 行：`rid`（行 id，见下）、`msgid`、`log_seq`（规范消息号，永不复用）、`ref`、`tokens`、`bytes`、`role`、`type_tag` · D 行：区间 `(start, end)`（rid 值）——用行 id 寻址，**永不**用 msgid（2026-11-27 owner 裁定）+ 终态全量快照 · U 行：`rid`（目标行；该行的 msgid 保留为交叉校验）+ 新字节（再引用时带 `num`） |
-| `egress_state` | `(session_id, rid)` | **物化 live 视图**（7773）：每条**存活**消息一行，按 `pos` 排序。每次 append 在同一事务内把 op 应用到行上——`I` 插入（`pos` 后移）、`U` 就地改、`D` 物理删 + 前移。构造上以 live 视图大小为界；没有压实、没有 base 行、没有 op 镜像。msgid **可以**在 live 视图里重现（内容 hash 代理可以合法冲突、re-home 可以重现同一 msgid）；`rid` 不可以——所以主键与日志里的一切锚点都是 `rid`，`idx_egress_state_msgid`（session_id, msgid）只做 serving 查找。 | `rid`（稠密、每会话、永不重发——flow 永不删，所以 `MAX(rid)+1` 永远安全）、`pos`、`log_seq`（I 孪生在 flow 里的编号，不可变——孪生锚点）、`num`（当前内核引用号；0 = 无引用/已退役）、`msgid`、`ref`、`tokens`、`type`、`role`、`ts`、`sys_in`、`bytes`、`created_at`。`snapPinLiveIds`/serving 读命中它。 |
+| `egress_flow` | `(session_id, op_seq)` | **消息**操作日志。表内稠密（#7574 不变量）。**append-only：任何机制都不裁剪它**（#7439）；恢复 = 回退到最新健康点；任意点位可完整重建（`egressStateAt`）。 | `row_type` I/D/U（退役的 `B` base 行已不存在，#7773）· I 行：`rid`（自发行号 = **消息编号**，§10）、`msgid`、`tokens`、`bytes`、`role`、`type_tag` · D 行：区间 `(start, end)`（rid 值）——用行 id 寻址，**永不**用 msgid（2026-11-27 owner 裁定）+ 终态全量快照 · U 行：`rid`（目标行；该行的 msgid 保留为交叉校验）+ 新字节——U **永不带编号**（2026-11-28） |
+| `egress_state` | `(session_id, rid)` | **物化 live 视图**（7773）：每条**存活**消息一行，按 `pos` 排序。每次 append 在同一事务内把 op 应用到行上——`I` 插入（`pos` 后移）、`U` 就地改、`D` 物理删 + 前移。构造上以 live 视图大小为界；没有压实、没有 base 行、没有 op 镜像。msgid **可以**在 live 视图里重现（内容 hash 代理可以合法冲突、re-home 可以重现同一 msgid）；`rid` 不可以——所以主键与日志里的一切锚点都是 `rid`，`idx_egress_state_msgid`（session_id, msgid）只做 serving 查找。 | `rid`（稠密、每会话、**一次性**——flow 永不删，所以 `MAX(rid)+1` 永远安全；它就是消息编号，§10）、`pos`、`msgid`、`tokens`、`type`、`role`、`ts`、`sys_in`、`bytes`、`created_at`。`snapPinLiveIds`/serving 读命中它。（旧 `log_seq`/`num`/`ref` 列已删——2026-11-28 裁定。） |
 | `egress_block_flow` | `(session_id, op_seq)` | 追加式**块**历史。**独立编号池**（双时钟）。 | `row_type` I/U/D（reap = 一条 `D` 行，带该块的**终态全量快照**，#7773；退役的 `B` 行已不存在）· 快照 payload `{tier, startMsgid, startSeq, endMsgid, endSeq, supersedesBlockId, active, reaped, one, full}` · **`flow_op_seq`** = 写入时刻 flow 的 `MAX(op_seq)`（跨表指针）· kstate 边车（残差字段清单） |
 | `egress_block_state` | `(session_id, block_id)` | **物化** live 块：每个未 reap 的块一行，按 `pos` 排序；reap 物理删行（flow 保留终态 `D` 快照）。 | 快照 payload + `pos` + `op_seq`/`flow_op_seq` |
 | `egress_usage` | `(session_id, op_seq)` | 追加式**缓存/用量事件流**（owner 裁定 2026-11-27）：把内存 cache ledger 的变更记成 op log，进程重启后可重建（§12）。第三个 egress 时钟，独立编号池。 | `row_type` M/S/F · `at`（epoch ms——点位 fork 水位）· `payload` = 有界 JSON（S：`recordCacheSample` 的**精确**参数 + model · F：原始 fold 行） |
@@ -52,13 +52,11 @@
 
 | id | 在哪 | 它回答的问题 | 可否复用 |
 |---|---|---|---|
-| `op_seq` | flow / block_flow / usage 主键 | 「**这张表的第 N 次写盘**」——物理日志游标；fork 与 point 水位骑在它上（或块平面用 `flow_op_seq` 指针挂到它上） | 单调，但指**事件**不指行：一行的生命（I→U→U→D）要占好几个 op_seq——行用它的 I 行 `rid` 寻址，不指望写在哪 |
-| `log_seq` | flow I 行 / state | 「**kernel 引用**这行用几号」——`mNNNNN` = m + log_seq，一个号不是两个（§10） | 可被重引：fold summary 合法接手退役槽位（demote → re-home，§10 规则 7）——正因如此它**不能**当行身份 |
-| `num` | state 行 + U payload | 该行**当前**的 kernel 引用号；`0` = 未被引用/已 demote | 跟着 kernel 事实走，+U num |
+| `op_seq` | flow / block_flow / usage 主键 | 「**这张表的第 N 次写盘**」——物理日志游标；fork 与 point 水位骑在它上（或块平面用 `flow_op_seq` 指针挂到它上），append 的并发守卫断言它 | 单调，但指**事件**不指行：一行的生命（I→U→U→D）要占好几个 op_seq |
+| `rid` | flow I/U 行 + state 主键 | 「**哪一行**」——每个 op payload 的指针目标（D 端点、U 目标、I 锚点）——**并且**「这条消息几号」：模型可见 tag = `m` + rid，渲染时派生（§10） | 会话内稠密（`MAX(rid)+1` 看**整个** flow，含已退役行），**一次性**：`D` 永久退役其 rid；写入口拒绝 ≤ 前沿的 `I` |
 | `pos` | state 表 | 「它在**当前 live 视图**里排第几」 | 瞬态，每次插入/删除都变 |
-| `rid` | flow I/U 行 + state 主键 | 「**哪一行**」——每个 op payload 的指针目标（D 端点、U 目标、I 锚点） | 会话内稠密（`MAX(rid)+1`），永不重发（flow 永不裁剪） |
 
-一句话：**log_seq/num 是引用号（允许重发），rid 是行身份（禁止复用），op_seq 是写盘计数，pos 是视图偏移。** #7849 之前的形状让 msgid 一个人同时扛引用身份和行身份两件事——内容 hash 派生的 msgid 可能合法重现，D 行寻址就是这么坏的（owner 裁定 2026-11-27）。
+一句话：**rid 既是行也是号（一次性），op_seq 是写盘计数，pos 是视图偏移。** 2026-11-28 之前还有一套内核引用号（`log_seq`/`num`）与行身份（`rid`）双发号人并存——引用号可能撞到活行的号，让 op log 永久冻死（2026-11-28 事故，§10）。#7849 之前的形状让 msgid 一个人同时扛引用身份和行身份两件事——内容 hash 派生的 msgid 可能合法重现，D 行寻址就是这么坏的（owner 裁定 2026-11-27）。
 
 fork **不需要任何 id 转换**：所有主键都是 `(session_id, rid)`，子会话的拷贝行由会话 id 隔离命名空间，op 永不跨会话——子的 rid 原样保留（血缘身份），从自己的 `MAX(rid)+1` 续编。**usage** 流（§12）根本不携带 rid（事件只引用 kernel 块 id 和时间戳），所以 fork 拷贝——整拷（to-now）或 `at <= W` 前缀（point）——就是纯行拷贝，重放重建 ledger，没有任何重映射。
 
@@ -131,23 +129,24 @@ fork **不需要任何 id 转换**：所有主键都是 `(session_id, rid)`，�
 | 讨论 [#7773](https://github.com/ranxianglei/billion-context/discussions/7773)（2026-11-26） | **形态再裁定**：两平面的 `B` base 行退役；state 表变为**物化 live 视图**（PK `(session_id, msgid)`、`pos` 序；D 物理删、折叠 O(尾长)）；恢复变为一趟全史 walk（`egressFlowWalkBack`）；点位 fork 重放物化到**任意**点位；每次写入后断言结构不变量（§3）。存量不迁移——表从未随版本发布，已有库把四张 egress 表 drop 重建（owner 操作手册：删 `index.db*` + 重启）。 |
 | Owner 裁定（2026-11-27，#7773 后续——实测 D 行审计） | **行寻址改用自派行 id（`rid`）**：日志 payload 里的 msgid 不是可靠地址——proxy 会把宿主 id 映射成内容 hash、客户端 id 可能冲突、折叠/re-home 之后同一个 msgid 分不清指哪一次。所有 egress 表改由稠密、append-only、永不重发的 `rid` 寻址：`egress_state` PK `(session_id, rid)`（+ `idx_egress_state_msgid` 供 serving 查找），`egress_flow` I 行带 `rid`、D/U payload 引用 rid。内核身份缝（prev↔next diff 匹配）继续用 msgid——只有**持久寻址层**变了。从未发布规则再次适用：旧形态探针（缺 `rid`）首开 drop 重建；开发库按 §7 手册毁库重建。 |
 
+| Owner 裁定（2026-11-28，[discussions/7903](https://github.com/ranxianglei/billion-context/discussions/7903)——双发号人事故） | **`rid` 成为唯一消息编号**：内核引用号（`log_seq`/`num`）与行 allocator 是两个发号人；客户端重启后一个引用号落到活行的号上，此后每轮写入都被拒、记账永久冻结。裁定删掉第二个发号人：rid 一次性（`MAX(rid)+1` 看整个 flow）、U op 永不带编号、模型 tag 渲染时派生（`m` + rid）、内核 refs 账本冷加载从 egress 表重建。不做兼容层——旧形态表 drop 重建（§10）。 |
+
 **遗留**（已跟踪）：egressPlane 默认翻 100（等 owner 点头）；归档格式承载 op log；退役身份载体的物理 DROP 批次；按退役登记表删开关（硬编码开）。（point-reconstruction materializer 与 `egressBlockCompact` 生产调用方已被 #7773 退役——点位 fork 重放物化，块压实不复存在。）
 
-## 10. 重编号——log_seq 就是引用号（定稿设计，2026-11-25）
+## 10. 编号——rid 就是消息编号（owner 裁定，2026-11-28，[discussions/7903](https://github.com/ranxianglei/billion-context/discussions/7903)）
 
-**背景——本次收掉的分裂。** 内核给每条真消息发一个引用号（`m00001`、`m00002`…——`assignRefs`，落在 `refs` 表），op log 另有一套 `log_seq` 计数，两套编号空间只靠消息 raw id 关联。kstate 退役（#758 PR-B）在冷加载时从 op log 视图重建 `messageRefs` 时，这个分裂咬了人：op log 给**恒定 system 行**排了第一号，视图于是铸出 `m00001 → egress-system`，把所有真消息整体 +1；重建出的 refs 与按内核引用号落盘的 `tokenSnapshot` 对不上，折叠后每一轮的线上 tag 都带错了 token 数。"加载时忽略 overlay"只治标；设计裁定（owner，2026-11-25）是**op log 是唯一正史，那么内核引用号与 `log_seq` 就是同一个号**——不再存在第二套编号可以跟它漂移，egress 体系也不再需要引用外部表。
+**取代 2026-11-25 的重编号（旧 §10：「log_seq 就是引用号」）。** 那套设计把两个发号人焊在一起——行 allocator 与内核 refs 账本——引用号仍然可能落到一个已被活行持有的号上。2026-11-28 事故（owner 机器，会话 `01a2222a`）：客户端重启后内核引用号迟到；第一轮 diff 把一个引用号钉到一个已持有该号的活行上，整批写入被拒，而——diff 每轮一字不差地重放——egress 记账**永久冻结**（一小时内两个会话；「self-heals next turn」的 warn 是假的）。裁定把第二个发号人整个删掉：**每条消息只有一个编号，就是它的 rid。** 不做兼容层——平面从未发布，旧形状表（存在 `log_seq`/`num`/`ref` 任一列）打开时 drop 重建。
 
 **规则。**
 
-1. **`log_seq` ≡ 引用号。** 真实消息的 `log_seq` 就是内核分给它的那个号（`mNNNNN` = `m` + `log_seq`），写 I 行时落盘。旧的 `MAX(log_seq)+1` 计数器只作为"该 id 没有账本条目"时的兜底，绝不覆盖已知编号。内核编号稠密、一次性分配、永不复用（退役槽位是死的，#5196），所以新分配的号恰为 `MAX(log_seq)+1`——日志完备后计数器与账本天然一致。**冲突规则（2026-11-25 细化）：** 低于本批高水的引用号是合法的——它表示该槽位已退役（压缩把内容搬了家）——只有当该号与 op 位置上仍然**存活**的行相撞时才拒绝写入（内核可能在折叠的 D 行入账前就把退役槽位分了出去）；没有账本条目的行取稠密兜底，且必须高于**本批所有引用号**（内核自己的折叠摘要 id 没有 refs 条目、渲染在引用号之间——序列中间插一个稠密号会抢走下一个引用号，如 fork 子会话折叠里的 `acp_summary_b2`）。
-2. **system 行编号 0。** 落在引用空间（从 1 开始）之外。什么都不用过滤："系统提示词不占消息引用号"变成构造上为真，对一切派生视图（pin 账本、kstate 重建、replay）都为真——因为被过滤的那个号根本不该存在于这个空间里。
-3. **arm 时自愈回填。** 中途 arm 的会话（开平面前有 legacy 落盘）在 op log 里缺 arm 前的消息。不需要标记行：arm 后的第一次记账看到的是空日志，diff 于是为**全部**存活消息发 I 行、各带其现有内核号——这一次自然的首趟就是回填。幂等是结构性的：按缺失的 `msgid` 补行，第二趟无新行可补；日志被截断/损坏也用同一路径自愈（缺的行在下一次记账时回来）。fork 逐行拷贝 flow，回填的号随迁移走。生而 egress-on 的会话永远不需要：system 是 0，第一条真消息就是 1。
-4. **`refs` 表：egress-on 停写，读兑底保留。** 回填后 op log 覆盖全部历史，egress-on 会话停止写 `refs` 行（已登记 [deprecations.zh-CN.md](./deprecations.zh-CN.md)）；读方对回填前/legacy 会话继续回退到该表，直到物理 DROP 批次。
-5. **kstate overlay 成为正当路径。** 冷加载按 `{rawId → m + log_seq}` 从 op log 视图推导 `messageRefs`——由规则 1，这正是内核在进程内分配的同一个映射。"别让 overlay 覆盖已存 refs"的权宜补丁不再需要：编号一致后它本来就是对的。
-6. **系统提示词：输入形态在 `egress_state`，账本形态在 flow。** 一个文本、两种形态、不再第三份：flow 的 system 行保留**拼装成品**（客户端 system `A` + 服务端常驻块 `B`，每轮实时计算；transcript 要的就是真正发出去的东西）。**客户端原文 `A`** 在 egress 表内拿到永久住所——`egress_state` 上固定 `egress-system` msgid、编号 0 的一行，客户端改了就发 U 更新（`sessions` 不动 DDL）。结果：`session_ext` 里的粘性副本（`inc:system`）对 egress-on 会话退役——已登记 [deprecations.zh-CN.md](./deprecations.zh-CN.md)；增量车道对 egress-on 会话从 egress state 读 `A`（legacy/关平面不动）。两种形态都从 egress 表可查，不再"真正的系统提示词在扩展列里"。
-7. **编号生命周期——存储行跟随内核引用事实（2026-11-26 定稿）。** 一行的 `num` 是它**当前**的内核引用号；**无引用时为 0**。稠密兜底（规则 1）给没有账本条目的行（受保护/BLOCKED 行、内核摘要行）发一个占位号——占位号是内核计数器**永远看不见**的。于是内核计数器日后完全可能引用一个仍被占位号持有的槽位；这个分叉是结构性的，不是数据损坏。日志在一轮内、于 diff 处对账：spine 行的有效 num 相对 refs 账本变化时发一条**带 `num` 的 +U**（payload 加字段；该 op 自身的 `log_seq` 仍为 NULL）——N→0 = 降级（该号**退役**，永不复用），0→N = 回落到内核引用号上，N→M = 跟随重钉。重放先于同批后续 I 应用 U 的 `num`（D、U、I 的 op 顺序），所以刚释放槽位的再引用合法，而与该行仍**存活**的引用号相撞仍然拒绝（那才是真内核损坏）。稠密游标仍从 flow 高水位之后起走，退役槽位永不复用。没有这次对账时，此后每一轮写入都被拒（`cited number N is already live`）——op log 冻结、服务降级到客户端字节，正是本修复消除的故障形态。
+1. **`rid` ≡ 消息编号。** `I` 时从**整个** flow 的 `MAX(rid) + 1` 发号（含已退役行——flow append-only 永不裁剪，所以前沿总能看见所有发过的 rid）。会话内稠密、**一次性**：`D` 永久退役其 rid，`I` 拿新号。写入口拒绝任何 ≤ 前沿的 `I`（`duplicate row id …` / 一次性守卫）——事故形态变成硬错误且无任何写入；日志停在最后一个健康点。
+2. **system 行拿自己的 rid**（新会话里是 rid 1）——没有保留的 0，没有「引用空间之外」的过滤；内核 overlay 构建 refs 时跳过 `egress-system` msgid 即可。
+3. **U op 永不带编号。** 改一行不改变其 rid；一行搬家 = `D`+`I`，**消耗**一个新 rid（旧号保持已花）。退役的 `+U num` / demote / re-home 机制整体删除——只有一个发号人就没有东西要对账。
+4. **模型可见 tag 是派生的，不是存储的。** `mNNNNN` = `"m" + String(rid).padStart(5, "0")`，渲染时计算（`egress-block`）。内核 `messageRefs` 账本在冷加载时**从 egress 表重建**（`{msgid → m+rid}`）——内核与 egress 平面构造上共享同一个编号；record/authority 路径（全部四个 lane）上的 `EgressRefMap`/`citationNumber` 与一切 `refMap` 参数已删。
+5. **系统提示词保持两种形态**（与 2026-11-25 规则 6 不变）：拼装成品在 flow 的 system 行，客户端原文 `A` 作为固定 `egress-system` 行上的 `sys_in`，egress-on 的 `session_ext inc:system` 粘性副本退役。
+6. **arm 时回填**（精神不变）：arm 后的第一次记账对空视图 diff，按视图顺序为整个 live 对话发 `I` 行、各拿新 rid——按行存在幂等。
 
-**为什么对平面其余部分是安全的。** fork 原样拷贝 flow 行，回填的编号随会话走；前沿 = flow 上的 `MAX(log_seq)`（退役 base payload 的 `highWater` 已不存在，7773）——stage-0 读的 `MAX(log_seq)` 前沿与下一号兑底两边都引用对齐；CCR 与块表以 `op_seq`/`msg_id` 为键，与引用号无关。附带收益：egress-on 的引用空间与 legacy 边**逐字相同**（两边 `m00001` 都是第一条真消息），加载重编号机制（#4316）整体退出 egress-on 路径——"重编号后快照过期"这一 bug 类在 egress-on 上不再存在。
+**为什么对平面其余部分安全。** fork 原样拷贝 flow 行，编号随会话走；前沿 = flow 上的 `MAX(rid)`——fork 子会话继续父会话的编号空间（裁定 7439）；CCR 与块表以 `op_seq`/`msgid` 为键，与编号无关。egress-on 的引用空间与 legacy 边**逐字相同**（`m00001` = 第一条消息，system 行不进 refs），加载重编号机制（#4316）整体退出 egress-on 路径。引用号撞活行的死锁类——以及随之而来的永久记账停止——已经没有代码能表达它。E2E：`tests/egress-rid-restart-e2e.test.ts`（服务端+客户端重启、重启后折叠、编号继续自增）。
 
 ## 11. 扫尾（2026-11-25，讨论 [#7735](https://github.com/ranxianglei/billion-context/discussions/7735)）——身份行、表创建门、kv 策略
 

@@ -47,7 +47,7 @@
 
 ## 5. 持久化单一事实源
 
-统一存储 `messages.msg_id` 列是唯一 id 事实源:ingest 时把校验过的 id 钉进行(T5 裁定:无双平行 ledger、skeleton 行不携 id)。账本主键 `(session_id, msg_id, content_hash)`;canonical 行按 **MSGID 而非内容 hash** 键控(#4491);fork 克隆保号(#4316 L3 PR3/3 `cloneSessionRows`)。**KDD #23 例外(仅 egress-on 会话):op log 是正史消息权威**(`egress_flow.msgid` + `log_seq`);messages 行降级为**惰性投影**(平面回滚 / web 读 / 恢复时一次性重建),pin 通道(KDD #21/#22)对这些会话改解析 op log 的 I 行而非本账本——其余消费者不变。
+统一存储 `messages.msg_id` 列是唯一 id 事实源:ingest 时把校验过的 id 钉进行(T5 裁定:无双平行 ledger、skeleton 行不携 id)。账本主键 `(session_id, msg_id, content_hash)`;canonical 行按 **MSGID 而非内容 hash** 键控(#4491);fork 克隆保号(#4316 L3 PR3/3 `cloneSessionRows`)。**KDD #23 例外(仅 egress-on 会话):op log 是正史消息权威**(`egress_flow.msgid` + `rid`);messages 行降级为**惰性投影**(平面回滚 / web 读 / 恢复时一次性重建),pin 通道(KDD #21/#22)对这些会话改解析 op log 的 I 行而非本账本——其余消费者不变。
 
 ## 6. 消费方(五个,id 各自回答什么问题)
 
