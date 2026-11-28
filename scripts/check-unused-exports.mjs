@@ -41,6 +41,7 @@ const ENTRY_FILES = new Set([
     "src/zcode/mcp-entry.ts",
     "src/zcode/bootstrap-hook.ts",
     "src/agent/dsh-native-client.ts",
+    "src/salvage.ts",
 ]);
 
 // `--others --exclude-standard` pulls in NEW, not-yet-committed files too:
