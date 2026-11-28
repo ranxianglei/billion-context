@@ -2,6 +2,8 @@ import type { CoreMessage } from "acp-kernel";
 import { injectResponsesDeveloperMessage, type ResponseInputItem, type ResponsesProjection } from "acp-kernel/wire";
 import { keepResponseId as knobKeepResponseId } from "../knobs.js";
 import { joinResponsesSystemSections } from "../responses-system-sections.js";
+import { normalizeCodexResponsesEgressInput } from "../codex-ws-replay.js";
+import { isCodexWsReplayTransport } from "../fetch-transport.js";
 import { coreToResponsesWithToolImages as coreToResponses, patchResponsesInputWithToolImages as patchResponsesInput, mergeAdjacentConfigurationUpdates } from "../responses-tool-output.js";
 import { buildVisibilityMarker } from "./core.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
@@ -284,7 +286,7 @@ function buildCompleted(responseObj: Record<string, unknown> | null): Buffer {
     );
 }
 
-export function createResponsesAdapter(textProtocol?: boolean, projection?: ResponsesProjection, absorbName?: string, notes?: string[]): CompressLoopAdapter {
+export function createResponsesAdapter(textProtocol?: boolean, projection?: ResponsesProjection, absorbName?: string, notes?: string[], codexResponsesReplay?: boolean): CompressLoopAdapter {
     const suppressTextLifecycle = !!textProtocol;
     let outputIndex = 0;
     let responseObj: Record<string, unknown> | null = null;
@@ -337,7 +339,7 @@ export function createResponsesAdapter(textProtocol?: boolean, projection?: Resp
             const finalInput = notes && notes.length > 0
                 ? [...withDev, ...notes.map((text) => ({ type: "message" as const, role: "user" as const, content: text }))]
                 : withDev;
-            const rebuilt: Record<string, unknown> = { ...requestBody, input: finalInput };
+            const rebuilt: Record<string, unknown> = { ...requestBody, input: (codexResponsesReplay || isCodexWsReplayTransport()) ? normalizeCodexResponsesEgressInput(finalInput) : finalInput };
             // #1954: same as the HTTP path — warn when we strip a non-empty
             // chain ref, since a delta continuation then loses its history silently.
             if (!knobKeepResponseId()) {

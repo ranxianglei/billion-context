@@ -21,6 +21,8 @@ Every model-traffic request that reaches the proxy passes through this module: i
 
 **Prepare (per-wire).** `prepare-anthropic` / `prepare-openai` / `prepare-responses` / `prepare-google` convert the request to canonical cores (in-flight envelope fields such as host msgids are stripped here — see [identity](./identity.md)), run the fold→rebuild→injection sequence, and place the system message and the nudge where that wire requires it.
 
+**Codex Responses replay.** On non-plugin Codex HTTP and WebSocket requests, `src/codex-ws-replay.ts` conservatively normalizes recognized assistant and empty encrypted-reasoning envelopes at egress, including internal loop rebuilds. The WS continuation comparison uses the same equivalence. Reasoning ingress identities, encrypted content, summaries, substantive content, unknown shapes, other clients, and plugin traffic retain their original handling.
+
 **Kernel.** The canonical cores plus the session's `CompressionState` go to acp-kernel; the decision and its artifacts come back — see the [kernel module](./kernel.md).
 
 **Unified loop (`src/loop`).** A protocol-neutral core with four wire adapters performs tool adjudication and the prose tag-echo filter (`tag-echo-filter.ts` — prose only, arguments untouched). This is where the two compression modes keep the same code path (KDD #7): plugin mode suppresses tool + nudge injection because the agent owns compression; proxy mode emits the `acp_summary` carrier, re-voiced as a user message so strict backends keep a stable prefix.

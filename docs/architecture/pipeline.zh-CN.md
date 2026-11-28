@@ -21,6 +21,8 @@
 
 **准备（按 wire）。** `prepare-anthropic` / `prepare-openai` / `prepare-responses` / `prepare-google` 把请求转成 canonical cores（宿主 msgid 等 in-flight 信封字段在此剥掉——见 [identity](./identity.zh-CN.md)），跑折叠→重建→注入，把 system 与 nudge 落到该 wire 要求的位置。
 
+**Codex Responses 重放。** 对非插件 Codex HTTP 和 WebSocket 请求，`src/codex-ws-replay.ts` 在出站时保守统一符合条件的 assistant 和空内容加密 reasoning 信封，内部 loop 重建使用相同规则；WebSocket 续接比较也使用相同等价判断。reasoning 入站身份、密文、摘要、实际内容、未知结构、其他客户端和插件流量保持原有处理。
+
 **内核。** canonical cores 加会话的 `CompressionState` 进 acp-kernel，判定与产物回来——见 [kernel 模块](./kernel.zh-CN.md)。
 
 **统一 loop（`src/loop`）。** 协议中立核心 + 4 个 wire 适配器，做工具裁决与散文 tag-echo 过滤（`tag-echo-filter.ts`——只滤散文、参数不动）。两种压缩模式在这里共用同一条代码路径（KDD #7）：plugin 模式抑制 tool + nudge 注入（agent 自己压）；proxy 模式发 `acp_summary` 载体、改口为 user 消息，让严格后端保持前缀稳定。

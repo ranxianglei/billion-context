@@ -34,11 +34,12 @@ export function pickAdapter(
     anthropicCacheMarks?: Map<string, { type: "ephemeral" }>,
     anthropicClientCacheControls?: Map<string, unknown>,
     absorbArmed?: boolean,
+    codexResponsesReplay?: boolean,
 ): CompressLoopAdapter {
     // #1455: how upstream stream failures are presented to the client —
     // protocol-native error frames (default) or legacy synthesized completion.
     const shape = streamErrorShape ?? "protocol";
-    if (protocol === "responses") return createResponsesAdapter(textProtocol, responsesProjection, absorbName, systemNotes);
+    if (protocol === "responses") return createResponsesAdapter(textProtocol, responsesProjection, absorbName, systemNotes, codexResponsesReplay);
     if (protocol === "openai") return createOpenaiAdapter(requestBody, openaiSystem, absorbName, systemNotes, shape);
     if (protocol === "anthropic") return createAnthropicAdapter(requestBody, anthropicSystem, systemNotes, shape, anthropicCacheMarks, anthropicClientCacheControls, absorbArmed);
     if (protocol === "google") return createGoogleAdapter(requestBody, google?.system, absorbName, google?.model, systemNotes);

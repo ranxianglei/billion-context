@@ -2081,6 +2081,9 @@ export type Prepared = {
     responsesTextProtocol?: boolean;
     resetAfterSuccess?: boolean;
     responsesProjection?: ResponsesProjection;
+    /** Keep Codex HTTP and WS initial and internal-loop replays in the same
+     * conservative egress representation. */
+    codexResponsesReplay?: boolean;
     anthropicSystem?: AnthropicRequestBody["system"];
     /** #2189: the client's billing-attribution block captured from the INBOUND
      *  anthropic system (pre-anchor). Preflight summary calls must carry it —

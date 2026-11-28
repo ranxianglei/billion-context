@@ -29,6 +29,8 @@
 
 **ゲートとリカバリ。** `preflight.ts` (ホールドグレース、デッドエンドクールダウン)、`reasoning-guard` (署名済みペイロードは決してフォールド入力にならない)、`request-body-budget` (受信/デコード/送信バイト上限、パフォーマンスより可用性 #3128)、`content-encoding` (デコンプレッションボムガード、413)。エラー形状: `stream-error` (最小限の SSE エラー + 終了)、`fake-completion` (オプトインのリトライヒント)、`degenerate-turn` / `degenerate-retry`、および `exit-matrix` (ワイヤー終了 × 懸念事項、#588)。
 
+**Codex Responses リプレイ。** 非プラグインの Codex HTTP / WebSocket では、`src/codex-ws-replay.ts` が対象を限定して assistant と空内容の暗号化 reasoning の送信表現を統一します。内部 loop と WebSocket 継続比較も同じ規則を使用します。reasoning の受信時 ID、暗号文、要約、実際の内容、未知の構造、他クライアントとプラグインは従来どおりです。
+
 ## 主要エントリ
 
 `src/server/handle.ts` (トリアージ) · `src/server/prepare-*.ts` (ワイヤーごとのリクエスト準備) · `src/marker/` (受信タグストリップ) · `src/loop/` (統一コア + アダプタ) · `src/server/stream-*.ts` (ワイヤーごとの送信) · `src/egress-transforms.ts` (ユーザー送信ボディ書き換えプラグイン、#6003) · `src/server/preflight.ts` · `src/server/exit-matrix.ts`
