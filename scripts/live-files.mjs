@@ -172,6 +172,9 @@ export const LIVE_FILES = [
     // mkdtemp-isolated per test, so the zone band is irrelevant; the entry is
     // for the tripwire, like #5046/#4612.
     "tests/storage-backup-repair.test.ts",
+    // #6831: runs the import-graph gate script as a child process against a
+    // throwaway git fixture; no sockets — the entry is for the tripwire
+    "tests/check-test-import-graph.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
