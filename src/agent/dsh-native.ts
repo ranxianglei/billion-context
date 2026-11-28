@@ -67,7 +67,7 @@ import { bodyOverWindowDetail as sharedBodyOverWindowDetail, getDeclaredModelEnd
 import { matchModelEndpoint, loadDeclaredModelEndpoints } from "../model-endpoints.js";
 import { runOutsideFetchChain } from "./fetch-chain/index.js";
 import { installNativeWebSocketIntercept } from "./native-ws-intercept.js";
-import { asciiHeaderValue, fetchManifest, fetchProxyManifestVersion, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyManifestVersion, fetchProxyVersion, fetchStatus, fetchStatusLatest, forwardTool, isTransientConnectionError, reportAttributionHealth, reportRuntimeInfo, waitForProxyVersion, withConnectionRetry, type ManifestTool } from "./shared.js";
 import { createForkAdopter, sideShapedBody } from "./fork-adopt.js";
 import { detectWireFormat } from "acp-kernel/wire";
 import { coreAlignEnvelopeIds, laneMsgIdsForOpenAiWire, laneMsgIdsForResponsesWire, laneMsgIdsForWire } from "./pi-msgids.js";
@@ -1800,33 +1800,19 @@ function latestSessionNote(status: Record<string, unknown>, requestedSid: string
         : `⚠️ bili: could not identify the current session — showing ${resolved} instead.`;
 }
 
-async function statusOutcome(ctx: PluginContext, invocation?: CommandInvocation): Promise<CommandOutcome> {
-    const base = register.base;
-    if (!base) {
-        // #3380 P3: toolsReady implies a proxy WAS serving this session — a
-        // missing origin is then a transient outage with recovery running,
-        // not a missing install.
-        return {
-            kind: "error",
-            text: register.toolsReady
-                ? "bili: proxy temporarily unreachable — it was serving this session before and recovery is running in the background; compression resumes automatically when it answers."
-                : "bili: no proxy detected — install via `bili plugin install dsh` or launch through `bili dsh`.",
-        };
-    }
-    maybeRetry(ctx);
-    // #3380 P3: wire-mode exposure — the proxy answers but the local tools are
-    // down, so every model request rides bili WITHOUT identity headers
-    // (anonymous zero-fold sessions, no compression). Say so in the panel the
-    // user already looks at instead of letting it stay silent.
-    const wireNote = !register.toolsReady && !register.dead
-        ? `⚠️ bili tools NOT registered — model requests ride bili WITHOUT identity headers (wire mode: no compression, anonymous sessions). Last error: ${register.lastRegistrationError ?? "unknown"}. Restart dsh to restore; retries continue in the background.\n\n`
-        : "";
+// #3380 P3 / #7758: the "proxy was serving, now momentarily unreachable" notice. Two
+// distinct triggers share it: (a) register.base was cleared (respawn gave up / dead-attach /
+// failed spawn — recovery running in the background) and (b) base is still valid but the port
+// is momentarily dead during a FAST respawn window (connection refused). Both are transient.
+const DSH_TRANSIENT_UNREACHABLE_TEXT =
+    "bili: proxy temporarily unreachable — it was serving this session before and recovery is running in the background; compression resumes automatically when it answers.";
+
+async function readStatusPanel(base: string, sid: string | undefined, wireNote: string): Promise<CommandOutcome> {
     // #1677: the command executor hands us the invoking session via the invocation —
     // DSH never establishes the AsyncLocalStorage boundary on the command path, so
     // currentInitiator() is always empty here and relying on it made /acp silently
     // show ANOTHER (most-recently-active) session's panel. Prefer the invocation's
     // agent session id; fall back to ALS attribution, then the latest-session fallback.
-    const sid = invocationSidOf(invocation) ?? sessionIdOf(ctx);
     let fellBackToLatest = false;
     let status: Record<string, unknown> | undefined = sid !== undefined ? await fetchStatus(base, sid) : undefined;
     if (status === undefined) {
@@ -1867,23 +1853,49 @@ async function statusOutcome(ctx: PluginContext, invocation?: CommandInvocation)
     };
 }
 
+async function statusOutcome(ctx: PluginContext, invocation?: CommandInvocation): Promise<CommandOutcome> {
+    const base = register.base;
+    if (!base) {
+        // #3380 P3: toolsReady implies a proxy WAS serving this session — a
+        // missing origin is then a transient outage with recovery running,
+        // not a missing install.
+        return {
+            kind: "error",
+            text: register.toolsReady
+                ? DSH_TRANSIENT_UNREACHABLE_TEXT
+                : "bili: no proxy detected — install via `bili plugin install dsh` or launch through `bili dsh`.",
+        };
+    }
+    maybeRetry(ctx);
+    // #3380 P3: wire-mode exposure — the proxy answers but the local tools are
+    // down, so every model request rides bili WITHOUT identity headers
+    // (anonymous zero-fold sessions, no compression). Say so in the panel the
+    // user already looks at instead of letting it stay silent.
+    const wireNote = !register.toolsReady && !register.dead
+        ? `⚠️ bili tools NOT registered — model requests ride bili WITHOUT identity headers (wire mode: no compression, anonymous sessions). Last error: ${register.lastRegistrationError ?? "unknown"}. Restart dsh to restore; retries continue in the background.\n\n`
+        : "";
+    const sid = invocationSidOf(invocation) ?? sessionIdOf(ctx);
+    // #7758: a fast proxy respawn opens a ~1.4s window where the port is momentarily dead —
+    // retry the read briefly, then show the friendly "temporarily unreachable" notice instead
+    // of a bare `fetch failed`.
+    try {
+        return await withConnectionRetry(() => readStatusPanel(base, sid, wireNote));
+    } catch (err) {
+        if (isTransientConnectionError(err)) {
+            // #7758: the "was serving, now recovering" notice is only accurate when the proxy
+            // WAS serving (toolsReady). Otherwise fall back to the plain "not reachable".
+            return { kind: "error", text: register.toolsReady ? DSH_TRANSIENT_UNREACHABLE_TEXT : `bili: proxy not reachable at ${base} — is the bili proxy still running?` };
+        }
+        throw err;
+    }
+}
+
 /** One `/acp-cache` invocation (#1146): same report as the acp_cache tool.
  *  Session-bound when the host exposes the current session id, else resolved
  *  through the status endpoint's latest-active fallback. The host's command
  *  API passes no arguments, so this lane always shows the default
  *  (summary-ledger) report — no `full`. */
-async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation): Promise<CommandOutcome> {
-    const base = register.base;
-    if (!base) {
-        return {
-            kind: "error",
-            text: "bili: no proxy detected — install via `bili plugin install dsh` or launch through `bili dsh`.",
-        };
-    }
-    maybeRetry(ctx);
-    // #1677: same session-resolution fix as /acp — the command path carries no ALS
-    // attribution, so prefer the invocation's agent session id over currentInitiator().
-    const sid = invocationSidOf(invocation) ?? sessionIdOf(ctx);
+async function readCacheReport(base: string, sid: string | undefined): Promise<CommandOutcome> {
     let target = sid;
     let fallbackNote: string | undefined;
     if (target === undefined) {
@@ -1894,7 +1906,11 @@ async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation):
                 target = cid;
                 fallbackNote = latestSessionNote(status ?? {}, sid);
             }
-        } catch {
+        } catch (err) {
+            // #7758: a connection error means the port is momentarily dead (fast respawn) —
+            // re-throw so withConnectionRetry can retry; other errors (timeout) keep the
+            // historical swallow-to-undefined behavior.
+            if (isTransientConnectionError(err)) throw err;
             target = undefined;
         }
     }
@@ -1902,7 +1918,8 @@ async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation):
         let version: string | undefined;
         try {
             version = await fetchProxyVersion(base);
-        } catch {
+        } catch (err) {
+            if (isTransientConnectionError(err)) throw err;
             version = undefined;
         }
         if (version) {
@@ -1918,11 +1935,39 @@ async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation):
         if (report.failed) return { kind: "error", text: report.text };
         return { kind: "success", text: fallbackNote !== undefined ? `${fallbackNote}\n\n${report.text}` : report.text };
     } catch (err) {
+        if (isTransientConnectionError(err)) throw err;
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes("no model request has arrived")) {
             return { kind: "success", text: "bili: no ACP session yet for this conversation (send a model request first, then run /acp-cache)" };
         }
         return { kind: "error", text: `bili: cache report failed: ${msg}` };
+    }
+}
+
+async function cacheOutcome(ctx: PluginContext, invocation?: CommandInvocation): Promise<CommandOutcome> {
+    const base = register.base;
+    if (!base) {
+        return {
+            kind: "error",
+            text: "bili: no proxy detected — install via `bili plugin install dsh` or launch through `bili dsh`.",
+        };
+    }
+    maybeRetry(ctx);
+    // #1677: same session-resolution fix as /acp — the command path carries no ALS
+    // attribution, so prefer the invocation's agent session id over currentInitiator().
+    const sid = invocationSidOf(invocation) ?? sessionIdOf(ctx);
+    // #7758: a fast proxy respawn opens a ~1.4s window where the port is momentarily dead —
+    // retry the read briefly, then show the friendly "temporarily unreachable" notice instead
+    // of a bare `fetch failed`.
+    try {
+        return await withConnectionRetry(() => readCacheReport(base, sid));
+    } catch (err) {
+        if (isTransientConnectionError(err)) {
+            // #7758: the "was serving, now recovering" notice is only accurate when the proxy
+            // WAS serving (toolsReady). Otherwise fall back to the plain "not reachable".
+            return { kind: "error", text: register.toolsReady ? DSH_TRANSIENT_UNREACHABLE_TEXT : `bili: proxy not reachable at ${base} — is the bili proxy still running?` };
+        }
+        throw err;
     }
 }
 

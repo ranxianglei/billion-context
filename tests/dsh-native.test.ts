@@ -1078,9 +1078,11 @@ test("apply() /acp-cache (#1146): unreachable proxy reports an error", async () 
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cache-down-"));
     try {
         await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
-            // healthy attach first (so register.base is set), then kill the
+            // healthy attach first (so register.base is set + toolsReady), then kill the
             // proxy before the handler runs — a dead preset would instead
-            // trigger the #983 spawn fallback, which this test does not want
+            // trigger the #983 spawn fallback, which this test does not want.
+            // #7758: the proxy WAS serving (toolsReady), so a connection-refused now shows
+            // the friendly "temporarily unreachable … recovering" notice, not a bare error.
             const proxy = await startMockProxy([]);
             try {
                 _resetRegisterForTest(proxy.origin);
@@ -1093,7 +1095,8 @@ test("apply() /acp-cache (#1146): unreachable proxy reports an error", async () 
                 proxy.close();
                 const out = await cacheCmd.handler();
                 assert.equal(out.kind, "error");
-                assert.match(out.text, /proxy not reachable/);
+                assert.match(out.text, /temporarily unreachable/);
+                assert.doesNotMatch(out.text, /fetch failed/);
             } finally {
                 _resetRegisterForTest(undefined);
             }
@@ -1718,6 +1721,47 @@ test("apply() /acp pre-first-request (#955): renders the runtime-table entry bef
         });
     } finally {
         proxy.close();
+        rmrf(home);
+        _resetRegisterForTest(undefined);
+    }
+});
+
+// #7758: a fast proxy respawn (owner-gone → spawner re-listens the same port) opens a ~1.4s
+// window where the port is momentarily dead. register.base STAYS valid (same port) and
+// toolsReady stays true, so the #3393 `!base` branch never fires — the command fetch hits the
+// dead port and must retry briefly, then show the friendly "temporarily unreachable" notice
+// instead of a bare `fetch failed`.
+test("#7758 /acp + /acp-cache on a momentarily-dead port show the friendly notice, not a bare 'fetch failed'", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-7758-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            // healthy attach first (so register.base is set + toolsReady), then kill the proxy
+            // before the handler runs — a dead preset would instead trigger the #983 spawn
+            // fallback, which this test does not want. The base stays valid (same port) and
+            // toolsReady stays true, so the #3393 `!base` branch never fires; the command fetch
+            // hits the dead port and must retry + show the friendly notice (#7758).
+            const proxy = await startMockProxy([]);
+            try {
+                _resetRegisterForTest(proxy.origin);
+                process.env.BILLION_CONTEXT_PROXY = proxy.origin;
+                const ctx = mockCtx();
+                apply(ctx);
+                await _stateToolsReadyForTest();
+                const invocation = { agent: { session: { id: "dsh-7758" } } };
+                proxy.close();
+                const acp = await ctx.registeredCommands[0].handler(invocation);
+                assert.equal(acp.kind, "error", "/acp is an error (proxy down)");
+                assert.match(acp.text, /temporarily unreachable/, "/acp shows the friendly notice");
+                assert.doesNotMatch(acp.text, /fetch failed/, "/acp does NOT surface a bare 'fetch failed'");
+                const cache = await ctx.registeredCommands[1].handler(invocation);
+                assert.equal(cache.kind, "error", "/acp-cache is an error (proxy down)");
+                assert.match(cache.text, /temporarily unreachable/, "/acp-cache shows the friendly notice");
+                assert.doesNotMatch(cache.text, /fetch failed/, "/acp-cache does NOT surface a bare 'fetch failed'");
+            } finally {
+                _resetRegisterForTest(undefined);
+            }
+        });
+    } finally {
         rmrf(home);
         _resetRegisterForTest(undefined);
     }

@@ -23,7 +23,7 @@ import { detectWireFormat } from "acp-kernel/wire";
 import * as pfChannel from "./pf-channel.js";
 import { validateMsgIds } from "../msgid-pin.js";
 import type { DirectSendPrep } from "./native-intercept.js";
-import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, type ForwardedToolResult, type ManifestTool } from "./shared.js";
+import { asciiHeaderValue, detectProxyBase, destinationRoutedThroughProxy, fetchManifest, forwardTool, fetchStatus, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, armedIdleNotice, noSessionWarning, nonHttpProvidersFromEnv, isTransientConnectionError, PROXY_TRANSIENT_UNREACHABLE_TEXT, withConnectionRetry, type ForwardedToolResult, type ManifestTool } from "./shared.js";
 import { createForkAdopter } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
 import { plainHttpTrusted } from "../private-host.js";
@@ -1356,8 +1356,15 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     const conversationId = sessionIdOf(ctx) ?? "unknown";
                     let status: Record<string, unknown> | undefined;
                     try {
-                        status = await fetchStatus(proxyBase, conversationId);
+                        // #7758: a fast proxy respawn opens a ~1.4s window where the port is
+                        // momentarily dead — retry briefly, then a friendly "temporarily
+                        // unreachable" notice instead of a bare `fetch failed`.
+                        status = await withConnectionRetry(() => fetchStatus(proxyBase, conversationId));
                     } catch (err) {
+                        if (isTransientConnectionError(err)) {
+                            notify(PROXY_TRANSIENT_UNREACHABLE_TEXT, "warning");
+                            return;
+                        }
                         notify(`bili: status fetch failed: ${err instanceof Error ? err.message : String(err)}`, "error");
                         return;
                     }
@@ -1422,13 +1429,19 @@ export function createBiliPlugin(agentOverride?: string, opts?: { retryIntervalM
                     const toolArgs = /(^|\s)(--)?full(\s|$)/.test(args ?? "") ? { detail: "full" as const } : {};
                     let text: string;
                     try {
-                        const out = await forwardTool(proxyBase, conversationId, "acp_cache", toolArgs, undefined, conversationId !== "unknown");
+                        // #7758: same fast-respawn retry as /acp — a momentarily-dead port
+                        // should not surface as a bare `fetch failed`.
+                        const out = await withConnectionRetry(() => forwardTool(proxyBase, conversationId, "acp_cache", toolArgs, undefined, conversationId !== "unknown"));
                         if (out.failed) {
                             notify(`bili: cache report failed: ${out.text}`, "error");
                             return;
                         }
                         text = out.text;
                     } catch (err) {
+                        if (isTransientConnectionError(err)) {
+                            notify(PROXY_TRANSIENT_UNREACHABLE_TEXT, "warning");
+                            return;
+                        }
                         notify(`bili: cache report failed: ${err instanceof Error ? err.message : String(err)}`, "error");
                         return;
                     }

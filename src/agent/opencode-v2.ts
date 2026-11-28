@@ -52,7 +52,7 @@ import { randomUUID } from "node:crypto";
 import { ACP_TOOLS_OPENAI, ABSORB_TOOL_OPENAI } from "../compress-tool.js";
 import { opencodeV2MsgIdList, stampedMsgIdsHeaderFromList } from "./opencode-v2-msgids.js";
 import * as pfChannel from "./pf-channel.js";
-import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, V2_SYNTHETIC_TEXT } from "./shared.js";
+import { asciiHeaderValue, fetchManifest, fetchProxyVersion, fetchStatus, fitNoticeDescription, forwardTool, postIdentityRegister, proxyBaseFromEnv, proxyBaseFromUrl, reportCompactionBoundary, reportRuntimeInfoOnChange, isTransientConnectionError, PROXY_TRANSIENT_UNREACHABLE_TEXT, withConnectionRetry, V2_SYNTHETIC_TEXT } from "./shared.js";
 import { createForkAdopter, normalizeForkBoundary, type ForkBoundary } from "./fork-adopt.js";
 import { logHostEvent } from "./host-log.js";
 
@@ -639,7 +639,10 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                                 text = "bili: no proxy detected (set BILLION_CONTEXT_PROXY or point the provider at the proxy's /bili/ URL, then run /acp again)";
                             } else {
                                 try {
-                                    const status = await fetchStatus(base, sid);
+                                    // #7758: a fast proxy respawn opens a ~1.4s window where the port is
+                                    // momentarily dead — retry briefly, then a friendly "temporarily
+                                    // unreachable" notice instead of a bare `fetch failed`.
+                                    const status = await withConnectionRetry(() => fetchStatus(base, sid));
                                     if (status && typeof status.panel === "string" && status.panel.length > 0) {
                                         text = status.panel;
                                         webUrl = typeof status.webUrl === "string" && status.webUrl.length > 0 ? status.webUrl : undefined;
@@ -668,7 +671,9 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                                             : "bili: proxy returned no status panel";
                                     }
                                 } catch (err) {
-                                    text = `bili: /acp failed (${err instanceof Error ? err.message : String(err)})`;
+                                    text = isTransientConnectionError(err)
+                                        ? PROXY_TRANSIENT_UNREACHABLE_TEXT
+                                        : `bili: /acp failed (${err instanceof Error ? err.message : String(err)})`;
                                 }
                             }
                         }
@@ -704,12 +709,18 @@ export function createOpencodeV2Setup(options: OpencodeV2SetupOptions = {}): (ct
                                 text = "bili: no proxy detected (set BILLION_CONTEXT_PROXY or point the provider at the proxy's /bili/ URL, then run /acp-cache again)";
                             } else {
                                 try {
-                                    text = (await forwardTool(base, sid, "acp_cache", toolArgs, undefined, true)).text;
+                                    // #7758: same fast-respawn retry as /acp — a momentarily-dead port
+                                    // should not surface as a bare `fetch failed`.
+                                    text = (await withConnectionRetry(() => forwardTool(base, sid, "acp_cache", toolArgs, undefined, true))).text;
                                 } catch (err) {
-                                    const msg = err instanceof Error ? err.message : String(err);
-                                    text = msg.includes("no model request has arrived")
-                                        ? "bili: no ACP session yet for this conversation (send a model request first, then run /acp-cache)"
-                                        : `bili: cache report failed (${msg})`;
+                                    if (isTransientConnectionError(err)) {
+                                        text = PROXY_TRANSIENT_UNREACHABLE_TEXT;
+                                    } else {
+                                        const msg = err instanceof Error ? err.message : String(err);
+                                        text = msg.includes("no model request has arrived")
+                                            ? "bili: no ACP session yet for this conversation (send a model request first, then run /acp-cache)"
+                                            : `bili: cache report failed (${msg})`;
+                                    }
                                 }
                             }
                         }

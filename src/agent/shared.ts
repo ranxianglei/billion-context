@@ -464,6 +464,53 @@ export async function fetchProxyVersion(proxyBase: string, init?: RequestInit): 
     return manifest.commit !== undefined ? `${manifest.version} (${manifest.commit})` : manifest.version;
 }
 
+// Connection-level failure codes — the "the proxy socket is dead right now" class
+// (ECONNREFUSED on a fast respawn, ECONNRESET on a mid-flight drop). Distinct from timeouts
+// (which carry no code, or UND_ERR_HEADERS_TIMEOUT / ABORT_ERR) and from HTTP !ok (which
+// fetchJson turns into a normal undefined return, never a throw).
+const CONNECTION_ERROR_CODES = new Set([
+    "ECONNREFUSED", "ECONNRESET", "ECONNABORTED", "EPIPE",
+    "EHOSTUNREACH", "ENETUNREACH", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+function fetchErrCode(err: unknown): string | undefined {
+    const e = err as { cause?: { code?: unknown }; code?: unknown } | null;
+    const code = e?.cause?.code ?? e?.code;
+    return typeof code === "string" && code.length > 0 ? code : undefined;
+}
+
+/** True when `err` is a transient connection failure (socket refused/reset/etc.), i.e. the
+ *  proxy is momentarily unreachable and likely to recover on its own — NOT a timeout and NOT
+ *  an HTTP-level error. Used by the /acp & /acp-cache command paths to retry briefly and then
+ *  show a friendly "temporarily unreachable" notice instead of a bare `fetch failed` (#7758). */
+export function isTransientConnectionError(err: unknown): boolean {
+    const code = fetchErrCode(err);
+    if (code !== undefined) return CONNECTION_ERROR_CODES.has(code);
+    return err instanceof Error && err.message === "fetch failed";
+}
+
+// A fast proxy respawn (owner-gone → spawner re-listens the same port) opens a ~1.4s window
+// where a command-layer fetch hits a momentarily-dead port. Retry on connection errors only —
+// bounded so a genuinely-down proxy still returns promptly with the friendly notice (#7758).
+const CONN_RETRY_DELAY_MS = 400;
+const CONN_RETRY_MAX = 4; // retries after the initial attempt → 5 calls, ~1.6s of wait
+
+export async function withConnectionRetry<T>(fn: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+        try {
+            return await fn();
+        } catch (err) {
+            if (attempt >= CONN_RETRY_MAX || !isTransientConnectionError(err)) throw err;
+            await new Promise((resolve) => setTimeout(resolve, CONN_RETRY_DELAY_MS));
+        }
+    }
+}
+
+/** Model-facing notice when the proxy port is momentarily dead (fast respawn window) — reuse
+ *  across the pi / dsh / opencode command lanes (#7758). dsh-native keeps its #3393 wording. */
+export const PROXY_TRANSIENT_UNREACHABLE_TEXT =
+    "bili: proxy temporarily unreachable — it was serving this session and the connection is likely to recover on its own. Try again in a moment, or check that the bili proxy is running.";
+
 /** #1603: one-line staleness warning for status UIs — the on-disk install is
  *  newer than the running process, so a host restart is needed to activate the
  *  new code. Soft-fail by design (same contract as fetchStatus): undefined when
