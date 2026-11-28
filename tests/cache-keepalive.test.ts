@@ -218,6 +218,30 @@ test("buildPingBody: byte-exact rewrite of ONLY max_tokens and stream", () => {
     assert.deepEqual(JSON.parse(buildPingBody(minimal)), { model: "m", messages: [], max_tokens: 1, stream: false });
 });
 
+// #7741: a budget-based thinking body must not be pinged with max_tokens=1 —
+// strict upstreams reject max_tokens <= budget_tokens, so the ping would 400
+// and keepalive could never succeed on a thinking model.
+test("buildPingBody: thinking budget lifts max_tokens to budget+1, non-thinking stays 1", () => {
+    const thinkingBody = JSON.stringify({
+        model: "claude-opus-test",
+        max_tokens: 4096,
+        stream: true,
+        thinking: { type: "enabled", budget_tokens: 1024 },
+        system: "sys",
+        messages: [{ role: "user", content: "hi" }],
+    });
+    const ping = JSON.parse(buildPingBody(thinkingBody)) as Record<string, unknown>;
+    assert.equal(ping["max_tokens"], 1025, "max_tokens = budget_tokens + 1 (satisfies max_tokens > budget_tokens)");
+    assert.equal(ping["stream"], false);
+    assert.deepEqual(ping["thinking"], { type: "enabled", budget_tokens: 1024 }, "thinking field preserved byte-exact");
+    // disabled thinking has no budget_tokens → keep the cheap max_tokens = 1
+    const disabled = JSON.stringify({ model: "m", messages: [], thinking: { type: "disabled" } });
+    assert.equal(JSON.parse(buildPingBody(disabled))["max_tokens"], 1);
+    // a non-object thinking field is ignored → max_tokens = 1
+    const malformed = JSON.stringify({ model: "m", messages: [], thinking: "enabled" });
+    assert.equal(JSON.parse(buildPingBody(malformed))["max_tokens"], 1);
+});
+
 test("detectKeepaliveTier: 5m / 1h / mixed / nested / none", () => {
     assert.equal(detectKeepaliveTier(JSON.parse(BODY_5M)), "5m");
     assert.equal(detectKeepaliveTier(JSON.parse(BODY_1H)), "1h");
