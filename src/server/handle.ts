@@ -35,7 +35,7 @@ import { enterSessionContext, log as loggerLog } from "../logger.js";
 import { codexCompactGatePre, codexCompactMode, hasCompactionTrigger, isCodexHost, replaceBiliCompactionItems } from "../codex-compact.js";
 import { emitPreflightError } from "../stream-error.js";
 import { agentProviderRecipes } from "../agent-providers.js";
-import { affinityToken, claudeAnthropicPersonaOrderApplies, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, preferZedThreadIdIdentity, qoderSideTaskConversation, zcodeMemoryConversation } from "../session-id.js";
+import { affinityToken, claudeAnthropicPersonaOrderApplies, claudeRequestClassOf, conversationHeaderSource, claudeSubagentAgentId, claudeSubagentSplit, claudeSubagentLaneTokenOf, clientConversationHeader, codexTurnIdentity, dshPersonaFingerprintApplies, instructionsFingerprintApplies, openaiSystemTextForPersona, preferPromptCacheKeyIdentity, preferZedThreadIdIdentity, qoderSideTaskConversation, zcodeMemoryConversation } from "../session-id.js";
 import { preferKiroConversationIdentity } from "../kiro.js";
 import { personaConversationOrder, type SessionOrderResolution } from "../session-resolve.js";
 
@@ -1714,17 +1714,20 @@ async function handleRequest(
                            ))
                      : claudeAnthropicPersonaOrderApplies(req.headers) && opts.subagentSplit !== false
                        && !sideRequestLike && personaSystemText !== ""
+                       && claudeRequestClassOf(req.headers) !== "main"
                        // #4352: header-less claude code subagents (VS Code
                        // build) ride the raw parent id; the resolver is
                        // consulted only so a #5095 lane token can carve the
                        // dispatch onto its own lane (#2944; the |sub:<fp>
                        // fork retired with the #7525 GA content ladder).
                        // #5095 D1-C: when the bili SubagentStart hook's token
-                       // rides the first user message, the resolver keys the
-                       // dispatch per-TOKEN — parallel same-type dispatches
-                       // stop merging on the persona fingerprint (token wins:
-                       // uniqueness by construction, no prompt-collision bet).
-                       // Without a token the stamped id rides verbatim.
+                       // rides the opening turn (first user message or
+                       // immediately following role:"system" SubagentStart
+                       // carrier), the resolver keys the dispatch per-TOKEN —
+                       // parallel same-type dispatches stop merging on the
+                       // persona fingerprint. Explicit `main` class headers
+                       // never enter this branch. Without a token the stamped
+                       // id rides verbatim.
                        ? personaConversationOrder(
                            anthropicIdentity?.value ?? anthropicSignal,
                            personaSystemText,

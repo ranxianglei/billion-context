@@ -842,7 +842,7 @@
 - **类型：** `boolean`
 - **默认值：** `true`
 - **状态：** ACTIVE
-- **说明：** Claude Code subagent 会话拆分（#970/#4352），两套机制都由本开关控制。(1) 携带 `x-claude-code-agent-id` + `x-claude-code-parent-agent-id` 对的 anthropic-wire 请求获得自己的 `<session>\|sub:<agent-id>` 会话 —— 独立的锁链与压缩状态 —— 而不是排在主会话锁后面。(2) 无头 claude code 流量（VS Code 扩展构建：其 subagent 不带 agent-id 头、且与父会话逐字共享第一个 system block，因此双信号门必然不命中，#4352）改走顺序优先会话解析器 —— 历史连续的主会话按顺序+内容证据留在原 key，历史不相交的 subagent 借道则分叉到自己的车道：首条 user 消息上带 bili SubagentStart hook token 时按派发铸键（`<session>\|sub:<fp>:t:<token>`），否则用本 run 首条 user 消息片段作兼底（`<session>\|sub:<fp>:<userFp>`），同一父 id 下反复派发的同型子代理不再共用一条压缩会话（#5095）；既无有效 token、又无可用 user 文本的借道保留两段式 `<session>\|sub:<fp>` 形态。设 `BILI_SUBAGENT_SPLIT=0` 同时关闭两套机制。
+- **说明：** Claude Code subagent 会话拆分（#970/#4352），两套机制都由本开关控制。(1) 携带 `x-claude-code-agent-id` + `x-claude-code-parent-agent-id` 对的 anthropic-wire 请求获得自己的 `<session>\|sub:<agent-id>` 会话 —— 独立的锁链与压缩状态 —— 而不是排在主会话锁后面。(2) 无头 claude code 流量（VS Code 扩展构建：其 subagent 不带 agent-id 头、且与父会话逐字共享第一个 system block，因此双信号门必然不命中，#4352）改走顺序解析器（#7525 GA 之后内容无关：盖戳 id 逐字沿用，除非存在有效 #5095 lane token）：派发开场轮携带 bili SubagentStart hook token 时按派发铸键——开场轮 = 首条 user 消息，或紧随其后的 `role:"system"` SubagentStart 载体（Claude Code ≥2.1.330 形态，#7662）——键为 `<session>\|sub:<fp>:t:<token>`（persona 标签为空时为两段式 `<session>\|sub:t:<token>`），同一父 id 下反复派发的同型子代理不再共用一条压缩会话（#5095）；其余借道一律沿用盖戳 id。设 `BILI_SUBAGENT_SPLIT=0` 同时关闭两套机制。
 
 > **作用域 — 仅 anthropic 线路。** 走 **Responses** 协议的 Claude Code（带 `x-claude-code-session-id`、上游 `/v1/responses`）**不会**经过 `claudeSubagentSplit`。该车道按 instructions 指纹键控（`WIRE_CLIENTS` → `claude-responses`，见 `src/server/lane-decisions.ts`），`subagentSplit` 管不到 —— 在那里设 `BILI_SUBAGENT_SPLIT=0` 无效。该车道的两条出路：
 > - `personaSplit: false` / `BILI_PERSONA_SPLIT=0`，或

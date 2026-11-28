@@ -2,7 +2,8 @@
  *  settings install a SubagentStart hook (dist/claude-subagent-hook.js) that
  *  mints one random token per subagent DISPATCH and injects it into the
  *  dispatch's context via `additionalContext`. The token then rides the wire
- *  inside that dispatch's first user message — giving the proxy a
+ *  inside that dispatch's opening turn (first user message or immediately
+ *  following `role:"system"` SubagentStart carrier) — giving the proxy a
  *  bili-minted, per-dispatch-unique discriminator for subagent requests that
  *  share the parent's session id and carry no agent-id headers (#4352 /
  *  #5095): the order resolver keys such traffic on
