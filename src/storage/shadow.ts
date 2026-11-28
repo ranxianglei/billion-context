@@ -615,7 +615,7 @@ export class UnifiedShadow {
     // engine/engineSource introspection lives in engineInfo (sqlite-only
     // diagnostics widened for network backends); runtime-status reads that.
 
-    /** Ingest + verify one committed record. Never throws.
+    /** Ingest + verify one committed record. Required commits propagate failures.
      *
      *  `rawTail` (#2960 ⑤): the live in-memory conversation tail when the
      *  caller has one. The envelope persists only a pruned+truncated view of
@@ -623,11 +623,25 @@ export class UnifiedShadow {
      *  message log authoritatively, so the ingest uses the raw tail whenever
      *  available; both digest legs go through the same override, so parity
      *  accounting stays honest. */
-    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
+    record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore,
+        requireCommit = false,
+        settleCcr?: (current: MessageContentStore | null, counters: { requests: number; nextBlockId: number } | null) => MessageContentStore | undefined): void {
         // #3931 step 3: network backend — the ingest runs on the serial
         // queue (fire-and-forget; failures are logged once per distinct message — never disabled).
         if (this.sync === null) {
+            if (requireCommit) throw new Error("Originals guard requires synchronous SQLite storage");
             this.enqueueAsyncRecord(record, rawTail, liveCcr);
+            return;
+        }
+        if (settleCcr) {
+            if (!requireCommit) throw new Error("Originals guard requires a durable commit");
+            const loaded = this.legacyLoad(record);
+            if (!loaded) throw new Error("Index commit refused: session record could not be loaded");
+            const sync = this.sync;
+            sync.withOriginalsTransaction(() => {
+                const originals = settleCcr(sync.getCcr(loaded.id, true), sync.sessionCounters(loaded.id));
+                this.record(record, rawTail, originals, true);
+            });
             return;
         }
         // #5627: which stage is running — the failure forensics must name
@@ -636,7 +650,10 @@ export class UnifiedShadow {
         let sessionId: string | undefined;
         try {
             const loaded = this.legacyLoad(record);
-            if (!loaded) return;
+            if (!loaded) {
+                if (requireCommit) throw new Error("Index commit refused: session record could not be loaded");
+                return;
+            }
             sessionId = loaded.id;
             // #4216/#4242: the reap shape (blockContents without their
             // state.blocks entries) is now REPRESENTABLE — planIngest
@@ -844,6 +861,7 @@ export class UnifiedShadow {
             this.consecutiveFailures = 0;
         } catch (err) {
             this.noteIngestFailure(err, phase, sessionId);
+            if (requireCommit) throw err;
         }
     }
 
@@ -1081,6 +1099,27 @@ export class UnifiedShadow {
             loggerLog("warn", `[storage] unified import failed for a legacy record (${String(err)}) — serving the legacy view`);
             return null;
         }
+    }
+
+    /** #5599 bulk migration: one-shot digest verification of a freshly imported
+     *  session against its legacy source view — the same verifier as the
+     *  steady-state sample in record(), without the latch/freeze side effects
+     *  (the migrate tool reports, it does not heal). Null on network backends
+     *  (no sync read path); throws only when the ingest vanished its own row. */
+    verifyImported(legacy: LegacySessionLike): ReturnType<BatchedViewVerification["finish"]> | null {
+        if (this.sync === null) return null;
+        const sessionRow = this.sync.getSessionRow(legacy.id);
+        if (!sessionRow) throw new Error(`session row missing after import: ${legacy.id}`);
+        const verifier = new BatchedViewVerification(legacy, sessionRow, this.sync.getRefs(legacy.id), this.sync.getDeadRefs(legacy.id), this.sync.getCcrEntries(legacy.id), this.sync.getStateFields(legacy.id), this.sync.getOrphanViews(legacy.id) ?? {});
+        for (let offset = 0; ; offset += VERIFY_BATCH_SIZE) {
+            const rows = this.sync.getBlocks(legacy.id, { limit: VERIFY_BATCH_SIZE, offset });
+            verifier.addBlocks(rows);
+            if (rows.length < VERIFY_BATCH_SIZE) break;
+        }
+        for (let i = 0; i < verifier.messageSeqs.length; i += VERIFY_BATCH_SIZE) {
+            verifier.addMessages(this.sync.getMessages(legacy.id, { seqs: verifier.messageSeqs.slice(i, i + VERIFY_BATCH_SIZE) }));
+        }
+        return verifier.finish();
     }
 
     /** GC parity: remove the session's rows when the legacy files are deleted. */
@@ -1391,9 +1430,9 @@ export class UnifiedShadow {
     }
 
     /** #2960 ③: whole-store CCR read from the sessions row's ccr mirror. */
-    getCcr(sessionId: string): MessageContentStore | null {
+    getCcr(sessionId: string, requireValid = false): MessageContentStore | null {
         if (this.sync === null) return null;
-        return this.sync.getCcr(sessionId);
+        return this.sync.getCcr(sessionId, requireValid);
     }
 
     /** #4316 PR3/3: raw id → canonical seq (single-row ids only) for the
@@ -1403,6 +1442,18 @@ export class UnifiedShadow {
     seqByRaw(sessionId: string): Map<string, number> | null {
         if (this.sync === null) return null;
         return this.sync.seqByRaw(sessionId);
+    }
+
+    /** #5599: row-backed msg ids (live OR retired) for the re-stamp
+     *  completeness check — same full-trust gate as seqByRaw. Null when the
+     *  store cannot answer; the caller fails safe to keeping legacy refs. */
+    backedMsgIds(sessionId: string, msgIds: string[]): Set<string> | null {
+        if (this.sync === null) return null;
+        try {
+            return this.sync.backedMsgIds(sessionId, msgIds);
+        } catch {
+            return null;
+        }
     }
 
     /** #4316 PR3/3: live (non-retired) message row count. */

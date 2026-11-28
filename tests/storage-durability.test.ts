@@ -18,6 +18,33 @@ delete process.env.BILI_STORAGE_UNIFIED;
 
 import { UnifiedStore } from "../src/storage/store.ts";
 import { planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
+import { openSqliteDatabase } from "../src/storage/driver.ts";
+import { statSync, utimesSync } from "node:fs";
+
+/** Damage a referenced page, not potentially unused bytes in an empty DB. */
+function corruptSessionsPage(path: string): Buffer {
+    const { db } = openSqliteDatabase(path);
+    let rootpage: number;
+    try {
+        const row = db.prepare("SELECT rootpage FROM sqlite_master WHERE type = 'table' AND name = 'sessions'").get() as { rootpage: number };
+        assert.ok(row?.rootpage > 0, "sessions must have a real b-tree root");
+        rootpage = row.rootpage;
+    } finally {
+        db.close();
+    }
+    const raw = readFileSync(path);
+    const storedPageSize = raw.readUInt16BE(16);
+    const pageSize = storedPageSize === 1 ? 65536 : storedPageSize;
+    const header = (rootpage - 1) * pageSize + (rootpage === 1 ? 100 : 0);
+    assert.ok([2, 5, 10, 13].includes(raw[header]), "fixture starts with a valid b-tree page type");
+    raw[header] = 0xff;
+    const before = statSync(path);
+    writeFileSync(path, raw);
+    // Force a new integrity scan after this same-size write. Deliberately
+    // preserving metadata is a separate integrity-cache contract.
+    utimesSync(path, before.atime, new Date(before.mtimeMs + 2000));
+    return raw;
+}
 
 function freshDir(): string {
     return mkdtempSync(join(tmpdir(), "storage-durability-"));
@@ -54,16 +81,8 @@ test("quick_check: a corrupt db fails open with a typed error, files left UNTOUC
         const store = UnifiedStore.open(path);
         store.close();
 
-        // 2. Corrupt the main db file (flip bytes in the middle of the page area).
-        const raw = readFileSync(path);
-        for (let i = Math.floor(raw.length / 3); i < Math.floor(raw.length / 3) + 4096; i++) {
-            raw[i] = raw[i] ^ 0xff;
-        }
-        writeFileSync(path, raw);
-        // The flip keeps size + mtime (4 ms granularity), so the #4609 verdict
-        // cache (index.db.chk) would still match and skip quick_check — drop it
-        // so the reopen re-scans from fresh evidence (#4599).
-        rmSync(`${path}.chk`, { force: true });
+        // 2. Damage a live page and invalidate the previous clean verdict.
+        corruptSessionsPage(path);
 
         // 3. Reopen — must fail with a typed, greppable integrity error
         //    (migrations must never run against a corrupt file).
@@ -144,16 +163,8 @@ test("shadow open ALARMS on a corrupt index.db set — nothing renamed, boot pro
         const store = UnifiedStore.open(path);
         store.close();
 
-        // Corrupt it (page area flip) and remember its exact bytes.
-        const raw = readFileSync(path);
-        for (let i = Math.floor(raw.length / 3); i < Math.floor(raw.length / 3) + 4096; i++) {
-            raw[i] = raw[i] ^ 0xff;
-        }
-        writeFileSync(path, raw);
-        // Drop the #4609 verdict cache: the flip keeps size + mtime, so a
-        // cached "ok" would skip quick_check and the shadow would open the
-        // corrupt set instead of alarming (#4599).
-        rmSync(`${path}.chk`, { force: true });
+        // Damage a live page and remember its exact bytes.
+        const raw = corruptSessionsPage(path);
         const beforeHash = createHash("sha256").update(raw).digest("hex");
 
         // The shadow's maybeOpen (full mode) must ALARM, not refuse — come

@@ -429,6 +429,24 @@ const STALE_COLD_LOAD_WARN_MIN = 30;
 // #5408: how often the frozen-skip ERROR may repeat per session.
 const FROZEN_SKIP_NOTICE_COOLDOWN_MS = 10 * 60_000;
 
+/** #5599 `bili storage migrate`: per-session outcome of the bulk legacy→unified import. */
+interface LegacyMigrateSessionResult {
+    id: string;
+    /** Representative state file (relative to the sessions dir) for this id. */
+    file: string;
+    status: "imported" | "indexed" | "drifted" | "failed" | "planned";
+    reason?: string;
+    /** Same-id route files that were NOT used as representative (left untouched). */
+    alternates?: number;
+    decodedBytes?: number;
+}
+
+export interface LegacyMigrateReport {
+    scannedFiles: number;
+    results: LegacyMigrateSessionResult[];
+    counts: { imported: number; indexed: number; drifted: number; failed: number; planned: number };
+}
+
 export class SessionStore {
     /** #5188: args of the SYNCHRONOUS first-open path only. When that path ran
      *  and failed, the save path retries maybeOpen on a cooldown; intentional
@@ -523,6 +541,7 @@ export class SessionStore {
     // #3931 step 3: assigned asynchronously for network backends (mysql) —
     // see the constructor and ready().
     private shadow?: UnifiedShadow;
+    private readonly originalsBasis = new WeakMap<Session, { refs: Map<string, string>; hashes: Set<string> }>();
     /** Only alive while one synchronous record build hydrates both lazy fields. */
     private residentFieldsForBuild?: {
         id: string;
@@ -770,6 +789,10 @@ export class SessionStore {
      *  loadEnvelope). Bounded server startup refuses corrupt originals;
      *  legacy direct callers retain their warned fresh-store fallback. */
     loadContentStore(session: Session): MessageContentStore | null {
+        if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
+            const originals = this.shadow?.getCcr(session.id, true);
+            if (originals != null) return originals;
+        }
         return this.readContentStoreRels(session.id, [
             contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin),
             contentStoreRelPathFor(session.id),
@@ -780,6 +803,10 @@ export class SessionStore {
      *  checkpoint path has no live Session object, only the frozen record's
      *  meta — same rel-path candidates, same parse-and-degrade semantics. */
     private contentStoreById(id: string, meta?: { protocol?: string; upstreamOrigin?: string } | null): MessageContentStore | null {
+        if (this.writerOffActive() || this.envelopeFrozen(id)) {
+            const originals = this.shadow?.getCcr(id, true);
+            if (originals != null) return originals;
+        }
         return this.readContentStoreRels(id, [
             contentStoreRelPathFor(id, meta?.protocol, meta?.upstreamOrigin),
             contentStoreRelPathFor(id),
@@ -879,6 +906,10 @@ export class SessionStore {
      *  save retries; the previous envelope stays byte-identical. */
     private saveContentStore(session: Session): boolean {
         if (!this.enabled || !session.contentStoreDirty) return true;
+        if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
+            session.contentStore ??= { version: 1, byHash: {}, byRef: {} };
+            return true;
+        }
         const rel = contentStoreRelPathFor(session.id, session.meta.protocol, session.meta.upstreamOrigin);
         const abs = path.join(this.sessionsDir, rel);
         const tmp = path.join(path.dirname(abs), `.tmp-${path.basename(abs, ".json")}-${process.pid}-${this.tmpSeq++}`);
@@ -2000,6 +2031,129 @@ export class SessionStore {
         return this.afterLoad(id, view);
     }
 
+    /** #5599 `bili storage migrate`: bulk-import every legacy JSON session into
+     *  the unified index, then digest-reconcile each against its source file —
+     *  the same verifier the steady-state sample uses, run once per session.
+     *  Read-only over the JSON files (never deletes/renames/quarantines); the
+     *  re-import decision mirrors loadSync's ahead-probe, so the outcome equals
+     *  what a live open would converge to. Re-runs are safe: consistent
+     *  sessions report "indexed" without re-writing. */
+    async migrateLegacyToUnified(opts: { dryRun?: boolean } = {}): Promise<LegacyMigrateReport> {
+        const dryRun = opts.dryRun === true;
+        const counts = { imported: 0, indexed: 0, drifted: 0, failed: 0, planned: 0 };
+        const results: LegacyMigrateSessionResult[] = [];
+        const byId = new Map<string, Array<{ file: string; savedAt: number }>>();
+        const badFiles: Array<{ file: string; reason: string }> = [];
+        let scannedFiles = 0;
+        for (const root of [this.sessionsDir, `${this.sessionsDir}-cold`] as string[]) {
+            if (!existsSync(root)) continue;
+            for (const file of walkJsonFilesSync(root)) {
+                if (path.basename(file).endsWith(".content-store.json")) continue;
+                scannedFiles++;
+                const parsed = await this.readRawFileWithBytes(file);
+                if (!parsed) {
+                    badFiles.push({ file, reason: "unreadable or undecodable" });
+                    continue;
+                }
+                const rec = this.parseBootPayload(parsed.value);
+                if (!rec) {
+                    badFiles.push({ file, reason: "invalid session record" });
+                    continue;
+                }
+                if (!fileNameMatchesId(path.basename(file), rec.payload.id, rec.meta.protocol, rec.meta.upstreamOrigin)) {
+                    badFiles.push({ file, reason: `filename does not match the record id (${rec.payload.id})` });
+                    continue;
+                }
+                const list = byId.get(rec.payload.id) ?? [];
+                list.push({ file, savedAt: rec.payload.savedAt ?? 0 });
+                byId.set(rec.payload.id, list);
+            }
+        }
+        const relOf = (file: string): string =>
+            file.startsWith(`${this.sessionsDir}-cold${path.sep}`)
+                ? `cold:${path.relative(`${this.sessionsDir}-cold`, file)}`
+                : path.relative(this.sessionsDir, file);
+        const indexedBefore = new Set(this.unifiedListSessionIds() ?? []);
+        for (const id of [...byId.keys()].sort()) {
+            const files = byId.get(id)!;
+            // Boot's survivor rule: newest savedAt wins, lexicographic path breaks ties.
+            const rep = [...files].sort((a, b) => b.savedAt - a.savedAt || a.file.localeCompare(b.file))[0];
+            let status: LegacyMigrateSessionResult["status"] = "failed";
+            let reason: string | undefined;
+            let decodedBytes: number | undefined;
+            if (dryRun) {
+                try {
+                    const parsed = await this.readRawFileWithBytes(rep.file);
+                    const rec = parsed ? this.parseBootPayload(parsed.value) : null;
+                    if (!parsed || !rec || rec.payload.id !== id) throw new Error("representative file changed between scan and import attempt");
+                    decodedBytes = parsed.bytes;
+                    this.migrationOriginals(rep.file, rec.payload.forkContentStore, rec.payload.state.messageRefs);
+                    status = indexedBefore.has(id) ? "indexed" : "planned";
+                } catch (err) {
+                    status = "failed";
+                    reason = String(err instanceof Error ? err.message : err);
+                }
+            } else {
+                try {
+                    const parsed = await this.readRawFileWithBytes(rep.file);
+                    const rec = parsed ? this.parseBootPayload(parsed.value) : null;
+                    if (!parsed || !rec || rec.payload.id !== id) throw new Error("representative file changed between scan and import attempt");
+                    decodedBytes = parsed.bytes;
+                    const shadow = this.shadow;
+                    if (!shadow) throw new Error("unified sidecar unavailable");
+                    const hadRows = indexedBefore.has(id);
+                    const indexed = hadRows ? this.loadUnified(id) : null;
+                    const envReq = Number(rec.payload.stats?.requests ?? 0);
+                    const idxReq = indexed ? Number(indexed.stats?.requests ?? 0) : 0;
+                    const ahead = indexed !== null &&
+                        (envReq > idxReq || (envReq === idxReq && Number(rec.payload.state?.nextBlockId ?? 0) > Number(indexed.state?.nextBlockId ?? 0)));
+                    const originals = this.migrationOriginals(rep.file, rec.payload.forkContentStore, rec.payload.state.messageRefs);
+                    const completeOriginals = this.mergeOriginalStores([hadRows ? shadow.getCcr(id, true) : null, originals]);
+                    const complete = completeOriginals ? { ...rec.payload, forkContentStore: completeOriginals } : rec.payload;
+                    let wrote = false;
+                    if (!hadRows || indexed === null || ahead) {
+                        if (!shadow.importRecord(complete)) throw new Error("import failed (see log)");
+                        wrote = true;
+                    }
+                    const legacy = recordToLegacyView(complete);
+                    if (!legacy) throw new Error("legacy view build failed");
+                    const verdict = shadow.verifyImported(legacy);
+                    if (verdict === null) {
+                        status = wrote ? "imported" : "indexed";
+                        reason = "verification unavailable (network backend)";
+                    } else if (verdict.matches) {
+                        status = wrote ? "imported" : "indexed";
+                    } else {
+                        status = "drifted";
+                        const parts = [`diverged: ${verdict.diagnostics.keys.join(", ")}`];
+                        if (verdict.diagnostics.stateKeys) parts.push(`state: ${verdict.diagnostics.stateKeys.join(", ")}`);
+                        reason = `digest mismatch (${parts.join("; ")})`;
+                    }
+                    if (canonicalJson(shadow.getCcr(id, true)) !== canonicalJson(completeOriginals ?? null)) {
+                        status = "drifted";
+                        reason = "CCR originals differ from the migration source";
+                    }
+                } catch (err) {
+                    status = "failed";
+                    reason = String(err instanceof Error ? err.message : err);
+                }
+            }
+            const entry: LegacyMigrateSessionResult = { id, file: relOf(rep.file), status };
+            if (reason) entry.reason = reason;
+            if (decodedBytes !== undefined) entry.decodedBytes = decodedBytes;
+            if (files.length > 1) entry.alternates = files.length - 1;
+            results.push(entry);
+            counts[status]++;
+        }
+        for (const bad of badFiles) {
+            const entry: LegacyMigrateSessionResult = { id: path.basename(bad.file), file: relOf(bad.file), status: "failed", reason: bad.reason };
+            results.push(entry);
+            counts.failed++;
+        }
+        this.log("info", `[persist] storage migrate${dryRun ? " (dry run)" : ""}: ${scannedFiles} files scanned, ${counts.imported} imported, ${counts.indexed} indexed, ${counts.drifted} drifted, ${counts.failed} failed`);
+        return { scannedFiles, results, counts };
+    }
+
     /** Shared post-load fixups for the unified read path: rebuilds the
      *  Session from a store view (viewToRecord → buildSession, the same
      *  forward-compat pass as a legacy load) and applies the #408 clamp
@@ -2084,6 +2238,19 @@ export class SessionStore {
         try {
             const seqByRawId = this.unifiedSeqByRaw(session.id);
             if (seqByRawId === null || seqByRawId.size === 0) return;
+            // #5599: stamp only a COMPLETE ledger — every mapped id must own a
+            // row (live or retired). An imported collapsed ledger (folded
+            // ghosts have no rows; the tail re-based at seq 0) would let the
+            // stamp evict the ghost bindings onto fresh numbers and re-target
+            // saved citations at newer bodies. Incomplete → keep legacy refs
+            // (JSON-load parity); the next fold retries once rows exist.
+            // Query failure fails safe to skip: never restamp on uncertain input.
+            const mapped = Object.keys(state.messageRefs.byRaw).filter((id) => state.messageRefs.byRaw[id] !== "BLOCKED");
+            const backed = this.unifiedBackedMsgIds(session.id, mapped);
+            if (backed === null || mapped.some((id) => !backed.has(id))) {
+                this.log("info", `[persist] ${session.id}: unified ledger incomplete (${mapped.length} mapped ids checked) — keeping legacy refs (#5599)`);
+                return;
+            }
             const outcome = restampRefsToLedger(state, seqByRawId);
             // #4733: the ref restamp alone leaves the CCR content store keyed by
             // store-time refs — a stored original would sit under a number the
@@ -2329,6 +2496,18 @@ export class SessionStore {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {
             return this.shadow.seqByRaw(id);
+        } catch {
+            return null;
+        }
+    }
+
+    /** #5599: msg ids owning ≥1 unified row (live or retired) — the re-stamp
+     *  completeness check's data source. Null when the unified store cannot
+     *  answer; the caller then keeps legacy refs (fail-safe direction). */
+    private unifiedBackedMsgIds(id: string, msgIds: string[]): Set<string> | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.backedMsgIds(id, msgIds);
         } catch {
             return null;
         }
@@ -3245,13 +3424,119 @@ export class SessionStore {
     /** #3818: decoded-size proxy for budget arbitration of index-only
      *  sessions — the serialized record the JSON writer would emit, which
      *  is what readRawFileWithBytes measures for file-backed candidates
-     *  (#2803: the budget is a RAM proxy, not a disk one). */
+     *  (#2803: the budget is a RAM proxy, not a disk one).
+     *  #6773 review: measure from the pure record projection, not the
+     *  committing guardedBuild — the CCR generation guard throws for a
+     *  cold session whose contentStore is not yet materialized (the
+     *  request path materializes it via contentStoreOf, but the warm loop
+     *  invokes the builder directly), so the catch returned
+     *  MAX_SAFE_INTEGER and silently skipped every CCR-bearing session
+     *  from pre-warming. buildRecordForSave is the same record guardedBuild
+     *  returns on the normal path, without the commit side effect. */
     private estimateDecodedBytes(session: Session): number {
         try {
-            return JSON.stringify(this.guardedBuild(session)()).length;
+            return JSON.stringify(this.buildRecordForSave(session, this.liveStorageStamp)).length;
         } catch {
             return Number.MAX_SAFE_INTEGER;
         }
+    }
+
+    private mergeOriginalStores(stores: Array<MessageContentStore | null | undefined>): MessageContentStore | undefined {
+        let merged: MessageContentStore | undefined;
+        for (const store of stores) {
+            if (store == null) continue;
+            if (typeof store !== "object" || store.version !== 1 || !store.byHash || !store.byRef
+                || typeof store.byHash !== "object" || typeof store.byRef !== "object"
+                || Array.isArray(store.byHash) || Array.isArray(store.byRef)) throw new Error("malformed CCR originals store");
+            merged ??= { version: 1, byHash: {}, byRef: {} };
+            for (const [hash, text] of Object.entries(store.byHash)) {
+                if (typeof text !== "string" || createHash("sha256").update(text, "utf8").digest("hex") !== hash) {
+                    throw new Error("CCR original body has an invalid content hash");
+                }
+                if (Object.hasOwn(merged.byHash, hash) && merged.byHash[hash] !== text) throw new Error("conflicting CCR original body");
+                merged.byHash[hash] = text;
+            }
+            for (const [ref, entry] of Object.entries(store.byRef)) {
+                if (!entry || typeof entry !== "object" || typeof entry.hash !== "string"
+                    || typeof entry.rawId !== "string" || !Object.hasOwn(store.byHash, entry.hash)) throw new Error("CCR reference has no valid original body");
+                if (Object.hasOwn(merged.byRef, ref) && canonicalJson(merged.byRef[ref]) !== canonicalJson(entry)) throw new Error(`conflicting CCR original reference: ${ref}`);
+                Object.defineProperty(merged.byRef, ref, { value: entry, enumerable: true, writable: true, configurable: true });
+            }
+        }
+        return merged;
+    }
+
+    private migrationOriginals(file: string, embedded?: MessageContentStore, refs?: Session["state"]["messageRefs"]): MessageContentStore | undefined {
+        const validateOwners = (originals: MessageContentStore | undefined): MessageContentStore | undefined => {
+            for (const [ref, entry] of Object.entries(originals?.byRef ?? {})) {
+                // Match the existing fork alias contract: pruned IDs retain
+                // frozen original keys; still-mapped IDs must agree both ways.
+                if (refs?.byRaw && Object.hasOwn(refs.byRaw, entry.rawId)
+                    && (refs.byRaw[entry.rawId] !== ref || refs.byRef?.[ref] !== entry.rawId)) {
+                    throw new Error(`CCR original reference owner conflicts with session: ${ref}`);
+                }
+            }
+            return originals;
+        };
+        // #5485: legacy-mode sessions never reach the fold-time re-key, so their
+        // originals can still sit under refs from before a renumbering. Apply the
+        // same re-key here; the source files stay untouched.
+        const rekeyed = (originals: MessageContentStore | undefined): MessageContentStore | undefined =>
+            originals && refs?.byRaw ? restampContentStore(originals, refs.byRaw) : originals;
+        const sidecar = file.endsWith(".fb.json")
+            ? `${file.slice(0, -".fb.json".length)}.content-store.json`
+            : file.replace(/\.json$/, ".content-store.json");
+        let bytes: Buffer;
+        try { bytes = readFileSync(sidecar); }
+        catch (err) {
+            if ((err as NodeJS.ErrnoException).code === "ENOENT") return validateOwners(rekeyed(this.mergeOriginalStores([embedded])));
+            throw new Error("CCR originals sidecar cannot be read", { cause: err });
+        }
+        let parsed: MessageContentStore;
+        try { parsed = JSON.parse(this.readCodec.decode(bytes)) as MessageContentStore; }
+        catch (err) { throw new Error("CCR originals sidecar cannot be decoded", { cause: err }); }
+        if (parsed == null) throw new Error("malformed CCR originals sidecar");
+        return validateOwners(rekeyed(this.mergeOriginalStores([embedded, parsed])));
+    }
+
+    private mergeDurableOriginals(session: Session, disk: MessageContentStore | null): MessageContentStore | undefined {
+        const resident = session.contentStore;
+        if (session.contentStoreDirty === true && resident
+            && Object.keys(resident.byRef).length === 0 && Object.keys(resident.byHash).length === 0) return resident;
+        const basis = this.originalsBasis.get(session);
+        if (basis) {
+            for (const [ref, entry] of basis.refs) {
+                if (!disk?.byRef[ref] || canonicalJson(disk.byRef[ref]) !== entry) {
+                    throw new Error(`Index commit refused: CCR generation conflict at ${ref}`);
+                }
+            }
+            for (const hash of basis.hashes) {
+                if (!disk || !Object.hasOwn(disk.byHash, hash)) throw new Error("Index commit refused: CCR generation lost an original body");
+            }
+        } else if (disk) {
+            for (const [ref, entry] of Object.entries(disk.byRef)) {
+                if (!resident?.byRef[ref] || canonicalJson(resident.byRef[ref]) !== canonicalJson(entry)) {
+                    throw new Error(`Index commit refused: unproven CCR generation at ${ref}`);
+                }
+            }
+            for (const hash of Object.keys(disk.byHash)) {
+                if (!resident || !Object.hasOwn(resident.byHash, hash)) throw new Error("Index commit refused: unproven CCR original body generation");
+            }
+        }
+        const merged = this.mergeOriginalStores([disk, resident]);
+        if (merged) {
+            session.contentStore = merged;
+            session.contentStoreDirty = true;
+        }
+        return merged;
+    }
+
+    private rememberOriginalsBasis(session: Session): void {
+        const store = session.contentStore;
+        this.originalsBasis.set(session, {
+            refs: new Map(Object.entries(store?.byRef ?? {}).map(([ref, entry]) => [ref, canonicalJson(entry)])),
+            hashes: new Set(Object.keys(store?.byHash ?? {})),
+        });
     }
 
     private guardedBuild(session: Session): () => PersistedSession {
@@ -3267,6 +3552,16 @@ export class SessionStore {
         // the JSON envelope, and the stamp must say legacy for that copy.
         const stamp = this.liveStorageStamp;
         return () => {
+            const requireCommit = this.writerOffActive() || this.envelopeFrozen(session.id);
+            if (requireCommit && !this.shadow) throw new Error("Index commit refused: unified storage unavailable");
+            const settleCcr: Parameters<UnifiedShadow["record"]>[4] = requireCommit && this.shadow && !this.shadow.isAsyncBackend
+                ? (current, counters) => {
+                    if (counters && (session.stats.requests < counters.requests
+                        || (session.stats.requests === counters.requests && session.state.nextBlockId < counters.nextBlockId))) {
+                        throw new Error("Index commit refused: session generation advanced while preparing originals");
+                    }
+                    return this.mergeDurableOriginals(session, current);
+                } : undefined;
             const record = this.buildRecordForSave(session, stamp);
             const disk = this.staleDiskPayload(record);
             if (disk === null) {
@@ -3277,7 +3572,6 @@ export class SessionStore {
                 // re-ingests forever. buildRecord omits it, so the disk file
                 // never carries it.
                 const payload = session.decompositionLog;
-                if (payload !== undefined) session.decompositionLog = undefined;
                 // #2960 ⑤: the table holds the RAW tail (full fidelity); the
                 // envelope keeps its bounded folded view for legacy readers.
                 // ②a caveat: once foldResidentTail has folded the resident
@@ -3295,8 +3589,13 @@ export class SessionStore {
                     this.shadow?.record(payload !== undefined ? { ...record, decompositionLog: payload } : record,
                         tail && tail.length > 0
                             ? { lastMessages: tail, lastMessagesFolded: session.lastMessagesFolded }
-                            : undefined, session.contentStore ?? undefined);
+                            : undefined, session.contentStore ?? undefined, requireCommit, settleCcr);
+                    if (settleCcr) {
+                        this.rememberOriginalsBasis(session);
+                        session.contentStoreDirty = false;
+                    }
                 }
+                if (payload !== undefined) session.decompositionLog = undefined;
                 this.noteOwnCommit(session.id, record);
                 return record;
             }
@@ -3316,7 +3615,25 @@ export class SessionStore {
             // to the live session so serving converges on the same newest-wins
             // arbitration the write side just used.
             this.convergeToDisk(session, disk);
-            if (!this.egressProjectionFrozen(session)) this.shadow?.record(disk);
+            if (!this.egressProjectionFrozen(session)) {
+                if (settleCcr && this.shadow) {
+                    // #6773 review: convergence discards the in-memory state, so
+                    // the stale in-memory originals are discarded with it — rebind
+                    // from the index mirror (the newer generation we just converged
+                    // to) and seed the basis so the guarded commit merges against
+                    // it instead of refusing the unproven generation (a stale
+                    // resident with no basis wedges every subsequent save until
+                    // restart).
+                    session.contentStore = this.shadow.getCcr(session.id, true) ?? undefined;
+                    session.contentStoreDirty = false;
+                    this.rememberOriginalsBasis(session);
+                }
+                this.shadow?.record(disk, undefined, undefined, requireCommit, settleCcr);
+                if (settleCcr) {
+                    this.rememberOriginalsBasis(session);
+                    session.contentStoreDirty = false;
+                }
+            }
             // Rewrite the disk's own payload: content-identical no-op that
             // preserves the newer state while satisfying the write chain.
             this.noteOwnCommit(session.id, disk);

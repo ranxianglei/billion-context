@@ -106,7 +106,16 @@ async function withHarness(run: (h: Harness) => Promise<void>): Promise<void> {
             ingestRowsNow: () => anyStore.ingestRowsNow(session),
             spy: () => {
                 const real = anyStore.shadow.record.bind(anyStore.shadow);
-                anyStore.shadow.record = (...args: unknown[]) => { ingests++; return real(...args); };
+                anyStore.shadow.record = (...args: unknown[]) => {
+                    // #6773: the writer-off originals commit (requireCommit +
+                    // settleCcr) wraps the actual ingest in a transaction and
+                    // re-enters record() for the inner write — count only the
+                    // inner (settleCcr-less) ingest so one full build is one
+                    // count, preserving this suite's pre-#6773 counting shape.
+                    if (args[4] !== undefined) return real(...args);
+                    ingests++;
+                    return real(...args);
+                };
                 return () => ingests;
             },
             markDirty: () => {
