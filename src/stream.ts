@@ -1166,24 +1166,74 @@ function mergeIntervals(intervals: Array<[number, number]>): Array<[number, numb
     return out;
 }
 
-/** The recommended intervals for THIS call: this request's prepare-time offer
- *  when present (the exact list the nudge text / acp_status showed), else a
- *  live recompute (plugin-lane ctxs carry no prepare snapshot). Same filters as
- *  the advertised surfaces: viable + dead-ref exclusion + minCompressRange. */
-function recommendedIntervals(ctx: RewriteCtx): Array<[number, number]> {
-    let ranges: CompressibleRange[] | undefined;
-    if (ctx.lastNudge) {
-        ranges = excludeDeadRefRanges(viableRanges(ctx.lastNudge.compressibleRanges ?? []), ctx.session.state.deadRefs);
-    } else {
-        ranges = liveCompressionRanges(ctx)?.ranges;
+// #7816: position-based merge, mirroring the kernel's formatRanges (nudge-text.ts)
+// — sort by array position, merge positionally-adjacent ranges (gap ≤ 1 slot)
+// honoring noMergeBefore, extending the end ref/pos. The advertised list the
+// model reads is produced by THIS merge; the gate must merge in the same space,
+// or a positionally-merged line whose raw ranges are ref-number-disjoint (non-
+// monotonic refs) is advertised as one span while its ref-number union keeps a
+// hole — and the gate refuses the exact line formatRanges just printed.
+function mergeByPosition(ranges: CompressibleRange[]): Array<{ startRef: string; endRef: string }> {
+    if (ranges.length === 0) return [];
+    interface Entry {
+        startRef: string;
+        endRef: string;
+        startPos: number;
+        endPos: number;
+        noMergeBefore: boolean;
     }
+    const entries: Entry[] = ranges.map((r) => ({
+        startRef: r.startRef,
+        endRef: r.endRef,
+        startPos: r.startIndex ?? refNum(r.startRef),
+        endPos: r.endIndex ?? refNum(r.endRef),
+        noMergeBefore: r.noMergeBefore ?? false,
+    }));
+    entries.sort((a, b) => a.startPos - b.startPos || refNum(a.startRef) - refNum(b.startRef));
+    const merged: Entry[] = [];
+    for (const e of entries) {
+        const last = merged[merged.length - 1];
+        if (last && !e.noMergeBefore && e.startPos <= last.endPos + 1) {
+            last.endRef = e.endRef;
+            last.endPos = Math.max(last.endPos, e.endPos);
+        } else {
+            merged.push({ ...e });
+        }
+    }
+    return merged.map((e) => ({ startRef: e.startRef, endRef: e.endRef }));
+}
+
+function formatIntervals(intervals: Array<[number, number]>): string {
+    if (intervals.length === 0) return "(none)";
+    return intervals.map(([a, b]) => `${indexToRef(a)}–${indexToRef(b)}`).join(", ");
+}
+
+/** The recommended intervals for THIS call: the union of this request's
+ *  prepare-time offer (the exact list the nudge text showed) and a live
+ *  recompute (the exact list acp_status shows) — the model may have been
+ *  advertised by either, so the gate accepts spans from both. Same filters as
+ *  the advertised surfaces: viable + dead-ref exclusion + minCompressRange.
+ *  #7816: merged by POSITION (mirroring formatRanges) before converting to
+ *  ref-number spans, so a positionally-merged advertised line is accepted as a
+ *  whole even when its raw ranges are ref-number-disjoint (non-monotonic refs);
+ *  each merged entry contributes its [min,max] ref span, matching what the
+ *  display's orderedRefPair prints. */
+function recommendedIntervals(ctx: RewriteCtx): Array<[number, number]> {
+    const raw: CompressibleRange[] = [];
+    if (ctx.lastNudge) raw.push(...(ctx.lastNudge.compressibleRanges ?? []));
+    const live = liveCompressionRanges(ctx)?.ranges;
+    if (live) raw.push(...live);
     const minChars = ctx.config.compress.minCompressRange;
+    const filtered = excludeDeadRefRanges(
+        viableRanges(raw).filter((r) => minChars <= 0 || (r.chars ?? r.tokens * 4) >= minChars),
+        ctx.session.state.deadRefs,
+    );
     const out: Array<[number, number]> = [];
-    for (const r of ranges ?? []) {
-        if (minChars > 0 && (r.chars ?? r.tokens * 4) < minChars) continue;
-        const s = refToIndex(r.startRef);
-        const e = refToIndex(r.endRef);
-        if (s !== null && e !== null && s <= e) out.push([s, e]);
+    for (const r of mergeByPosition(filtered)) {
+        const a = refToIndex(r.startRef);
+        const b = refToIndex(r.endRef);
+        if (a === null || b === null) continue;
+        out.push([Math.min(a, b), Math.max(a, b)]);
     }
     return mergeIntervals(out);
 }
@@ -1212,10 +1262,15 @@ function coveredRefRuns(state: CompressionState): Array<[number, number]> {
 }
 
 /** Submitted ranges whose LIVE portion escapes the recommendation set. Empty
- *  array = every span stays within bounds (or is a pure refold). Unresolvable
- *  refs are skipped — the downstream gates own those receipts. */
-function outOfRecommendedRanges(ranges: ParsedRange[], ctx: RewriteCtx): string[] {
+ *  offending = every span stays within bounds (or is a pure refold). Unresolvable
+ *  refs are skipped — the downstream gates own those receipts. #7816: also
+ *  returns the resolved exempt set so a refusal is diagnosable from the lane log
+ *  without instrumentation. */
+function outOfRecommendedRanges(ranges: ParsedRange[], ctx: RewriteCtx): { offending: string[]; exempt: Array<[number, number]> } {
     const exempt = mergeIntervals([...recommendedIntervals(ctx), ...coveredRefRuns(ctx.session.state)]);
+    if (ctx.debug) {
+        ctx.log(`[acp-proxy: requireRecommendation gate — exempt: ${formatIntervals(exempt)}; requested: ${ranges.map((r) => `${r.startRef}–${r.endRef}`).join(", ")}]`);
+    }
     const offending: string[] = [];
     for (const range of ranges) {
         const s = refToIndex(range.startRef);
@@ -1231,7 +1286,7 @@ function outOfRecommendedRanges(ranges: ParsedRange[], ctx: RewriteCtx): string[
         }
         if (!within) offending.push(`${range.startRef}–${range.endRef}`);
     }
-    return offending;
+    return { offending, exempt };
 }
 
 export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: RewriteCtx, opts?: { loopTracking?: boolean }): ProxyToolResult {
@@ -1427,10 +1482,10 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     // refs (post-#1001 order fix + post-#4316 superseded translation), so the
     // coverage judgment compares like-for-like against the advertised set.
     if (gate?.requireRecommendation) {
-        const offending = outOfRecommendedRanges(ranges, ctx);
+        const { offending, exempt } = outOfRecommendedRanges(ranges, ctx);
         if (offending.length > 0) {
             const listed = offending.slice(0, 3).join(", ") + (offending.length > 3 ? ` (+${offending.length - 3} more)` : "");
-            ctx.log(`[acp-proxy: refused out-of-recommendation compress — span(s) ${listed} outside the current recommendation set (compress.requireRecommendation)]`);
+            ctx.log(`[acp-proxy: refused out-of-recommendation compress — span(s) ${listed} outside the current recommendation set (compress.requireRecommendation); exempt: ${formatIntervals(exempt)}]`);
             // #6728: charge the SPEC-REPEAT ledger (recordCompressFailure) so
             // the repeat-collapse below fires on identical re-submission.
             // #7197: do NOT charge the session-level breaker

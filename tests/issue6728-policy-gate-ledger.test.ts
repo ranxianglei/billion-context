@@ -150,14 +150,18 @@ function nudgeGateCtx(): Ctx {
 }
 
 function scopeGateCtx(): Ctx {
-  const ctx = freshCtx();
-  setOffer(ctx, [offerRange("m00001", "m00004", 4)]);
-  storeUnpromptedGate(ctx.session, {
-    nudgeInjected: true,
-    requireNudge: false,
-    requireRecommendation: true,
-  });
-  return ctx;
+    const ctx = freshCtx();
+    setOffer(ctx, [offerRange("m00001", "m00004", 4)]);
+    // #7816: the gate's set is the UNION of the offer and the live recompute,
+    // so the SCOPE_CALL span (m5-m7) must be absent from BOTH to be refused —
+    // kill it from the live plan (the offer never covered it).
+    ctx.session.state.deadRefs = ["m00005", "m00006", "m00007"];
+    storeUnpromptedGate(ctx.session, {
+        nudgeInjected: true,
+        requireNudge: false,
+        requireRecommendation: true,
+    });
+    return ctx;
 }
 
 const NUDGE_CALL = {
