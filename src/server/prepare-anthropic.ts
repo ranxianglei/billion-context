@@ -38,7 +38,7 @@ import { anthropicToolsCarryCacheControl, computeAnthropicMessageMarks, countAnt
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { isStrictReasoningEcho, modelIdOf } from "../strict-echo.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
-import { imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
+import { egressPlaneGateOn, imageRescaleMaxDim, renderNone as knobRenderNone } from "../knobs.js";
 import { SessionStore } from "../persist.js";
 import { applyImageRescalePass } from "../image-rescale.js";
 import { isAutoModeClassifier } from "../auto-mode-forge.js";
@@ -48,13 +48,14 @@ import { effectiveBlockOpsEnabled } from "./prepare-responses.js";
 import { injectSystem, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
-import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgIdPin, applyMsgSeqStamps, validateMsgIds, validateMsgSeqs } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgIdPin, applyMsgSeqStamps, applyWireMsgIdPin, validateMsgIds, validateMsgSeqs, validateWireMsgIds, wirePinGroups } from "../msgid-pin.js";
 import { tryIncrementalPin } from "../snapshot/stage0.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 import { currentCalibrationFactor } from "../util.js";
 import { yieldToEventLoop } from "../yield-loop.js";
-import { egressAuthorityArmed, egressBlockLedgerFor, recordAuthorityTurn, resolveEgressAuthority } from "./egress-lane-io.js";
+import { egressAuthorityArmed, egressBlockLedgerFor, recordAuthorityTurn, resolveEgressAuthority, stampEgressSeqs } from "./egress-lane-io.js";
+import { EgressAuthorityRejectError } from "../storage/egress-record.js";
 
 export async function prepareAnthropic(
     parsed: AnthropicRequestBody,
@@ -256,10 +257,15 @@ export async function prepareAnthropic(
                 // screen; any mismatch degrades to the full signal, never
                 // rejects — opencode V1's anthropic-wire header is the
                 // steady-state consumer).
-                const idsFullForm = Array.isArray(incomingMsgIds) && incomingMsgIds.length === msgs.length ? (incomingMsgIds as string[]) : undefined;
-                const v = idsFullForm === undefined ? undefined : validateMsgIds(idsFullForm, msgs.length);
+                // #7439 follow-up: the full list is per-CORE or per-WIRE-
+                // ELEMENT (dual-mode, same rule as stage0 — a split group
+                // guarantees element count < core count, no ambiguity).
+                const wireG = (() => { const g = wirePinGroups(msgs); return g !== null && g.split ? g : null; })();
+                const idsFullForm = Array.isArray(incomingMsgIds) && (incomingMsgIds.length === msgs.length || (wireG !== null && incomingMsgIds.length === wireG.size)) ? (incomingMsgIds as string[]) : undefined;
+                const wireHit = wireG !== null && Array.isArray(incomingMsgIds) && incomingMsgIds.length === wireG.size && incomingMsgIds.length !== msgs.length;
+                const v = idsFullForm === undefined ? undefined : (wireHit ? validateWireMsgIds(idsFullForm, wireG!) : validateMsgIds(idsFullForm, msgs.length));
                 if (v !== undefined && v.ok) {
-                    msgs = applyMsgIdPin(msgs, v.ids);
+                    msgs = wireHit ? applyWireMsgIdPin(msgs, wireG!, v.ids) : applyMsgIdPin(msgs, v.ids);
                     originalMessages = msgs;
                     noteMsgIdObservation(session, v.ids, msgs, log, sessionId);
                     msgidPinMode = "incremental";
@@ -303,7 +309,9 @@ export async function prepareAnthropic(
         // (fold-time ids, immune to identity re-mints); live tail keeps the
         // client's bytes. No-op when the lane is inactive/degraded; the
         // reconcile call below still observes the CLIENT view.
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        let renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        // #7439 follow-up (C6): egress-on sequence authority (see egress-lane-io).
+        renderMsgs = stampEgressSeqs(getStore()?.egressOpLogStore(), sessionId, renderMsgs);
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
         // so the judged baseline is the rendered transcript, not the inbound.
@@ -597,10 +605,16 @@ export async function prepareAnthropic(
         // pinned, not a title request). Every other main turn is only
         // recorded, and an unreadable log then means "not recorded", not a
         // failed request.
-        if (featureEnabled("egressPlane") && !anthropicTitleGen) {
+        if (egressPlaneGateOn() && !anthropicTitleGen) {
             const st = getStore().egressOpLogStore();
             if (st) {
                 const armed = egressAuthorityArmed({ pluginMode, pinned: msgidPinMode === "incremental", sideRequest: anthropicTitleGen });
+                // The reject check sits AFTER processTurn here (the openai
+                // lane has it pre-kernel, prepare-openai.ts:384): the decision
+                // does not depend on the turn content, but the record needs
+                // the transformed lane shape. A rejected turn leaves only
+                // in-memory kernel state — nothing is recorded and the retry
+                // self-heals (single-txn, idempotent).
                 const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
                 const served = recordAuthorityTurn(st, sessionId, auth, extractSystem(systemOut) ?? "", log, egressBlockLedgerFor(session), session.state.messageRefs);
                 if (served !== null) {
@@ -711,6 +725,11 @@ export async function prepareAnthropic(
             attachedRetrievalNoteIds = retrNotes.map((n) => n.id);
         }
     } catch (err) {
+        // Ruling 7439-5 (C3, PR #7684): an unreadable op-log on an armed turn
+        // is a HARD fail (500 + x-bili-egress: unreadable) — the generic
+        // forward below would send the CLIENT'S bytes, which the ruling
+        // forbids (the openai lane already rethrows this exact error).
+        if (err instanceof EgressAuthorityRejectError) throw err;
         log("warn", `[${sessionId}] kernel transform failed, forwarding unchanged: ${String(err)}`);
         if (attachedRetrievals.length > 0) dropRetrievals(session, attachedRetrievals.map((i) => i.ref), "prepare failed; forwarded unprocessed");
         processedMessages = [];

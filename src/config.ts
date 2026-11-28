@@ -2508,6 +2508,17 @@ type FileConfig = {
      *  from pool eviction. Surviving bytes re-materialize via narrow disk reads.
      *  Default: same value as `residentMaxBytes` above. */
     sessions?: {
+        /** Relocate the sessions directory (where index.db, session JSON and
+         *  the CCR content stores live) off a capacity-constrained drive —
+         *  e.g. a Windows C: that cannot hold a growing index.db — without
+         *  touching the shell environment. env BILI_SESSIONS_DIR wins (the
+         *  #2030 override tier); absent/invalid falls back to the XDG data
+         *  dir. Resolved in paths.sessionsDir() (the leaf every consumer
+         *  imports); a value pointing at an existing FILE refuses to start
+         *  loudly instead of silently falling back (that fallback would
+         *  recreate the disk-capacity failure). Hot edits apply on the next
+         *  restart, like every other path. */
+        dir?: string;
         max?: number;
         warmMax?: number;
         warmMaxBytes?: number;
