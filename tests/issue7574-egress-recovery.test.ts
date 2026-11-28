@@ -114,13 +114,15 @@ test("#7574 a damaged op log costs a turn only where it is the authority; the op
                 db.close();
             }
         };
-        // damage every row of a session in both tables while the server is live
+        // damage a session's tables while the server is live: the serving copy
+        // goes structurally empty (the read notices) and the flow rows become
+        // unreplayable (the rebuild and the walk-back both hit them)
         const corrupt = async (sid: string): Promise<void> => {
             for (let attempt = 1; attempt <= 50; attempt++) {
                 const db = new DatabaseSync(dbPath);
                 try {
                     db.exec("PRAGMA busy_timeout = 15000");
-                    const st = db.prepare("UPDATE egress_state SET payload = ? WHERE session_id = ?").run('{"x":1}', sid);
+                    const st = db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(sid);
                     const fl = db.prepare("UPDATE egress_flow SET payload = ? WHERE session_id = ?").run('{"x":1}', sid);
                     if (st.changes > 0 && fl.changes > 0) return;
                 } catch (err) {

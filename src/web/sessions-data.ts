@@ -19,7 +19,7 @@ import { markdownToHtml } from "./markdown.js";
 import { displaySessionTitle, firstBlockTopicLead } from "../session-title.js";
 import { contextAnalysisView, type ContextAnalysisView } from "../context-analysis.js";
 import { log } from "../logger.js";
-import { dataDir } from "../paths.js";
+import { dataDir, sessionsDirRelocated } from "../paths.js";
 import { isExternalSummaryBlock } from "../external-summary-marker.js";
 import { readdirSync, statSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
@@ -83,6 +83,7 @@ interface WebSessionSummary {
     /** true when the per-request cache ledger holds samples — the token
      *  fields above then include ledger-measured usage (max with stats). */
     hasLedger?: boolean;
+    hasEgress?: boolean; // #B4 (KDD#25): egress op-log records present — a single-turn egress session is not an empty stub
     /** Display-name fallback: collapsed lead of the first compression block's topic/summary. */
     firstBlockHint?: string;
     /** Parent session for a subagent/derived session, when the host stamped
@@ -485,14 +486,14 @@ const DATA_DIR_INFRA_ENTRIES = new Set(["ca"]);
 
 /** #2180: a top-level ENOENT means "pristine" — no session file can exist
  *  anywhere — only when the DEFAULT layout is in effect: BILI_SESSIONS_DIR
- *  unset AND the XDG data root either absent or holding ONLY bili's own infra
+ *  unset AND no `sessions.dir` config key AND the XDG data root either absent or holding ONLY bili's own infra
  *  dirs (a fresh install where ensureRootCA() already ran). An explicit
  *  override pointing nowhere, or a data root containing anything else, stays
  *  loud (#1937): silence there would hide a moved/misconfigured path while
  *  real sessions sit elsewhere. */
 function isPristineSessionsRoot(error: unknown): boolean {
     if ((error as NodeJS.ErrnoException | undefined)?.code !== "ENOENT") return false;
-    if (process.env.BILI_SESSIONS_DIR) return false;
+    if (sessionsDirRelocated()) return false;
     let entries: string[];
     try {
         statSync(dataDir());
@@ -812,7 +813,9 @@ function summaryFromRow(row: import("../storage/store.js").WebSummaryRow): WebSe
         lastSeen: row.updatedAt,
         restored: true,
     };
-    return summaryOf(source, false);
+    const s = summaryOf(source, false);
+    if ((row.egressRecords ?? 0) > 0) s.hasEgress = true;
+    return s;
 }
 
 function hitPct(input: number, cached: number): number | null {
@@ -1061,7 +1064,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
  *  compression blocks, no cache ledger (startup & test stubs). Hidden from every
  *  list (#1426 user ask); still reachable through a direct detail link. */
 function isEmptyStub(s: WebSessionSummary): boolean {
-    return (s.requests ?? 0) <= 1 && (s.contextTokens ?? 0) === 0 && (s.blocks ?? 0) === 0 && !s.hasLedger;
+    return (s.requests ?? 0) <= 1 && (s.contextTokens ?? 0) === 0 && (s.blocks ?? 0) === 0 && !s.hasLedger && !(s.hasEgress ?? false);
 }
 
 let lastHiddenEmpty = 0;
@@ -1578,7 +1581,15 @@ function renderDetail(session: Session, live: boolean): WebSessionDetail {
         ...(clientHint ? { clientHint } : {}),
         ...(engineLane ? { engineLane } : {}),
         ...(typeof session.metadata["biliVersion"] === "string" ? { biliVersion: session.metadata["biliVersion"] as string } : {}),
-        ...(typeof session.metadata["storageMode"] === "string" ? { storageMode: session.metadata["storageMode"] as string } : {}),
+        // Egress-on sessions have no file/DB copy at all — the per-turn unified
+        // ingest is frozen (KDD #23) and the identity row's metadata whitelist
+        // (KDD #25) drops the storageMode stamp, so the stamp is structurally
+        // absent. Surface the REAL carrier instead of letting the client's
+        // "legacy" fallback lie (#155 honest-output class).
+        ...(() => {
+            if (session.metadata["egressAuthority"] === true) return { storageMode: "egress" as const };
+            return typeof session.metadata["storageMode"] === "string" ? { storageMode: session.metadata["storageMode"] as string } : {};
+        })(),
         // #3756 follow-up: snapshot-render shadow observability (compute the
         // view, never emit it) — surfaced so the panel can prove the render
         // engine healthy across the fleet before the rollout flip.
