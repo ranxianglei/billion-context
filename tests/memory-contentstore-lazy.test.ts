@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { SessionStore } from "../src/persist.ts";
-import { isDroppedContentStore, markDirty, residentBreakdown, type Session } from "../src/session.ts";
+import { isDroppedContentStore, markDirty, residentBreakdown, sessionWeight, type Session } from "../src/session.ts";
 import { createInitialState, createContentStore, storeOriginal, type CoreMessage, type MessageContentStore } from "acp-kernel";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -70,16 +70,20 @@ test("idle save folds the content store; first touch transparently re-materializ
         assert.ok(!isDroppedContentStore(s.contentStore), "starts plain");
         const fullBytes = residentBreakdown(s).contentStore;
         assert.ok(fullBytes > 25_000, `seeded originals should be measurable, got ${fullBytes}`);
+        const beforeTotal = sessionWeight(s);
 
         await store.writeNow(s);
 
         assert.ok(isDroppedContentStore(s.contentStore), "idle save swaps in the lazy proxy");
-        // NOTE: measuring deepSizeOf through the proxy IS a touch (one narrow
-        // read) — that is the design; RAM goes quiet only until first use.
-        // First touch: full set back, byte-identical to what was seeded.
+        assert.ok(
+            sessionWeight(s) < beforeTotal - Math.floor(fullBytes * 0.5),
+            `released store must leave the cached weight (${beforeTotal} -> ${sessionWeight(s)}; store was ~${fullBytes} B)`,
+        );
+        assert.equal(residentBreakdown(s).contentStore, 64, "diagnostics count only the unloaded proxy");
+        assert.ok(isDroppedContentStore(s.contentStore), "measuring must not load persisted originals");
+        assert.equal(Object.keys(s.contentStore!.byRef).length, 30, "all refs visible through the proxy");
         const restored = residentBreakdown(s).contentStore;
         assert.ok(restored >= Math.floor(fullBytes * 0.9), `re-materialized set must match the seed (~${fullBytes}), got ${restored}`);
-        assert.equal(Object.keys(s.contentStore!.byRef).length, 30, "all refs visible through the proxy");
         assert.equal(Object.keys(s.contentStore!.byHash).length, 2, "deduped originals visible");
         const entry = s.contentStore!.byRef["m00001"];
         assert.equal(entry.rawId, "raw-1");
