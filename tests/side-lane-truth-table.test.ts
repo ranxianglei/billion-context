@@ -238,33 +238,41 @@ test("isSideRequest: the conversation sentinel normalizes to absent; only real p
     }
 });
 
-// #6884: pi's leg of the #6880 declaration. The "conversation" sentinel from
-// a PI-marked request is a FACT ("this is the session's main conversation
-// turn" — pi has no auxiliary-call concept, so an undeclared aux call cannot
-// exist), not an inference: handle.ts derives declaredPiMainTurn and rides
-// the #1699 explicit-"main" rung, so the agent becomes "main" and outranks
-// every body heuristic. The dsh leg of the SAME sentinel stays ≡ absent
-// (the #6880 pin above) — the asymmetry is the point.
-test("isSideRequest: the pi conversation sentinel declares main — side-shaped bodies stay main (#6884)", () => {
+// #6884: pi's leg of the #6880 declaration; #7572 extends it to dsh. The
+// "conversation" sentinel from a PI- or DSH-marked request is a FACT ("this
+// is the session's main conversation turn" — pi has no auxiliary-call concept
+// at all; dsh's contract is that ordinary conversation leaves
+// GenerateOptions.purpose UNSET while every auxiliary call sets a real
+// purpose, so the sentinel can only appear on a main turn), not an
+// inference: handle.ts derives declaredMainTurn and rides the #1699
+// explicit-"main" rung, so the agent becomes "main" and outranks every body
+// heuristic. #7572 supersedes #6884's "dsh sentinel ≡ absent" default — the
+// pre-#7572 pi/dsh asymmetry is now the shared main behavior.
+test("isSideRequest: the pi/dsh conversation sentinel declares main — side-shaped bodies stay main (#6884, #7572)", () => {
     // reference: the derivation exactly as handle.ts applies it (both call
-    // sites share declaredPiMainTurn ? "main" : <agent>)
+    // sites share declaredMainTurn ? "main" : <agent>)
     const classify = (headers: Record<string, string | string[] | undefined>, body: Record<string, unknown>) => {
         const raw = pluginPurposeHeader(headers);
         const declared = raw === PLUGIN_PURPOSE_CONVERSATION ? undefined : raw;
-        const declaredPiMainTurn = raw === PLUGIN_PURPOSE_CONVERSATION && pluginAgentHeader(headers) === "pi";
-        return isSideRequest(body, declaredPiMainTurn ? "main" : pluginRequestAgentHeader(headers), declared);
+        const declaredMainTurn = raw === PLUGIN_PURPOSE_CONVERSATION && (pluginAgentHeader(headers) === "pi" || pluginAgentHeader(headers) === "dsh");
+        return isSideRequest(body, declaredMainTurn ? "main" : pluginRequestAgentHeader(headers), declared);
     };
     // the #388 killer shape: toolless body under the 200-token budget —
     // pre-#6884 this demoted a declared pi main turn to the passthrough
     const sideShaped = { max_tokens: 64, messages: [{ role: "user", content: "one-shot" }] };
     // the fix: a declared pi main turn is NOT demoted by the shape
     assert.equal(classify({ "x-bili-plugin": "pi", "x-bili-plugin-purpose": PLUGIN_PURPOSE_CONVERSATION }, sideShaped), false, "pi + sentinel outranks the budget heuristic");
-    // the asymmetry: the SAME sentinel from dsh stays ≡ absent — the heuristic still demotes
-    assert.equal(classify({ "x-bili-plugin": "dsh", "x-bili-plugin-purpose": PLUGIN_PURPOSE_CONVERSATION }, sideShaped), true, "dsh + sentinel is an inference, not a fact");
+    // #7572: the SAME sentinel from dsh now ALSO declares main — the pre-#7572
+    // asymmetry (dsh ≡ absent, the heuristic demoted) is superseded
+    assert.equal(classify({ "x-bili-plugin": "dsh", "x-bili-plugin-purpose": PLUGIN_PURPOSE_CONVERSATION }, sideShaped), false, "dsh + sentinel declares main too (#7572)");
     // a real pi purpose still declares side (declaration outranks the main turn)
     assert.equal(classify({ "x-bili-plugin": "pi", "x-bili-plugin-purpose": "session-title" }, sideShaped), true);
+    // a real dsh purpose still declares side too (aux calls keep their real purpose)
+    assert.equal(classify({ "x-bili-plugin": "dsh", "x-bili-plugin-purpose": "session-title" }, sideShaped), true);
     // an UNstamped pi dispatch keeps the pre-#6884 behavior: the heuristic classifies
     assert.equal(classify({ "x-bili-plugin": "pi" }, sideShaped), true);
+    // an UNstamped dsh dispatch keeps the pre-#7572 behavior: the heuristic classifies
+    assert.equal(classify({ "x-bili-plugin": "dsh" }, sideShaped), true);
     // and the main rung is what does the work: an explicit "main" persona
     // header was never demoted (the #1699 rung the sentinel now rides)
     assert.equal(classify({ "x-bili-plugin": "pi", "x-bili-plugin-agent": "main" }, sideShaped), false);
