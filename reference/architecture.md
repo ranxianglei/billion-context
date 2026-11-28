@@ -102,6 +102,7 @@ billion-context/
 │   ├── chat-pack.ts              # Bundled chat prompt pack: relationship-first compress philosophy (#5319)
 │   ├── compress-tool.ts          # ACP tool surface — thin re-export from acp-kernel
 │   ├── decompress-shared.ts      # Shared decompress logic + large-decompress tmp retention cap
+│   ├── superseded-refs.ts        # Shared superseded-ref resolution ladder for compress/decompress (#5049 item 4)
 │   ├── fold-reconcile.ts         # Fold-anchor reconciliation for stable prefix cache
 │   ├── generation-boundary.ts    # Standing generation-boundary note for post-switch stale-ref residue (#4305)
 │   ├── orphan-gc.ts              # Orphan block garbage collection
