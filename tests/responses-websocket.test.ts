@@ -68,6 +68,30 @@ test("V2 handshake: routes OAuth/API Responses sockets and stamps native identit
     } finally { cleanup(); }
 });
 
+// #5625 follow-up: the launcher respawns its proxy on a fresh dynamic port
+// (port 0), so a config-baked `<stale-origin>/bili/<upstream>` overlay can
+// outlive the origin it names. The tunnel must be rebuilt from the LIVE
+// origin (master's rewrite-and-replace did); dropping the handshake would
+// connect the host straight to the dead origin.
+test("V2 handshake: stale-baked overlay tunnels from the live origin after a respawn (#5625)", async () => {
+    const hooks = new Map<string, (event: V2HttpRequestEvent) => void | Promise<void>>();
+    const liveOrigin = "http://127.0.0.1:8787";
+    const cleanup = await createOpencodeV2Setup({
+        // Launcher-lane contract: discovery only — pin the live origin, never touch e.request.
+        route: async (_e, state) => { state.proxyBase = liveOrigin; },
+    })({
+        session: { hook: async (name, cb) => { hooks.set(name, cb); return {}; } },
+    });
+    try {
+        const upstream = "https://api.openai.com/v1/responses";
+        const event: V2HttpRequestEvent = { url: `wss://127.0.0.1:9999/bili/${upstream}`, headers: { authorization: "Bearer t" }, sessionID: "ses_stale", agent: "build", model: { providerID: "openai", id: "gpt-5.2" } };
+        await hooks.get("experimental.ws.handshake")!(event);
+        assert.equal(event.url, `${liveOrigin.replace(/^http/, "ws")}/bili/responses/${upstream}`);
+        assert.equal(event.headers?.["x-bili-plugin"], "opencode");
+        assert.equal(event.headers?.authorization, "Bearer t");
+    } finally { cleanup(); }
+});
+
 test("Responses WS egress headers: azure strips consumed x-bili-* under the custom-header cap; other hosts unchanged", () => {
     const raw = {
         host: "westus2.openai.azure.com",
