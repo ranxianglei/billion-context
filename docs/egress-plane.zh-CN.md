@@ -71,6 +71,16 @@ fork **不需要任何 id 转换**：所有主键都是 `(session_id, rid)`，�
 5. **保存**——会话信封保存为**仅索引**（bootstrap 起冻结）；**块记录器**把 `state.blocks` 与 `egress_block_state` diff，追加块 I/U 行，每行盖 `flow_op_seq = flow.MAX(op_seq)`。无逐轮统一 ingest（KDD #23）。
 6. **重启**——加载时重放 flow → `egress_state`（物化）；`tsStamps`/token 统计**从重放推导**，不再持久化；kstate 只留残差清单。state 副本损坏时，serving 读**全史重放重建**后照常服务（flow 是正史）；FLOW 本身不可重放时，`recoverEgressBase` 走**一趟全史 walk**（`egressFlowWalkBack`）：最新健康前缀截掉尾部、会话从那里继续；无任何健康点 ⇒ 响亮硬失败（7439-5）。
 
+## 4a. Recorded image shed（#7693，带图会话的稳态）
+
+插件宿主每轮全量重发，图片行只增不减。旧的路径只在 **wire 副本**上 shed（`shedWireImages` backstop）：flow 照记全图 ⇒ kernel 的 token 空间与 wire 字节分歧（kernel 看见永远折不掉的图，提前反复触发压缩），占位符 ref 靠每请求重建的字节索引解析，折叠后「id 对不上号」。egress-on 把收敛点上移到 op log：
+
+- **记录源先过 `shedCoreImages`**（`src/egress-core-shed.ts`）再进 `recordEgressTurn`：oldest-first 把最旧的非尾图片行归档成**固定占位文本行**（`[image: <mime> <WxH> <ref> omitted for size limit]`，msg id 不变），diff 天然为每个归档行产一条 **U op**——存储侧零新机器。
+- **目标**：学习到的 per-origin 图片计数墙（`session.stats.imageCountCaps`，取 `cap-1`）∩ 出站字节预算（WS/HTTP outbound limit 取小）；保护尾 8 行（计数硬墙下尾让步）；`acp_read_original_image` 输出与 receipt 验证过的原图豁免。
+- **效果**：flow = wire = kernel 输入 = 客户端视图四方一致——kernel 不再提前触发压缩；占位行字节恒定（无逐轮重写、无新缓存接缝）；ref 就是 msgid 本身（折叠后不失）；占位行是可折叠文本行（折叠真释放空间）。
+- **原图恢复**：客户端每轮全量重发（#2092 契约）⇒ incoming image index 每请求重建，`decompress({ imageRef })` / 原图工具照常可达，无需新存储。wire shed（relay）保留为 backstop，收敛后变 no-op。
+- legacy（egress 关）路径不变。
+
 ## 5. 为什么更快
 
 | 之前（每轮，10w 行会话） | 之后 |
@@ -130,6 +140,7 @@ fork **不需要任何 id 转换**：所有主键都是 `(session_id, rid)`，�
 | 讨论 [#7735](https://github.com/ranxianglei/billion-context/discussions/7735)（2026-11-25） | **扫尾**：arm 时身份行（§11）、7 表创建门、kv_store 256 字符策略 + 大 blob 退役、l1 死行清理、三个 flag 默认值修正回 0。 |
 | 讨论 [#7773](https://github.com/ranxianglei/billion-context/discussions/7773)（2026-11-26） | **形态再裁定**：两平面的 `B` base 行退役；state 表变为**物化 live 视图**（PK `(session_id, msgid)`、`pos` 序；D 物理删、折叠 O(尾长)）；恢复变为一趟全史 walk（`egressFlowWalkBack`）；点位 fork 重放物化到**任意**点位；每次写入后断言结构不变量（§3）。存量不迁移——表从未随版本发布，已有库把四张 egress 表 drop 重建（owner 操作手册：删 `index.db*` + 重启）。 |
 | Owner 裁定（2026-11-27，#7773 后续——实测 D 行审计） | **行寻址改用自派行 id（`rid`）**：日志 payload 里的 msgid 不是可靠地址——proxy 会把宿主 id 映射成内容 hash、客户端 id 可能冲突、折叠/re-home 之后同一个 msgid 分不清指哪一次。所有 egress 表改由稠密、append-only、永不重发的 `rid` 寻址：`egress_state` PK `(session_id, rid)`（+ `idx_egress_state_msgid` 供 serving 查找），`egress_flow` I 行带 `rid`、D/U payload 引用 rid。内核身份缝（prev↔next diff 匹配）继续用 msgid——只有**持久寻址层**变了。从未发布规则再次适用：旧形态探针（缺 `rid`）首开 drop 重建；开发库按 §7 手册毁库重建。 |
+| **#7693（2026-11-28）** | Recorded image shed：带图会话的归档从 wire 副本上移到 op log（§4）——flow = wire = kernel 输入四方一致，压缩频率/缓存接缝/占位符 ref 丢失三个症状同时归正。 |
 
 **遗留**（已跟踪）：egressPlane 默认翻 100（等 owner 点头）；归档格式承载 op log；退役身份载体的物理 DROP 批次；按退役登记表删开关（硬编码开）。（point-reconstruction materializer 与 `egressBlockCompact` 生产调用方已被 #7773 退役——点位 fork 重放物化，块压实不复存在。）
 

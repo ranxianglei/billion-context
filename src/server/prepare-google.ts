@@ -418,7 +418,7 @@ export async function prepareGoogle(
                 // the transformed lane shape. A rejected turn leaves only
                 // in-memory kernel state — nothing is recorded and the retry
                 // self-heals (single-txn, idempotent).
-                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed });
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: laneCoreForRecord, log, armed, origin: upstreamOrigin });
                 const served = recordAuthorityTurn(st, sessionId, auth, googleOutboundSystem ?? googleClientSystem, log, egressBlockLedgerFor(session), session.state.messageRefs);
                 if (served !== null) {
                     rebuiltContents = coreToGoogle(served, { model });

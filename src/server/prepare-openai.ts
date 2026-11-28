@@ -64,6 +64,7 @@ interface EgressRecordSourceMsg {
 }
 import { rebuildOutboundFromLog } from "../storage/egress-serve.js";
 import { resolveEgressAuthority, egressAuthorityArmed, egressBlockLedgerFor, buildEgressIdentityInput, stampEgressSeqs } from "./egress-lane-io.js";
+import { shedCoreImages, type CoreImageShedTargets } from "../egress-core-shed.js";
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
 import { DeltaReanchorError, PF_TAIL_IDS_HEADER, evaluateDeltaResend, evaluateWatermarkFastpath, finalizeWatermarkTurn, parseTailIdsForPin, type FastpathHit, type FastpathOutcome } from "./fastpath.js";
 import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
@@ -178,6 +179,10 @@ export async function prepareOpenai(
     let egressBaseSeq = 0;
     let egressSwapApplied = false;
     let egressBootstrap = false;
+    // #7693: the image-shed targets the authority seam resolved this turn —
+    // this lane records its post-kernel array below, so it re-applies them
+    // there (the flow converges to what the wire actually carries).
+    let egressImageShedTargets: CoreImageShedTargets | undefined = undefined;
     let egressArmed = false;
     let egressServedFromLog = false;
     // The EXACT array fed to the outbound chain (post reasoning-drop / ccr /
@@ -381,10 +386,11 @@ export async function prepareOpenai(
             // array (egressRecordSource), diffed against auth.base.
             const st = getStore().egressOpLogStore();
             if (st) {
-                const auth = resolveEgressAuthority({ session, st, sessionId, core: msgs, log, armed: true });
+                const auth = resolveEgressAuthority({ session, st, sessionId, core: msgs, log, armed: true, origin: upstreamOrigin });
                 egressBaseRows = auth.base;
                 egressBaseSeq = auth.baseSeq;
                 egressBootstrap = auth.bootstrapping;
+                egressImageShedTargets = auth.imageShedTargets;
                 if (auth.swappedCore !== null) {
                     msgs = auth.swappedCore;
                     originalMessages = msgs;
@@ -729,7 +735,9 @@ export async function prepareOpenai(
                         sessionId,
                         prev: egressBaseRows ?? undefined,
                         baseSeq: egressBaseSeq,
-                        conversation: egressMessages,
+                        // #7693: record the image-shedded array — the served
+                        // wire is rebuilt from THIS view, so wire = flow.
+                        conversation: egressImageShedTargets ? shedCoreImages(egressMessages, egressImageShedTargets).rows : egressMessages,
                         systemText: openaiOutboundSystem,
                         nowMs: Date.now(),
                         blockLedger: egressBlockLedgerFor(session),
@@ -984,12 +992,15 @@ export async function prepareOpenai(
         try {
             const st = getStore().egressOpLogStore();
             if (st) {
+                // #7693: same image-shed targets as the serve path above
+                // (armed turns; record-only turns have no targets).
+                const recordCore = egressRecordSource ?? (processedMessages.length > 0 ? processedMessages : originalMessages);
                 recordEgressTurn({
                     store: st,
                     sessionId,
                     prev: egressBaseRows ?? undefined,
                     baseSeq: egressBaseSeq,
-                    conversation: egressRecordSource ?? (processedMessages.length > 0 ? processedMessages : originalMessages),
+                    conversation: egressImageShedTargets ? shedCoreImages(recordCore, egressImageShedTargets).rows : recordCore,
                     systemText: openaiOutboundSystem ?? openaiSystemText,
                     nowMs: Date.now(),
                     blockLedger: egressBlockLedgerFor(session),

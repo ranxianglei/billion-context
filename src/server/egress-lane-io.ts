@@ -47,7 +47,9 @@
 import { recoverEgressBase, recordEgressTurn, EgressAuthorityRejectError, EGRESS_SYSTEM_MSGID, sanitizeEgressIdentityMetadata, type EgressIdentityInput, type EgressOpLogStore, type EgressRefMap } from "../storage/egress-record.js";
 import type { EgressBlockLedgerInput } from "../storage/egress-block.js";
 import { EgressConcurrentWriteError } from "../storage/egress-state.js";
-import { egressPlaneGateOn } from "../knobs.js";
+import { egressPlaneGateOn, limitsHttpOutboundBytes, limitsWsOutboundBytes } from "../knobs.js";
+import { normalizeUpstreamOrigin } from "../util.js";
+import { shedCoreImages, CORE_IMAGE_SHED_NOTE_RE, type CoreImageShedTargets } from "../egress-core-shed.js";
 import { outputBudgetField, readOutputBudget } from "./budget.js";
 import { rebuildCoreFromLog } from "../storage/egress-serve.js";
 import type { EgressViewRow } from "../storage/egress-state.js";
@@ -92,6 +94,11 @@ export function egressAuthorityProbe(
         const b = base[bi];
         const ct = typeof c.text === "string" ? c.text : "";
         const bt = typeof b.text === "string" ? b.text : "";
+        // #7693: the recorded image shed rewrites an archived image row to a
+        // placeholder note IN THE FLOW while the client still holds the
+        // original — that pair diverges by design (server bytes win, the
+        // note converges the client). It must not count as a divergence.
+        if (CORE_IMAGE_SHED_NOTE_RE.test(bt) && ct.startsWith("[image]")) continue;
         if (c.contentType !== b.contentType || ct.length !== bt.length || (ct.length <= 32768 && ct !== bt)) diverged++;
         if (diverged >= 4) break;
     }
@@ -118,6 +125,11 @@ interface EgressAuthorityOutcome {
      * NOT advanced (legacy turn, or a record-only turn whose log is
      * unreadable). */
     recordCore: BiliMessage[] | null;
+    /** #7693: the image-shed targets this turn's record ran with (armed
+     * turns only). The OpenAI lane records its post-kernel array itself
+     * (the swapped core is its kernel input), so it re-applies the same
+     * targets there — everything else rides recordCore, already shed. */
+    imageShedTargets?: CoreImageShedTargets;
 }
 
 /** #7574: the ONE arming rule of the authority seam. The server log may
@@ -143,6 +155,26 @@ export function egressTinyBudget(parsed: unknown): boolean {
     if (field === null) return false;
     const value = readOutputBudget(parsed as Record<string, unknown>, field);
     return typeof value === "number" && value > 0 && value <= 200;
+}
+
+/** #7693: this turn's core-space image-shed targets for an ARMED session.
+ * Count wall: the per-origin upstream image-count cap the relay learned
+ * (same keys the relay reads — normalizeUpstreamOrigin), converged to
+ * cap−1 exactly like the relay's pre-send convergence. Byte budget: the
+ * minimum of the two outbound soft budgets — at record time the transport
+ * is not known yet (the WS marker is only set at send time), and the
+ * smaller budget is the safe direction (over-archiving old images is
+ * harmless: originals stay reachable; under-archiving just leaves the
+ * relay backstop to fire once more). A knob set to 0 (disabled) drops
+ * out of the minimum; both disabled = no byte target. */
+export function recordImageShedTargets(session: Session, origin: string | undefined): CoreImageShedTargets | undefined {
+    const key = normalizeUpstreamOrigin(origin);
+    const cap = key ? session.stats.imageCountCaps?.[key] : undefined;
+    const maxImages = typeof cap === "number" && Number.isFinite(cap) && cap >= 1 ? cap - 1 : undefined;
+    const budgets = [limitsWsOutboundBytes(), limitsHttpOutboundBytes()].filter((v) => v > 0);
+    const maxBytes = budgets.length > 0 ? Math.min(...budgets) : undefined;
+    if (maxImages === undefined && maxBytes === undefined) return undefined;
+    return { maxImages, maxBytes };
 }
 
 /** #7664 (PR-A): the in-memory kernel block set for the egress block ledger —
@@ -216,8 +248,15 @@ export function resolveEgressAuthority(args: {
     core: BiliMessage[];
     log: LaneLog;
     armed: boolean;
+    /** The lane's upstream origin — the image-count cap is learned per
+     * origin (see recordImageShedTargets). */
+    origin?: string;
 }): EgressAuthorityOutcome {
-    const { session, st, sessionId, core, log, armed } = args;
+    const { session, st, sessionId, core, log, armed, origin } = args;
+    // #7693: armed turns record the image-shedded core (the flow converges
+    // to what the wire actually carries); record-only turns record the
+    // client view verbatim (the log is not their content authority).
+    const imageShedTargets = armed ? recordImageShedTargets(session, origin) : undefined;
     // #7574: a session latched as unreadable stays failed until an operator
     // resets its log (admin route). Retrying the 17 replay scans on every
     // request would add seconds to each attempt and still end here.
@@ -295,9 +334,12 @@ export function resolveEgressAuthority(args: {
         // Turn-1 cold start (ruling 7439-5): the client bytes are the
         // content source EXACTLY ONCE — recordAuthorityTurn puts them in
         // the flow; from turn 2 this branch never runs again for a
-        // healthy session.
+        // healthy session. (#7693: a turn-1 context that is ALREADY over
+        // the wall is archived here, so the flow starts converged — the
+        // served wire and the kernel input follow the recorded rows.)
+        const bootstrapCore = imageShedTargets ? shedCoreImages(core, imageShedTargets).rows : core;
         log("info", `[${sessionId}] egress-authority: bootstrap — empty flow, client bytes recorded once (turn 1 of the op-log)`);
-        return { base: base0.view, baseSeq: base0.seq, bootstrapping: true, swappedCore: null, recordCore: core };
+        return { base: base0.view, baseSeq: base0.seq, bootstrapping: true, swappedCore: null, recordCore: bootstrapCore, imageShedTargets };
     }
     const base = rebuildCoreFromLog(base0.view) ?? [];
     if (base.length === 0 || !egressAuthorityProbe(base, core, sessionId, log)) {
@@ -307,9 +349,13 @@ export function resolveEgressAuthority(args: {
         return { base: base0.view, baseSeq: base0.seq, bootstrapping: false, swappedCore: null, recordCore: null };
     }
     const baseById = new Map(base.map((m) => [m.id, m] as const));
-    const swapped = core.map((c) => baseById.get(c.id) ?? c);
+    // #7693: archive over-budget images in the swapped core — the flow row
+    // keeps its msgid (a `U` op), its bytes go stable, and kernel input /
+    // served wire / recorded bytes all carry the same placeholder. The
+    // protected tail (this turn's fresh images) stays intact.
+    const swapped = shedCoreImages(core.map((c) => baseById.get(c.id) ?? c), imageShedTargets).rows;
     log("info", `[${sessionId}] egress-authority: ${base.length} existing row(s) served from the op-log, ${Math.max(0, core.length - base.length)} fresh from the client${base0.degraded ? ` (recovered to op_seq=${base0.seq}, truncated ${base0.truncated} row(s))` : ""}`);
-    return { base: base0.view, baseSeq: base0.seq, bootstrapping: false, swappedCore: swapped, recordCore: swapped };
+    return { base: base0.view, baseSeq: base0.seq, bootstrapping: false, swappedCore: swapped, recordCore: swapped, imageShedTargets };
 }
 
 /** Record THIS turn per the outcome (see the ORDER MATTERS note above):
