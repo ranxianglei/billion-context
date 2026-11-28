@@ -30,12 +30,15 @@ import {
     runBlogRefreshRound,
     kickBlogRefresh,
     warmBlogRefreshOnce,
+    configureBlogRefreshProxy,
     _resetBlogRefreshForTest,
     _setBlogRefreshDisabledForTest,
     settleRoundImmune,
 } from "../src/web/blog-refresh.ts";
 import { blogCacheStale } from "../src/web/client.ts";
 import { MESSAGES } from "../src/web/i18n.ts";
+import { Agent, ProxyAgent } from "undici";
+import { resetProxyCache } from "../src/upstream-proxy.ts";
 
 const CONTENTS_URL = "https://api.github.com/repos/ranxianglei/billion-context/contents/website/blog/posts?ref=master";
 const rawUrl = (rel: string): string => `https://raw.githubusercontent.com/ranxianglei/billion-context/master/${rel}`;
@@ -105,6 +108,7 @@ beforeEach(() => {
     writeFileSync(join(posts, "figures", "b.png"), BUNDLED_PNG);
     _setBlogRootForTest(pkgRoot);
     _resetBlogRefreshForTest();
+    resetProxyCache();
     hits = [];
     origFetch = globalThis.fetch;
     globalThis.fetch = ((url: unknown) => {
@@ -118,6 +122,7 @@ afterEach(() => {
     if (origFetch !== undefined) globalThis.fetch = origFetch;
     _setBlogRootForTest(null);
     _resetBlogRefreshForTest();
+    resetProxyCache();
     rmSync(outsideDir, { recursive: true, force: true });
 });
 
@@ -702,4 +707,41 @@ test("#4906 P3 blogCacheStale boundary + neutral offline wording pins", () => {
     assert.equal(blogCacheStale(0, 60 * 60 * 1000), true, "at 1h: stale -> background re-pull (bl.sub cadence)");
     assert.ok(MESSAGES["zh-CN"]["bl.offline"].includes("上次拉取未完成"), "zh wording no longer blames GitHub reachability");
     assert.ok(MESSAGES["en"]["bl.offline"].startsWith("Last refresh did not finish"), "en wording no longer blames GitHub reachability");
+});
+
+test("routes GitHub egress through the configured proxy dispatcher", async () => {
+    installGithubRouter();
+    const resolverUrls: string[] = [];
+    configureBlogRefreshProxy((url) => { resolverUrls.push(url); return "http://127.0.0.1:6785"; });
+    const seen: Array<{ url: string; dispatcher?: unknown }> = [];
+    globalThis.fetch = ((url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        seen.push({ url: u, dispatcher: (init as { dispatcher?: unknown } | undefined)?.dispatcher });
+        return Promise.resolve(router(u));
+    }) as typeof fetch;
+    const out = await runBlogRefreshRound({ force: true });
+    assert.equal(out.ok, true);
+    assert.ok(seen.length > 0, "the round must have fetched from GitHub");
+    assert.deepEqual(resolverUrls, seen.map((s) => s.url), "the resolver must see exactly the fetched URLs");
+    for (const s of seen) {
+        assert.ok(s.dispatcher instanceof ProxyAgent, `fetch ${s.url} must carry a ProxyAgent dispatcher`);
+    }
+});
+
+test("falls back to a direct Agent dispatcher when the blog-refresh proxy resolves to undefined", async () => {
+    installGithubRouter();
+    configureBlogRefreshProxy(() => undefined);
+    const seen: Array<{ url: string; dispatcher?: unknown }> = [];
+    globalThis.fetch = ((url: unknown, init?: RequestInit) => {
+        const u = String(url);
+        seen.push({ url: u, dispatcher: (init as { dispatcher?: unknown } | undefined)?.dispatcher });
+        return Promise.resolve(router(u));
+    }) as typeof fetch;
+    const out = await runBlogRefreshRound({ force: true });
+    assert.equal(out.ok, true);
+    assert.ok(seen.length > 0, "the round must have fetched from GitHub");
+    for (const s of seen) {
+        assert.ok(s.dispatcher instanceof Agent, `fetch ${s.url} must carry a direct Agent dispatcher`);
+        assert.ok(!(s.dispatcher instanceof ProxyAgent), `fetch ${s.url} must not carry a ProxyAgent`);
+    }
 });

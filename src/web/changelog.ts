@@ -14,6 +14,7 @@
 import type { ServerResponse } from "node:http";
 import { fetchWithTimeout } from "../fetch-util.js";
 import { log as loggerLog } from "../logger.js";
+import { proxyDispatcher } from "../upstream-proxy.js";
 
 type ChangelogRelease = {
     /** GitHub release tag (e.g. v0.1.203). */
@@ -55,12 +56,20 @@ let inflight: Promise<void> | undefined;
 /** One background warm-up per process for network-free callers (/acp panel);
  *  real cadence is driven by the admin endpoint's 10-minute throttle. */
 let warmAttempted = false;
+let resolveProxyForChangelog: ((url: string) => string | undefined) | undefined;
 
-/** Test seam: clear cache + throttle + in-flight + warm-up guards. */
+/** Configure the proxy resolver used when fetching GitHub Releases
+ *  (mirrors startReleaseNotesWatcher / startRemoteNoticesWatcher). */
+export function configureChangelogProxy(resolver?: (url: string) => string | undefined): void {
+    resolveProxyForChangelog = resolver;
+}
+
+/** Test seam: clear cache + throttle + in-flight + warm-up + proxy guards. */
 export function _resetChangelogForTest(): void {
     state = { releases: [], lastCheckAt: 0 };
     inflight = undefined;
     warmAttempted = false;
+    resolveProxyForChangelog = undefined;
 }
 
 /** Synchronous read of the newest cached release for surfaces that must not
@@ -92,9 +101,15 @@ function parseRelease(raw: unknown): ChangelogRelease | undefined {
 
 async function runCheck(): Promise<void> {
     try {
+        const proxyUrl = resolveProxyForChangelog?.(GITHUB_RELEASES_URL);
+        const dispatcher = proxyDispatcher(proxyUrl, FETCH_TIMEOUT_MS);
         const result = await fetchWithTimeout(
             GITHUB_RELEASES_URL,
-            { method: "GET", headers: { Accept: "application/json", "user-agent": "billion-context-changelog" } },
+            {
+                method: "GET",
+                headers: { Accept: "application/json", "user-agent": "billion-context-changelog" },
+                ...(dispatcher !== undefined ? { dispatcher } : {}),
+            },
             FETCH_TIMEOUT_MS,
         );
         try {
