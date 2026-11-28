@@ -129,7 +129,7 @@ test("pinned lane: bootstrap, steady serve, unpinned control, hard-fail (#7439-5
         const flowRows = (sid: string): number => {
             const db = new DatabaseSync(dbPath, { readOnly: true });
             try {
-                return (db.prepare("SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = ?").get(sid) as { n: number }).n;
+                return (db.prepare("SELECT COUNT(*) AS n FROM eg_flow WHERE session_id = ?").get(sid) as { n: number }).n;
             } finally {
                 db.close();
             }
@@ -211,8 +211,8 @@ test("pinned lane: bootstrap, steady serve, unpinned control, hard-fail (#7439-5
                     // 7773: the state plane carries no payload — damage it
                     // structurally (the serving read notices) and make the
                     // flow unreplayable (the rebuild and the walk-back hit it)
-                    const st = db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(sid);
-                    const fl = db.prepare("UPDATE egress_flow SET payload = ? WHERE session_id = ?").run('{"x":1}', sid);
+                    const st = db.prepare("DELETE FROM eg_state WHERE session_id = ?").run(sid);
+                    const fl = db.prepare("UPDATE eg_flow SET payload = ? WHERE session_id = ?").run('{"x":1}', sid);
                     if (st.changes > 0 && fl.changes > 0) {
                         assert.ok(fl.changes >= flowAfterBootstrap, `corruption covered the flow rows (changed ${fl.changes}, expected >= ${flowAfterBootstrap})`);
                         return;

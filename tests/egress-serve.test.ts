@@ -42,9 +42,9 @@ function open(): Harness {
         egressStateView: (sid: string) => egressStateRead(db, sid),
  
         egressStateViewAt: (sid: string, seq: number) => egressStateAt(db, sid, seq),
-        egressStateMaxSeq: (sid: string) => (db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx,
+        egressStateMaxSeq: (sid: string) => (db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM eg_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx,
         egressStateTruncateAfter: (sid: string, seq: number) => {
-            const b = db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND op_seq > ?`).run(sid, seq);
+            const b = db.prepare(`DELETE FROM eg_flow WHERE session_id = ? AND op_seq > ?`).run(sid, seq);
             return Number(b.changes);
         },
         egressFlowWalkBack: (sid: string) => egressFlowWalkBack(db, sid),

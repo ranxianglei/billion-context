@@ -2,7 +2,7 @@
 <rect width="1240" height="500" fill="#ffffff"/>
 <text x="40" y="22" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="16" font-weight="bold" fill="#1a2b4a">Egress 平面四表（双时钟 + 单向指针；物化 state，#7773）</text>
 <rect x="40" y="70" width="360" height="190" rx="8" fill="#fdeedd" stroke="#3a5a8a" stroke-width="1.5"/>
-<text x="52" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_flow — 消息 op log（正史）</text>
+<text x="52" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">eg_flow — 消息 op log（正史）</text>
 <text x="52" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, op_seq)，表内稠密</text>
 <text x="52" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">row_type：I 插入 / D 删除 / U 更新（无 B）</text>
 <text x="52" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">I 行：msgid + log_seq（规范编号，永不复用）；</text>
@@ -13,7 +13,7 @@
 <text x="52" y="215" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">任意点位可完整重建（egressStateAt）</text>
 <text x="52" y="230" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" font-weight="bold">退役的 B base 行已不存在（#7773）</text>
 <rect x="40" y="290" width="360" height="120" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
-<text x="52" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_state — 物化 live 视图</text>
+<text x="52" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">eg_state — 物化 live 视图</text>
 <text x="52" y="330" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, msgid)；pos 序，每条存活消息一行；</text>
 <text x="52" y="345" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">没有压实、没有 base 行</text>
 <text x="52" y="360" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">同事务应用：I 插入 + 后移、U 就地改、</text>
@@ -21,7 +21,7 @@
 <text x="52" y="390" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">snapPinLiveIds / serving 读命中它；副本损坏</text>
 <text x="52" y="405" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">全史重放重建后照常服务</text>
 <rect x="460" y="70" width="360" height="190" rx="8" fill="#fdeedd" stroke="#3a5a8a" stroke-width="1.5"/>
-<text x="472" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_block_flow — 块历史（独立时钟）</text>
+<text x="472" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">eg_block_flow — 块历史（独立时钟）</text>
 <text x="472" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, op_seq)——独立编号池</text>
 <text x="472" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">row_type：I 诞生 / U 变更 / D 收割（无 B）</text>
 <text x="472" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">D 行携带该块的终态全量快照</text>
@@ -32,7 +32,7 @@
 <text x="472" y="215" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">kstate 边车：残差字段清单</text>
 <text x="472" y="230" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" font-weight="bold">与消息 flow 一样 append-only</text>
 <rect x="460" y="290" width="360" height="120" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
-<text x="472" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_block_state — 物化 live 块</text>
+<text x="472" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">eg_block_state — 物化 live 块</text>
 <text x="472" y="330" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, block_id)；pos 序，每个未 reap</text>
 <text x="472" y="345" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">的块一行；reap 物理删行（flow 保留终态 D）</text>
 <text x="472" y="360" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">快照 payload + pos + op_seq/flow_op_seq</text>

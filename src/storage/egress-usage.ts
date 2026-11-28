@@ -61,11 +61,11 @@ export function egressUsageAppend(
   if (events.length === 0) return 0;
   const out = db.transaction(() => {
     const base = (
-      db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS n FROM egress_usage WHERE session_id = ?").get(sessionId) as { n: number }
+      db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS n FROM eg_usage WHERE session_id = ?").get(sessionId) as { n: number }
     ).n;
     let n = 0;
     const ins = db.prepare(
-      "INSERT INTO egress_usage (session_id, op_seq, row_type, at, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      "INSERT INTO eg_usage (session_id, op_seq, row_type, at, payload, created_at) VALUES (?, ?, ?, ?, ?, ?)",
     );
     let opSeq = base;
     const now = Date.now();
@@ -87,7 +87,7 @@ export function egressUsageAppend(
 
 export function egressUsageRows(db: SqliteDatabase, sessionId: string): EgressUsageRow[] {
   const rows = db
-    .prepare("SELECT op_seq, row_type, at, payload FROM egress_usage WHERE session_id = ? ORDER BY op_seq ASC")
+    .prepare("SELECT op_seq, row_type, at, payload FROM eg_usage WHERE session_id = ? ORDER BY op_seq ASC")
     .all(sessionId) as Array<{ op_seq: number; row_type: string; at: number; payload: string }>;
   return rows.map((r) => ({
     opSeq: r.op_seq,
@@ -104,9 +104,9 @@ export function egressUsageRows(db: SqliteDatabase, sessionId: string): EgressUs
 export function egressUsageForkCopy(db: SqliteDatabase, fromSessionId: string, toSessionId: string): void {
   if (fromSessionId === toSessionId) throw new Error("egress-usage fork: source and target are the same session");
   // Idempotent re-fork of the same parent pair: replace, like the flow copies.
-  db.prepare("DELETE FROM egress_usage WHERE session_id = ?").run(toSessionId);
+  db.prepare("DELETE FROM eg_usage WHERE session_id = ?").run(toSessionId);
   db.prepare(
-    "INSERT INTO egress_usage (session_id, op_seq, row_type, at, payload, created_at) SELECT ?, op_seq, row_type, at, payload, created_at FROM egress_usage WHERE session_id = ?",
+    "INSERT INTO eg_usage (session_id, op_seq, row_type, at, payload, created_at) SELECT ?, op_seq, row_type, at, payload, created_at FROM eg_usage WHERE session_id = ?",
   ).run(toSessionId, fromSessionId);
 }
 
@@ -119,15 +119,15 @@ export function egressUsageForkCopyPrefix(
   watermarkAt: number,
 ): void {
   if (fromSessionId === toSessionId) throw new Error("egress-usage fork: source and target are the same session");
-  db.prepare("DELETE FROM egress_usage WHERE session_id = ?").run(toSessionId);
+  db.prepare("DELETE FROM eg_usage WHERE session_id = ?").run(toSessionId);
   db.prepare(
-    "INSERT INTO egress_usage (session_id, op_seq, row_type, at, payload, created_at) SELECT ?, op_seq, row_type, at, payload, created_at FROM egress_usage WHERE session_id = ? AND at <= ?",
+    "INSERT INTO eg_usage (session_id, op_seq, row_type, at, payload, created_at) SELECT ?, op_seq, row_type, at, payload, created_at FROM eg_usage WHERE session_id = ? AND at <= ?",
   ).run(toSessionId, fromSessionId, Math.floor(watermarkAt));
 }
 
 /** Session deletion (deleteSession / deleteEgressOps): drop the stream. */
 export function egressUsageDelete(db: SqliteDatabase, sessionId: string): number {
-  const b = db.prepare("DELETE FROM egress_usage WHERE session_id = ?").run(sessionId);
+  const b = db.prepare("DELETE FROM eg_usage WHERE session_id = ?").run(sessionId);
   return Number(b.changes);
 }
 
@@ -179,7 +179,7 @@ export function writeUsageStatsBestEffort(db: SqliteDatabase, sessionId: string,
     if (!statsWarned.has(sessionId)) {
       if (statsWarned.size >= STATS_WARNED_CAP) statsWarned.clear();
       statsWarned.add(sessionId);
-      log(`[storage] egress usage stats row for session=${sessionId} not written (${err instanceof Error ? err.message : String(err)}) — the egress_usage stream keeps the truth; the stats row stays stale until a successful write`);
+      log(`[storage] egress usage stats row for session=${sessionId} not written (${err instanceof Error ? err.message : String(err)}) — the eg_usage stream keeps the truth; the stats row stays stale until a successful write`);
     }
     return false;
   }

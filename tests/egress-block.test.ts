@@ -116,7 +116,7 @@ test("reap = terminal D row with the full final snapshot; the state row is physi
         assert.equal(after.has("b1"), false);
         assert.equal(after.get("b2")!.active, true);
         // the flow keeps both rows (append-only): I@1, I@2, D@3
-        const rows = H.db.prepare("SELECT row_type FROM egress_block_flow WHERE session_id = ? ORDER BY op_seq").all(S) as { row_type: string }[];
+        const rows = H.db.prepare("SELECT row_type FROM eg_block_flow WHERE session_id = ? ORDER BY op_seq").all(S) as { row_type: string }[];
         assert.deepEqual(rows.map((r) => r.row_type), ["I", "I", "D"]);
         // replay sees the block only before the D
         const before = egressBlockReplay(H.db, S, 2);
@@ -125,7 +125,7 @@ test("reap = terminal D row with the full final snapshot; the state row is physi
         assert.equal(atD.blocks.has("b1"), false);
         assert.equal(atD.blocks.get("b2")!.active, true);
         // the D row's payload carries the terminal snapshot
-        const dRow = H.db.prepare("SELECT block_id, payload FROM egress_block_flow WHERE session_id = ? AND row_type = 'D'").get(S) as { block_id: string; payload: string };
+        const dRow = H.db.prepare("SELECT block_id, payload FROM eg_block_flow WHERE session_id = ? AND row_type = 'D'").get(S) as { block_id: string; payload: string };
         const parsed = JSON.parse(dRow.payload);
         assert.equal(dRow.block_id, "b1");
         assert.equal(parsed.reaped, true);
@@ -154,7 +154,7 @@ test("point fork: the block set aligns to the FLOW watermark via flow_op_seq (du
             { type: "U", blockId: "b1", snapshot: snap({ active: false }) },
         ], null, 2_500);
         // pointer sanity: I row → 1, U row → 2
-        const ptrs = H.db.prepare("SELECT row_type, flow_op_seq FROM egress_block_flow WHERE session_id = ? ORDER BY op_seq").all(P) as { row_type: string; flow_op_seq: number }[];
+        const ptrs = H.db.prepare("SELECT row_type, flow_op_seq FROM eg_block_flow WHERE session_id = ? ORDER BY op_seq").all(P) as { row_type: string; flow_op_seq: number }[];
         assert.deepEqual(ptrs.map((r) => [r.row_type, r.flow_op_seq]), [["I", 1], ["U", 2]]);
         // fork at FLOW watermark 1 → only the I row is in scope (flow_op_seq <= 1)
         egressPointFork(H.db, P, "child", 1);
@@ -194,16 +194,16 @@ test("fork-to-now: the child inherits the parent's four tables verbatim (a)", ()
 
         // The FLOW clock is the reference clock for fork watermarks (dual
         // clocks) — the block table's own op_seq space is self-contained.
-        const parentMax = (H.db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS m FROM egress_flow WHERE session_id = ?").get(P) as { m: number }).m;
+        const parentMax = (H.db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS m FROM eg_flow WHERE session_id = ?").get(P) as { m: number }).m;
         const C = "child-a";
         egressPointFork(H.db, P, C, parentMax);
 
         // every one of the four tables is byte-identical to the parent's
         for (const [table, cols] of [
-            ["egress_flow", "op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at"],
-            ["egress_block_flow", "op_seq, flow_op_seq, row_type, block_id, payload, kstate_json, created_at"],
-            ["egress_state", "rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at"],
-            ["egress_block_state", "block_id, pos, op_seq, flow_op_seq, payload, created_at"],
+            ["eg_flow", "op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at"],
+            ["eg_block_flow", "op_seq, flow_op_seq, row_type, block_id, payload, kstate_json, created_at"],
+            ["eg_state", "rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at"],
+            ["eg_block_state", "block_id, pos, op_seq, flow_op_seq, payload, created_at"],
         ] as const) {
             const q = (id: string) => H.db.prepare(`SELECT ${cols} FROM ${table} WHERE session_id = ? ORDER BY 1, 2`).all(id);
             assert.deepEqual(q(C), q(P));
@@ -212,7 +212,7 @@ test("fork-to-now: the child inherits the parent's four tables verbatim (a)", ()
         egressAppendTurn(H.db, C, [
             { type: "I", rid: 3, msgid: "m00009", after: null, ref: "m00009", tokens: 2, typeTag: "text", bytes: "after fork" },
         ], 9_000, { baseSeq: parentMax });
-        const childMax = (H.db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS m FROM egress_flow WHERE session_id = ?").get(C) as { m: number }).m;
+        const childMax = (H.db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS m FROM eg_flow WHERE session_id = ?").get(C) as { m: number }).m;
         assert.equal(childMax, parentMax + 1);
         assert.equal(egressBlockView(H.db, C).get("blk_1")!.active, true);
 
@@ -231,12 +231,12 @@ test("fork-to-now: the child inherits the parent's four tables verbatim (a)", ()
         egressBlockAppend(H.db, P2, [{ type: "I", blockId: "blk_1", snapshot: snap() }], null, 3_000);
         const C2 = "child-a-point";
         egressPointFork(H.db, P2, C2, 1); // at flow point 1, before the block's flow point
-        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ?").get(C2) as { c: number }).c, 1);
-        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_block_flow WHERE session_id = ?").get(C2) as { c: number }).c, 0, "the block's flow point is 2, past wm=1");
+        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM eg_flow WHERE session_id = ?").get(C2) as { c: number }).c, 1);
+        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM eg_block_flow WHERE session_id = ?").get(C2) as { c: number }).c, 0, "the block's flow point is 2, past wm=1");
         // at flow point 2 the block IS in scope
         const C3 = "child-a-point2";
         egressPointFork(H.db, P2, C3, 2);
-        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_block_flow WHERE session_id = ?").get(C3) as { c: number }).c, 1);
+        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM eg_block_flow WHERE session_id = ?").get(C3) as { c: number }).c, 1);
     } finally { close(H); }
 });
 
@@ -268,10 +268,10 @@ test("interleave regression (the review-critical bug): flow stays DENSE when mes
         assert.deepEqual(at2.map((r) => r.msgid), ["m00001", "m00002"]);
         // the flow table itself is dense: 1,2,3 — the block rows never
         // consumed a flow number
-        const seqs = (H.db.prepare("SELECT op_seq FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all(S) as { op_seq: number }[]).map((r) => r.op_seq);
+        const seqs = (H.db.prepare("SELECT op_seq FROM eg_flow WHERE session_id = ? ORDER BY op_seq").all(S) as { op_seq: number }[]).map((r) => r.op_seq);
         assert.deepEqual(seqs, [1, 2, 3]);
         // the block table numbered ITSELF: its own op 1, flow pointer 2
-        const blk = H.db.prepare("SELECT op_seq, flow_op_seq FROM egress_block_flow WHERE session_id = ?").get(S) as { op_seq: number; flow_op_seq: number };
+        const blk = H.db.prepare("SELECT op_seq, flow_op_seq FROM eg_block_flow WHERE session_id = ?").get(S) as { op_seq: number; flow_op_seq: number };
         assert.equal(blk.op_seq, 1);
         assert.equal(blk.flow_op_seq, 2);
     } finally { close(H); }
@@ -294,7 +294,7 @@ test("corrupt: a gap in the block table's OWN op_seq is reported (density)", () 
         // window (rows 1,3) that must be reported (the block flow is
         // append-only, so its own sequence is always dense; a gap means a
         // missing row)
-        H.db.prepare("DELETE FROM egress_block_flow WHERE session_id = ? AND op_seq = 2").run(S);
+        H.db.prepare("DELETE FROM eg_block_flow WHERE session_id = ? AND op_seq = 2").run(S);
         assert.throws(() => egressBlockReplay(H.db, S, 3), EgressBlockCorruptError);
     } finally { close(H); }
 });

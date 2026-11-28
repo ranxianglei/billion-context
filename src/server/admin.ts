@@ -835,7 +835,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             // kernel-state-at-now, which is inconsistent).
             if (resident && resident.metadata["egressAuthority"] === true) {
                 // #7577 (dual clocks, owner ruling 2026-11-24): the point-fork
-                // watermark is the FLOW clock — egressStateMaxSeq (egress_flow's
+                // watermark is the FLOW clock — egressStateMaxSeq (eg_flow's
                 // own MAX). Block rows carry their own op_seq clock plus a
                 // flow_op_seq pointer, so they align to this watermark with no
                 // separate high-water to chase.

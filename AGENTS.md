@@ -365,3 +365,44 @@ Of 326 analyzed merged PRs, 26 (~7%) needed a second+ human review round. Two dr
 2. **Incomplete first pass** — the initial fix addresses the reported symptom but misses an adjacent path/edge case, leaves promised work unfinished, or needs its approach reconsidered. Gate signal: does the fix cover ALL paths of the bug, not just the repro?
 
 These map directly onto §7.2–7.3; a reviewer walks those bullets in order.
+
+### 7.6 Egress Ledger GENERATION Discipline (discussions/7896, MANDATORY)
+
+The egress plane keeps append-only op logs — `eg_flow` (message log) and
+`eg_block_flow` (block log) — that are REPLAYED by a single law at read time.
+A version upgrade changes that law; a log written by the older version may be
+illegal under the newer one. The 11-24 incident class (sessions dead-looping
+on `EgressStateCorruptError: cited number N is already live`) is exactly this:
+old rows, new judge, no boundary — every turn re-replays the illegal prefix,
+so "self-heals next turn" is a lie and the session is stuck until it dies.
+
+Rules:
+
+1. **Two rulers, different things.** `STORAGE_SCHEMA_VERSION` covers DDL
+   (columns, indexes, tables). `LEDGER_GENERATION` (exported from
+   `src/storage/egress-state.ts`) covers ROW SEMANTICS: column meanings,
+   addressing keys, numbering schemes, replay invariants, payload shapes.
+   Additive DDL bumps the schema version only. Any change to row semantics
+   MUST bump `LEDGER_GENERATION`.
+2. **The G boundary row is the mechanism.** When the writer's law changes
+   (the last flow row reads as an older generation), the append path writes a
+   `row_type = 'G'` boundary row whose payload is the FULL materialized view
+   at the boundary before any new-gen ops. Every replay starts from the latest
+   G at or below its target and NEVER judges rows before it. A G-less old-gen
+   prefix that violates the new law fails loudly once (one-time legacy
+   damage) — no silent skip, no per-turn error storm.
+3. **PR gate.** A PR that touches the row semantics of `eg_flow` /
+   `eg_block_flow` must ship all three: the `LEDGER_GENERATION` bump, the G
+   write wired into BOTH append paths (`egressStateAppend` /
+   `egressBlockAppend`), and a cross-generation fixture test
+   (`tests/eg-ledger-generation-7896.test.ts`) proving a dirty old-gen prefix
+   replays cleanly from its G and fails once without one. Missing any of the
+   three = the PR does not merge.
+4. **Table discipline.** The egress tables carry the `eg_` prefix and are
+   created only when the egress plane gate is on (`egressTables` in
+   `migrateSchema`; decided next to `legacyTables` in `src/storage/shadow.ts`).
+   Gate off: empty `eg_*` tables are dropped, non-empty ones are frozen
+   read-only (reported in `frozenEgressTables`). Old `egress_*`-named tables
+   migrate on first open: empty → dropped, current-shape non-empty → copied
+   with `gen = 0`, old-shape non-empty → frozen. Renaming or dropping egress
+   storage outside this migration path is a bug, not a refactor.

@@ -310,7 +310,7 @@ test("S5: GC — an idle egress-on session is neither planned nor archived; a le
         assert.equal(out.archived, 1, "exactly the legacy session archived");
         assert.equal((h.db.prepare("SELECT status FROM sessions WHERE session_id = ?").get(egressSid) as { status: string }).status, "active", "the egress-on session stayed active");
         assert.equal((h.db.prepare("SELECT status FROM sessions WHERE session_id = ?").get(legacySid) as { status: string }).status, "archived", "the legacy session archived");
-        assert.equal((h.db.prepare("SELECT count(*) AS n FROM egress_flow WHERE session_id = ?").get(egressSid) as { n: number }).n, 2, "the op log is intact");
+        assert.equal((h.db.prepare("SELECT count(*) AS n FROM eg_flow WHERE session_id = ?").get(egressSid) as { n: number }).n, 2, "the op log is intact");
     } finally {
         closeStore(h);
     }
@@ -365,7 +365,7 @@ test("S5 (review): MANUAL archive of an egress-on session is refused at the arch
         assert.equal(out.ok, false, "the archive refuses an egress-on session");
         assert.match(out.reason ?? "", /egress-on/, "the reason names the missing op-log export");
         assert.equal((h.db.prepare("SELECT status FROM sessions WHERE session_id = ?").get(sid) as { status: string }).status, "active", "the session is untouched");
-        assert.equal((h.db.prepare("SELECT count(*) AS n FROM egress_flow WHERE session_id = ?").get(sid) as { n: number }).n, 2, "the op log is intact");
+        assert.equal((h.db.prepare("SELECT count(*) AS n FROM eg_flow WHERE session_id = ?").get(sid) as { n: number }).n, 2, "the op log is intact");
         assert.equal((h.db.prepare("SELECT count(*) AS n FROM messages WHERE session_id = ?").get(sid) as { n: number }).n, 0, "nothing was deleted");
     } finally {
         closeStore(h);

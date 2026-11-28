@@ -162,10 +162,10 @@ async function snapshotFull(origin: string, convId: string): Promise<FullSnap> {
 }
 
 /** Read the raw egress tables straight off the index (same seam as T1). */
-async function rawBlockRows(dir: string, convId: string, table: "egress_block_state" | "egress_block_flow"): Promise<unknown[]> {
+async function rawBlockRows(dir: string, convId: string, table: "eg_block_state" | "eg_block_flow"): Promise<unknown[]> {
     const { DatabaseSync } = await import("node:sqlite");
     const db = new DatabaseSync(`${dir}/sessions/index.db`, { readOnly: true });
-    const rows = db.prepare(`SELECT * FROM ${table} WHERE session_id = ? ORDER BY ${table === "egress_block_state" ? "op_seq" : "op_seq"}`).all(convId);
+    const rows = db.prepare(`SELECT * FROM ${table} WHERE session_id = ? ORDER BY ${table === "eg_block_state" ? "op_seq" : "op_seq"}`).all(convId);
     db.close();
     return rows as unknown[];
 }
@@ -433,9 +433,9 @@ test("#7658 T5: fork-then-compress — the child's client-side fold books correc
         // physically deleted, no compaction base rows).
         const { DatabaseSync } = await import("node:sqlite");
         const raw = new DatabaseSync(`${h.dir}/sessions/index.db`, { readOnly: true });
-        const dCount = (raw.prepare("SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = 'c5' AND row_type = 'D'").get() as { n: number }).n;
+        const dCount = (raw.prepare("SELECT COUNT(*) AS n FROM eg_flow WHERE session_id = 'c5' AND row_type = 'D'").get() as { n: number }).n;
         assert.ok(dCount >= 1, `the fold's D ops are in the append-only flow (D rows: ${dCount})`);
-        const stateCount = (raw.prepare("SELECT COUNT(*) AS n FROM egress_state WHERE session_id = 'c5'").get() as { n: number }).n;
+        const stateCount = (raw.prepare("SELECT COUNT(*) AS n FROM eg_state WHERE session_id = 'c5'").get() as { n: number }).n;
         assert.ok(stateCount < childView.length + 1, `the state plane is materialized and shrank with the fold (state rows: ${stateCount}, live view: ${childView.length})`);
         raw.close();
 
@@ -548,7 +548,7 @@ test("#7658 T7: compression blocks fork, and both sides keep folding independent
         // (ledgerEgressBooks runs inside recordEgressTurn) - the /tool call
         // itself is not a turn, so at fork time the parent's ledger is still
         // empty and the fork copies it verbatim (asserted after the fork).
-        const p7LedgerAtFork = await rawBlockRows(h.dir, "p7", "egress_block_flow");
+        const p7LedgerAtFork = await rawBlockRows(h.dir, "p7", "eg_block_flow");
 
         // Fork the folded state (client transcript still the 5 raw cells —
         // the host folds on its next turn).
@@ -566,7 +566,7 @@ test("#7658 T7: compression blocks fork, and both sides keep folding independent
         // block diff (unified leg, runs for the fresh child even though the
         // egress-on legs are frozen for live turns) records the inherited
         // kernel block set into the child's ledger.
-        const c7Ledger = (await rawBlockRows(h.dir, "c7", "egress_block_flow")) as Array<{ row_type: string; block_id: string }>;
+        const c7Ledger = (await rawBlockRows(h.dir, "c7", "eg_block_flow")) as Array<{ row_type: string; block_id: string }>;
         assert.equal(c7Ledger.length, 1, "child ledger holds exactly the inherited block at clone time");
         assert.equal(c7Ledger[0]!.row_type, "I");
         assert.equal(c7Ledger[0]!.block_id, "b1");
@@ -592,9 +592,9 @@ test("#7658 T7: compression blocks fork, and both sides keep folding independent
         assert(p7Live.has("p7-fold-0") && p7Live.has("p7-new-0") && p7Live.has("p7-id-0") && p7Live.has("p7-id-4"), "head/fold/tail/new cells all live in the parent flow");
         // The parent's fold turn (its first egress turn since the /tool call
         // created b1) booked b1 into the PARENT's ledger - and only there.
-        const p7LedgerAfterFold = (await rawBlockRows(h.dir, "p7", "egress_block_flow")) as Array<{ row_type: string; block_id: string }>;
+        const p7LedgerAfterFold = (await rawBlockRows(h.dir, "p7", "eg_block_flow")) as Array<{ row_type: string; block_id: string }>;
         assert(p7LedgerAfterFold.some((r) => r.row_type === "I" && r.block_id === "b1"), "the parent's fold turn books b1 into its block ledger");
-        assert.deepEqual(await rawBlockRows(h.dir, "c7", "egress_block_flow"), c7Ledger, "the child ledger is untouched by the parent's fold");
+        assert.deepEqual(await rawBlockRows(h.dir, "c7", "eg_block_flow"), c7Ledger, "the child ledger is untouched by the parent's fold");
         const c7WatermarkAtFork = Math.max(...c7BeforeFold.map((r) => r.num));
         const p7FoldNum = p7AfterFold.find((r) => r.msgid === "p7-fold-0")?.num;
         assert(p7FoldNum !== undefined && p7FoldNum > c7WatermarkAtFork, `the post-fork parent summary takes a fresh number above the fork watermark (${p7FoldNum} > ${c7WatermarkAtFork})`);
@@ -625,8 +625,8 @@ test("#7658 T7: compression blocks fork, and both sides keep folding independent
         // ...and the ledgers match their kernel sets: the child's fold turn
         // re-books the inherited b1 (self-heal) plus its own b2; the parent
         // keeps exactly b1.
-        const c7LedgerFinal = (await rawBlockRows(h.dir, "c7", "egress_block_flow")) as Array<{ row_type: string; block_id: string }>;
-        const p7LedgerFinal = (await rawBlockRows(h.dir, "p7", "egress_block_flow")) as Array<{ row_type: string; block_id: string }>;
+        const c7LedgerFinal = (await rawBlockRows(h.dir, "c7", "eg_block_flow")) as Array<{ row_type: string; block_id: string }>;
+        const p7LedgerFinal = (await rawBlockRows(h.dir, "p7", "eg_block_flow")) as Array<{ row_type: string; block_id: string }>;
         assert(c7LedgerFinal.some((r) => r.block_id === "b1") && c7LedgerFinal.some((r) => r.row_type === "I" && r.block_id === "b2"), "child ledger holds b1 (clone-time record, U'd to the egress-record shape) + b2 (its own fold)");
         assert(p7LedgerFinal.some((r) => r.row_type === "I" && r.block_id === "b1") && !p7LedgerFinal.some((r) => r.block_id === "b2"), "parent ledger keeps exactly b1");
     } finally {
@@ -727,7 +727,7 @@ test("#7658 T8: fork-after-fork — the grandchild inherits the whole chain", as
 });
 
 test("#7658 T9: the egress BLOCK LEDGER is written on the egress record path (the #7577 second leg)", async () => {
-    // #7577 promised the block ledger (egress_block_state / egress_block_flow)
+    // #7577 promised the block ledger (eg_block_state / eg_block_flow)
     // rebuilds the block set from the op log alone — but its only writer sat
     // in the unified ingestSession (src/storage/store.ts, gated on the
     // save-envelope metadata.egressAuthority), and a fully armed egress-on
@@ -762,8 +762,8 @@ test("#7658 T9: the egress BLOCK LEDGER is written on the egress record path (th
         await settle(h.store, "p9");
         assert.equal(peekSession("p9")!.state.blocks.length, blocksAtFold.length, "the kernel block row survives its deactivation");
         // THE LEDGER IS WRITTEN: one I row in the flow, one state replica.
-        const stateRows = (await rawBlockRows(h.dir, "p9", "egress_block_state")) as Array<Record<string, unknown>>;
-        const flowRows = (await rawBlockRows(h.dir, "p9", "egress_block_flow")) as Array<Record<string, unknown>>;
+        const stateRows = (await rawBlockRows(h.dir, "p9", "eg_block_state")) as Array<Record<string, unknown>>;
+        const flowRows = (await rawBlockRows(h.dir, "p9", "eg_block_flow")) as Array<Record<string, unknown>>;
         assert.equal(stateRows.length, 1, "one state-replica row (b1)");
         assert.equal(stateRows[0]?.["block_id"], "b1");
         const iRow = flowRows.find((r) => r["row_type"] === "I" && r["block_id"] === "b1");
@@ -885,9 +885,9 @@ test("#7658 T11: the fork route must not leak a raw corruption error as FORK_FAI
         // egressStateView. The damage lands AFTER the last flush, so no
         // debounced save can repair it.
         wdb = openSqliteDatabase(join(h.dir, "sessions", "index.db"));
-        const rows = wdb.db.prepare("SELECT op_seq FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all("p11") as { op_seq: number }[];
+        const rows = wdb.db.prepare("SELECT op_seq FROM eg_flow WHERE session_id = ? ORDER BY op_seq").all("p11") as { op_seq: number }[];
         assert.ok(rows.length >= 5, `flow holds the history (${rows.length} rows)`);
-        wdb.db.prepare("DELETE FROM egress_flow WHERE session_id = ? AND op_seq = ?").run("p11", rows[rows.length - 1].op_seq - 1);
+        wdb.db.prepare("DELETE FROM eg_flow WHERE session_id = ? AND op_seq = ?").run("p11", rows[rows.length - 1].op_seq - 1);
 
         // The fork route computes its source link OUTSIDE the structured
         // 409 try: pre-fix the view's throw escaped the lock scope and

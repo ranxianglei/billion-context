@@ -602,7 +602,7 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     void hydratePluginConversationsUnified();
     log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
     // Egress usage plane (8th egress table): the cache ledger is in-memory;
-    // these sinks append its event stream to egress_usage (null store =
+    // these sinks append its event stream to eg_usage (null store =
     // legacy backend → the ledger simply never survives a restart, same as
     // before this plane existed). Sink failures are swallowed inside the
     // emitter (warn-once) — the stream degrades, the request never does.

@@ -42,21 +42,21 @@ let prevFlowCount = 0;
 
 function checkMessagePlane(tag: string): void {
     // 1. append-only
-    const flowCount = (db.prepare("SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = ?").get(S) as { n: number }).n;
+    const flowCount = (db.prepare("SELECT COUNT(*) AS n FROM eg_flow WHERE session_id = ?").get(S) as { n: number }).n;
     assert.ok(flowCount >= prevFlowCount, `${tag}: the flow shrank (${prevFlowCount} → ${flowCount}) — 7773 invariant 1`);
     prevFlowCount = flowCount;
     // 4. row alphabet
-    const types = (db.prepare("SELECT DISTINCT row_type AS t FROM egress_flow WHERE session_id = ? ORDER BY t").all(S) as { t: string }[]).map((r) => r.t);
+    const types = (db.prepare("SELECT DISTINCT row_type AS t FROM eg_flow WHERE session_id = ? ORDER BY t").all(S) as { t: string }[]).map((r) => r.t);
     assert.ok(types.every((t) => t === "I" || t === "D" || t === "U"), `${tag}: retired row type in the flow: ${types.join(",")}`);
     // 2. state == live view
     const view = egressStateView(db, S);
-    const stateCount = (db.prepare("SELECT COUNT(*) AS n FROM egress_state WHERE session_id = ?").get(S) as { n: number }).n;
+    const stateCount = (db.prepare("SELECT COUNT(*) AS n FROM eg_state WHERE session_id = ?").get(S) as { n: number }).n;
     assert.equal(stateCount, view.length, `${tag}: state row count ${stateCount} != live view length ${view.length}`);
     // 3. the largest flow value is the largest SINGLE message (never an
     //    aggregate of several)
-    const bigFlow = (db.prepare("SELECT MAX(LENGTH(payload)) AS m FROM egress_flow WHERE session_id = ?").get(S) as { m: number | null }).m ?? 0;
+    const bigFlow = (db.prepare("SELECT MAX(LENGTH(payload)) AS m FROM eg_flow WHERE session_id = ?").get(S) as { m: number | null }).m ?? 0;
     assert.ok(bigFlow <= flowMaxBytes, `${tag}: a flow value of ${bigFlow} bytes exceeds the largest single message ever written (${flowMaxBytes}) — aggregate-shaped row (the retired B class)`);
-    const bigState = (db.prepare("SELECT MAX(LENGTH(bytes)) AS m FROM egress_state WHERE session_id = ?").get(S) as { m: number | null }).m ?? 0;
+    const bigState = (db.prepare("SELECT MAX(LENGTH(bytes)) AS m FROM eg_state WHERE session_id = ?").get(S) as { m: number | null }).m ?? 0;
     assert.ok(bigState <= stateMaxBytes, `${tag}: a state value of ${bigState} bytes exceeds the largest single message ever written (${stateMaxBytes})`);
 }
 
@@ -80,15 +80,15 @@ const snap = (over: Partial<EgressBlockSnapshot> = {}): EgressBlockSnapshot => (
     one: JSON.stringify({ text: "one" }), full: JSON.stringify({ text: "full-block-content".repeat(5) }), ...over,
 });
 function checkBlockPlane(tag: string): void {
-    const flowCount = (db.prepare("SELECT COUNT(*) AS n FROM egress_block_flow WHERE session_id = ?").get(S) as { n: number }).n;
+    const flowCount = (db.prepare("SELECT COUNT(*) AS n FROM eg_block_flow WHERE session_id = ?").get(S) as { n: number }).n;
     assert.ok(flowCount >= prevBlockFlowCount, `${tag}: the block flow shrank (${prevBlockFlowCount} → ${flowCount}) — 7773 invariant 1`);
     prevBlockFlowCount = flowCount;
-    const types = (db.prepare("SELECT DISTINCT row_type AS t FROM egress_block_flow WHERE session_id = ? ORDER BY t").all(S) as { t: string }[]).map((r) => r.t);
+    const types = (db.prepare("SELECT DISTINCT row_type AS t FROM eg_block_flow WHERE session_id = ? ORDER BY t").all(S) as { t: string }[]).map((r) => r.t);
     assert.ok(types.every((t) => t === "I" || t === "U" || t === "D"), `${tag}: retired row type in the block flow: ${types.join(",")}`);
     const blocks = egressBlockView(db, S);
-    const stateCount = (db.prepare("SELECT COUNT(*) AS n FROM egress_block_state WHERE session_id = ?").get(S) as { n: number }).n;
+    const stateCount = (db.prepare("SELECT COUNT(*) AS n FROM eg_block_state WHERE session_id = ?").get(S) as { n: number }).n;
     assert.equal(stateCount, blocks.size, `${tag}: block state row count ${stateCount} != live block count ${blocks.size}`);
-    const big = (db.prepare("SELECT MAX(LENGTH(payload)) AS m FROM egress_block_state WHERE session_id = ?").get(S) as { m: number | null }).m ?? 0;
+    const big = (db.prepare("SELECT MAX(LENGTH(payload)) AS m FROM eg_block_state WHERE session_id = ?").get(S) as { m: number | null }).m ?? 0;
     assert.ok(big <= blockMaxPayload, `${tag}: a block state payload of ${big} bytes exceeds the largest single snapshot ever written (${blockMaxPayload})`);
 }
 

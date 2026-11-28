@@ -146,7 +146,7 @@ export interface SessionRow {
     parentSessionId?: string | null;
     forkPointSeq?: number | null;
     /** #7658: the FLOW-clock watermark (MAX op_seq of the parent's
-     *  egress_flow at fork time) the four egress tables were copied at.
+     *  eg_flow at fork time) the four egress tables were copied at.
      *  fork_point_seq carries the unified-message through-seq — NULL for
      *  egress-on parents whose unified leg is frozen, so the egress fork
      *  point needs its own carrier. NULL = no egress copy (egress-off or
@@ -360,7 +360,7 @@ export interface CheckpointRow {
     firstTopic: string | null;
     firstSummary: string | null;
     activeCompressedTokens: number;
-    /** #B4 (KDD#25): non-system egress_state rows — set on a 7-table (egress)
+    /** #B4 (KDD#25): non-system eg_state rows — set on a 7-table (egress)
      *  instance (where the legacy `blocks` table is absent and the blocks
      *  fields are zero); a >0 count marks a session that has egress records,
      *  so isEmptyStub doesn't mistake a single-turn egress session for an
@@ -696,7 +696,7 @@ export class UnifiedStore {
     static open(
         path: string,
         engine?: SqliteEngineName,
-        opts?: { walJournalSizeLimitBytes?: number; legacyTables?: boolean },
+        opts?: { walJournalSizeLimitBytes?: number; legacyTables?: boolean; egressTables?: boolean },
     ): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used, source } = openSqliteDatabase(path, engine);
@@ -904,7 +904,10 @@ export class UnifiedStore {
                 // that call site: suites asserting the LEGACY table shape
                 // while egressPlane=1 simulate a pre-gate DB and set it.
                 // Direct UnifiedStore.open callers default to the full set.
+                // egressTables: same caller-decision pattern (7896) — the
+                // egressPlane gate decides, the store only applies it.
                 legacyTables: opts?.legacyTables ?? true,
+                egressTables: opts?.egressTables ?? true,
             });
         } catch (err) {
             // The handle we just opened must not leak when the file turns out
@@ -1946,7 +1949,7 @@ export class UnifiedStore {
             // #7439-2: msgid coordinates — ONE-TIME alignment with the egress
             // flow view, zero joins thereafter. Only sessions the flow has
             // recorded have coordinates (every other session stays NULL). The
-            // view (bounded egress_state serving read) is read LAZILY and only
+            // view (bounded eg_state serving read) is read LAZILY and only
             // when some block actually needs (re-)stamping — steady-state
             // saves never pay it. A corrupt/absent flow degrades to NULL
             // (summary_bytes carries the read); it must never fail the save.
@@ -2385,7 +2388,7 @@ export class UnifiedStore {
                     if (md["egressAuthority"] === true) return true;
                 } catch { /* corrupt metadata_json — fall through to the flow probe */ }
             }
-            return !!this.db.prepare("SELECT 1 FROM egress_flow WHERE session_id = ? LIMIT 1").get(sid);
+            return !!this.db.prepare("SELECT 1 FROM eg_flow WHERE session_id = ? LIMIT 1").get(sid);
         } catch {
             return false; // egress tables not probed in yet / fault — legacy path
         }
@@ -2401,7 +2404,7 @@ export class UnifiedStore {
     private egressAwareFreshness(sid: string, updatedAt: number): number {
         try {
             const r = this.db
-                .prepare("SELECT MAX(created_at) AS m FROM egress_flow WHERE session_id = ?")
+                .prepare("SELECT MAX(created_at) AS m FROM eg_flow WHERE session_id = ?")
                 .get(sid) as { m: number | null } | undefined;
             return r?.m != null && r.m > updatedAt ? r.m : updatedAt;
         } catch {
@@ -2447,7 +2450,7 @@ export class UnifiedStore {
             // is never read again; we deliberately do NOT pre-latch (that
             // would move arm timing for zero functional gain).
             const fr = (this.db
-                .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o FROM egress_flow WHERE session_id = ?")
+                .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o FROM eg_flow WHERE session_id = ?")
                 .get(sid) as { o: number });
             const seqFrontier = fr.o;   // op-ordering cursor (seqs guard)
             const msgFrontier = egressMessageHighWater(this.db, sid);   // canonical message frontier (positions)
@@ -2575,7 +2578,7 @@ export class UnifiedStore {
     }
 
     /** #7474 P2 (ruling 7439): the pin ledger of an egress-on session lives
-     *  in the op log — egress_state is the materialized live view (7773), and
+     *  in the op log — eg_state is the materialized live view (7773), and
      *  these sessions stop growing the messages projection entirely, so the
      *  messages-row read would freeze at the arm turn. Order = pos = view
      *  order (the pin's 0-based index ⇔ position contract); the constant
@@ -2824,25 +2827,40 @@ export class UnifiedStore {
      *  column for egress-on sessions (reads consult this first; the ext
      *  write stays for legacy). */
     egressSystemInput(sessionId: string): string | null {
-        const row = this.db
-            .prepare(
-                "SELECT sys_in FROM egress_state WHERE session_id = ? AND msgid = 'egress-system' LIMIT 1",
-            )
-            .get(sessionId) as { sys_in?: string | null } | undefined;
-        return typeof row?.sys_in === "string" && row.sys_in !== "" ? row.sys_in : null;
+        try {
+            const row = this.db
+                .prepare(
+                    "SELECT sys_in FROM eg_state WHERE session_id = ? AND msgid = 'egress-system' LIMIT 1",
+                )
+                .get(sessionId) as { sys_in?: string | null } | undefined;
+            return typeof row?.sys_in === "string" && row.sys_in !== "" ? row.sys_in : null;
+        } catch {
+            return null; // 7896: egress tables absent (gate off) — no system input
+        }
     }
 
     egressStateMaxSeq(sessionId: string): number {
         // op_seq is the row-ordering high-water (log_seq is the per-message
         // number and only I rows carry it — it is not the row cursor).
-        const row = this.db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sessionId) as { mx: number };
-        return Number(row.mx) || 0;
+        // 7896: the egress tables are created only while the plane gate is
+        // on — absent tables mean "no egress rows" (the same answer an
+        // empty table gives), not a fault.
+        try {
+            const row = this.db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM eg_flow WHERE session_id = ?`).get(sessionId) as { mx: number };
+            return Number(row.mx) || 0;
+        } catch {
+            return 0;
+        }
     }
 
     /** 2026-11-27 (row ids): highest rid issued in the flow (0 = none) —
      *  the allocator for a session's next row ids. */
     egressStateMaxRid(sessionId: string): number {
-        return egressRowHighWater(this.db, sessionId);
+        try {
+            return egressRowHighWater(this.db, sessionId);
+        } catch {
+            return 0; // 7896: tables absent (gate off)
+        }
     }
 
     /** 7773: truncate the flow past op_seq — and REBUILD the materialized
@@ -2853,10 +2871,31 @@ export class UnifiedStore {
      *  known-replayable by the caller (egressFlowWalkBack proved it). */
     egressStateTruncateAfter(sessionId: string, opSeq: number): number {
         return this.db.transaction(() => {
-            const b = this.db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND op_seq > ?`).run(sessionId, opSeq);
+            const b = this.db.prepare(`DELETE FROM eg_flow WHERE session_id = ? AND op_seq > ?`).run(sessionId, opSeq);
             egressMaterializeState(this.db, sessionId, egressStateAt(this.db, sessionId, opSeq), Date.now());
             return Number(b.changes);
         });
+    }
+
+    /** 7896: the egress tables are created only while the plane gate is on.
+     *  When a store instance opened with the gate off (or a flipped-off
+     *  mid-life install) meets one of the egress ops below, the missing
+     *  tables are the EMPTY answer, not a fault — every caller already
+     *  treats "no rows" as its legacy path. Probe once, cache per instance
+     *  (a store's gate state does not change under it; a flip reopens). */
+    private egTablesPresent: boolean | null = null;
+    hasEgTables(): boolean {
+        if (this.egTablesPresent === null) {
+            try {
+                const row = this.db
+                    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='eg_flow'")
+                    .get() as { name: string } | undefined;
+                this.egTablesPresent = row !== undefined;
+            } catch {
+                this.egTablesPresent = false;
+            }
+        }
+        return this.egTablesPresent;
     }
 
     /** Ruling 7439 (fork = whole-table copy): copy the parent's entire egress
@@ -2866,6 +2905,7 @@ export class UnifiedStore {
      *  where the parent stopped and nothing is ever re-issued across the
      *  fork. No-op (false) when the parent has no egress rows. */
     egressForkSession(parentId: string, childId: string): boolean {
+        if (!this.hasEgTables()) return false;
         return egressFork(this.db, parentId, childId) > 0;
     }
 
@@ -2874,15 +2914,19 @@ export class UnifiedStore {
      *  7439-1: the bytes live in the rows) — there is no content-CAS to
      *  release. Runs inside the caller's sweep transaction. */
     deleteEgressOps(sessionId: string): void {
-        this.db.transaction(() => {
-            this.db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(sessionId);
-            this.db.prepare("DELETE FROM egress_flow WHERE session_id = ?").run(sessionId);
-            // #7577: the block lifecycle log rides the same session — delete it too.
-            this.deleteEgressBlockOps(sessionId);
-            // egress_usage event stream + its materialized stats row.
-            egressUsageDelete(this.db, sessionId);
-            this.db.prepare("DELETE FROM session_ext WHERE session_id = ? AND key = ?").run(sessionId, USAGE_STAT_KEY);
-        });
+        if (this.hasEgTables()) {
+            this.db.transaction(() => {
+                this.db.prepare("DELETE FROM eg_state WHERE session_id = ?").run(sessionId);
+                this.db.prepare("DELETE FROM eg_flow WHERE session_id = ?").run(sessionId);
+                // #7577: the block lifecycle log rides the same session — delete it too.
+                this.deleteEgressBlockOps(sessionId);
+                // eg_usage event stream + its materialized stats row.
+                egressUsageDelete(this.db, sessionId);
+            });
+        }
+        // The usage stat key is a session_ext row — independent of the egress
+        // tables, always safe to sweep.
+        this.db.prepare("DELETE FROM session_ext WHERE session_id = ? AND key = ?").run(sessionId, USAGE_STAT_KEY);
     }
 
     /** Egress usage event stream (8th egress table, owner ruling 2026-11-27):
@@ -2924,7 +2968,7 @@ export class UnifiedStore {
     }
 
     /** Fork/rollback reconstruction of the block set at the block's OWN
-     *  op_seq x (dual clocks — this is egress_block_flow's sequence, not the
+     *  op_seq x (dual clocks — this is eg_block_flow's sequence, not the
      *  flow watermark), plus the kstate sidecar from the last row at/before
      *  x. */
     egressBlockReplay(sessionId: string, x: number): { blocks: Map<string, EgressBlockSnapshot>; kstate: string | null } {
@@ -2935,7 +2979,8 @@ export class UnifiedStore {
      *  only; the point-fork watermark is the FLOW clock, egressStateMaxSeq,
      *  because every block row's flow_op_seq pointer <= the flow MAX). */
     egressBlockMaxSeq(sessionId: string): number {
-        const block = this.db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_block_flow WHERE session_id = ?`).get(sessionId) as { mx: number };
+        if (!this.hasEgTables()) return 0;
+        const block = this.db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM eg_block_flow WHERE session_id = ?`).get(sessionId) as { mx: number };
         return Number(block.mx) || 0;
     }
 
@@ -2945,6 +2990,7 @@ export class UnifiedStore {
      *  their flow_op_seq pointer. wm = egressStateMaxSeq is the whole-copy
      *  special case. */
     egressPointForkSession(parentId: string, childId: string, wm: number): boolean {
+        if (!this.hasEgTables()) return false;
         return egressPointFork(this.db, parentId, childId, wm) > 0;
     }
 
@@ -2969,8 +3015,9 @@ export class UnifiedStore {
     /** Delete the session's block op-log rows (state AND flow). Runs inside
      *  the caller's sweep transaction. */
     deleteEgressBlockOps(sessionId: string): void {
-        this.db.prepare("DELETE FROM egress_block_state WHERE session_id = ?").run(sessionId);
-        this.db.prepare("DELETE FROM egress_block_flow WHERE session_id = ?").run(sessionId);
+        if (!this.hasEgTables()) return;
+        this.db.prepare("DELETE FROM eg_block_state WHERE session_id = ?").run(sessionId);
+        this.db.prepare("DELETE FROM eg_block_flow WHERE session_id = ?").run(sessionId);
     }
 
 
@@ -4556,7 +4603,7 @@ export class UnifiedStore {
         // table: blocks" and the whole list would crash to the disk walk, where
         // egress sessions (no JSON files) are missing → the panel shows 0.
         // When the legacy group is absent, query the sessions table alone
-        // (blocks-derived fields zero/NULL) and count the egress_state rows so
+        // (blocks-derived fields zero/NULL) and count the eg_state rows so
         // a single-turn egress session isn't mistaken for an empty stub
         // (isEmptyStub checks egressRecords).
         if (!this.legacyTablesPresent) {
@@ -4565,7 +4612,7 @@ export class UnifiedStore {
                     `SELECT s.session_id AS sessionId, s.title AS title, s.host_title AS hostTitle, s.label AS label,
                             s.protocol AS protocol, s.origin AS origin, s.status AS status, s.updated_at AS updatedAt,
                             s.stats_json AS statsJson, s.metadata_json AS metadataJson,
-                            (SELECT COUNT(*) FROM egress_state es
+                            (SELECT COUNT(*) FROM eg_state es
                               WHERE es.session_id = s.session_id AND es.msgid <> 'egress-system') AS egressRecords
                      FROM sessions s`,
                 )
@@ -4905,7 +4952,7 @@ export class UnifiedStore {
             // #7577 (dual clocks, owner ruling 2026-11-24): the watermark is
             // the FLOW clock (egressStateMaxSeq — the flow table keeps its
             // exclusive number pool). The point fork copies ALL FOUR tables
-            // (egress_state, egress_flow, egress_block_state, egress_block_flow):
+            // (eg_state, eg_flow, eg_block_state, eg_block_flow):
             // block rows align on wm via their flow_op_seq pointer, so the
             // child inherits the parent's block set as of that flow point.
             this.egressPointForkSession(parentId, childId, this.egressStateMaxSeq(parentId));

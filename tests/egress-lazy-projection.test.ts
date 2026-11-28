@@ -1,6 +1,6 @@
 /**
  * #7474 P2 (ruling 7439): the egress-on session's pin ledger lives in the
- * op log. `snapPinLiveIds` is the ONE read entry: egress_state (the
+ * op log. `snapPinLiveIds` is the ONE read entry: eg_state (the
  * compaction-bounded serving read) when the session has an op log, the
  * messages rows otherwise — so a non-egress session sees exactly the old
  * output, and a corrupt op log degrades to the (stale-but-honest) messages
@@ -44,17 +44,17 @@ function openStore(): { store: UnifiedStore; adapter: EgressOpLogStore; db: Retu
         egressStateView: (sid) => egressStateRead(db, sid),
         egressStateViewAt: (sid, seq) => {
             const rows = db
-                .prepare("SELECT op_seq, log_seq, row_type, msgid, payload, bytes FROM egress_flow WHERE session_id = ? AND op_seq <= ? ORDER BY op_seq ASC")
+                .prepare("SELECT op_seq, log_seq, row_type, msgid, payload, bytes FROM eg_flow WHERE session_id = ? AND op_seq <= ? ORDER BY op_seq ASC")
                 .all(sid, seq) as unknown as { op_seq: number; log_seq: number | null; row_type: "B" | "I" | "D" | "U"; msgid: string | null; payload: string; bytes: string | null }[];
             void rows;
             throw new Error("unused in this suite");
         },
         egressStateMaxSeq: (sid) => {
             void egressStateView(db, sid);
-            return (db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?").get(sid) as { mx: number }).mx;
+            return (db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS mx FROM eg_flow WHERE session_id = ?").get(sid) as { mx: number }).mx;
         },
         egressStateTruncateAfter: (sid, seq) => {
-            const b = db.prepare("DELETE FROM egress_flow WHERE session_id = ? AND op_seq > ?").run(sid, seq);
+            const b = db.prepare("DELETE FROM eg_flow WHERE session_id = ? AND op_seq > ?").run(sid, seq);
             return Number(b.changes);
         },
         egressFlowWalkBack: (sid) => egressFlowWalkBack(db, sid),
@@ -122,7 +122,7 @@ test("snapPinLiveIds: a damaged serving copy is copied again from the log; a cor
         // A ghost state row: pos density breaks, the serving read notices.
         const plantStateGhost = () =>
             H.db
-                .prepare(`INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 3)`)
+                .prepare(`INSERT INTO eg_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 3)`)
                 .run("s3");
         // 1. only the SERVING COPY is damaged, the log itself is intact: the
         //    copy is rebuilt from the log and the session keeps its ids
@@ -132,13 +132,13 @@ test("snapPinLiveIds: a damaged serving copy is copied again from the log; a cor
         const healed = H.adapter.egressStateView("s3");
         assert.deepEqual(healed.map((r) => r.msgid), ["egress-system", "m1", "m2"], "the self-healing read replays the intact log");
         assert.deepEqual(H.store.snapPinLiveIds("s3"), ["m1", "m2"], "intact log → the copy is repaired, the ids come from the log");
-        const stateCount = (H.db.prepare("SELECT COUNT(*) AS c FROM egress_state WHERE session_id = ?").get("s3") as { c: number }).c;
+        const stateCount = (H.db.prepare("SELECT COUNT(*) AS c FROM eg_state WHERE session_id = ?").get("s3") as { c: number }).c;
         assert.equal(stateCount, 3, "the damaged row is gone after the repair");
         // 2. the LOG is corrupt too: the pin read falls back to the messages
         //    ledger instead of throwing. Damage a flow I-row's payload (the
         //    rebuild replay meets it) on top of a stray state row (which is
         //    what sends the read onto the rebuild path).
-        H.db.prepare(`UPDATE egress_flow SET payload = ? WHERE session_id = ? AND row_type = 'I' AND msgid = 'm1'`).run('{"x":1}', "s3");
+        H.db.prepare(`UPDATE eg_flow SET payload = ? WHERE session_id = ? AND row_type = 'I' AND msgid = 'm1'`).run('{"x":1}', "s3");
         plantStateGhost();
         assert.throws(() => H.adapter.egressStateView("s3"), /corrupt|egress-state/i);
         assert.deepEqual(H.store.snapPinLiveIds("s3"), H.store.snapMsgIdLiveIds("s3"), "corrupt op log → messages ledger (stale-but-honest, never a pin-path throw)");
@@ -172,5 +172,5 @@ test("snapPinLiveIds: with the plane switched off the op log is not consulted, e
 });
 
 function dbMaxOpSeq(db: ReturnType<typeof openSqliteDatabase>["db"], sid: string): number {
-    return (db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?").get(sid) as { mx: number }).mx;
+    return (db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS mx FROM eg_flow WHERE session_id = ?").get(sid) as { mx: number }).mx;
 }

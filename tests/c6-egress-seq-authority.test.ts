@@ -1,6 +1,6 @@
 /** C6 (PR #7684): the egress flow is the SEQ authority for egress-on
  *  sessions — every message's ledgerSeq and every block's coordinate pair is
- *  the egress_flow.log_seq number, not a look-up into the frozen legacy
+ *  the eg_flow.log_seq number, not a look-up into the frozen legacy
  *  `messages` table.
  *
  *  Pre-fix, an egress-on session's block coordinates resolved through

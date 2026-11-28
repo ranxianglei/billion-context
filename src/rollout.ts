@@ -136,7 +136,7 @@ export const ROLLOUT_FEATURES: Record<string, RolloutPlan> = {
     // #7398/#7439: the egress plane — ONE switch for the whole new path.
     // ON: every lane (OpenAI/Anthropic/Responses/Google) records its
     // outbound conversation view as sparse ops (I/D/U) into the
-    // egress_state/egress_flow dual tables (rows SELF-CONTAINED — message
+    // eg_state/eg_flow dual tables (rows SELF-CONTAINED — message
     // bytes ride the row, no content CAS, ruling 7439-1), serves the
     // outbound core portion back from the op log (byte-identical by
     // construction), and pinned plugin lanes take server authority — the
