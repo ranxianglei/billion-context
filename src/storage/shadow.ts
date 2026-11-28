@@ -291,6 +291,17 @@ export class UnifiedShadow {
      *  writes — feeds the status wire and the skip-save logs so a frozen
      *  session surfaces WITH an age and a reason instead of only a count. */
     private readonly frozenEnvelopeSince = new Map<string, number>();
+    /** #7857-review F3: true when the store's legacy table group is absent
+     *  (the 7-table egress shape). There the sampled unified-vs-legacy view
+     *  comparison is structurally unverifiable: a NON-armed session's rows
+     *  are projected core-only by design (ingestCoreSessionOnly), so the
+     *  unified replay is empty while the live view holds the real history.
+     *  Running the sampler would false-positive every 20th save (a DIGEST
+     *  DRIFT error + watermark drop, then driftStreaks → DRIFT_ESCALATE_STREAK
+     *  → frozenEnvelopeIds FROZEN — restart data loss for the very shape
+     *  that must work). Armed sessions already bypass via egressOn; the
+     *  egress probe remains the plane's sole verification here. */
+    private skipViewVerification = false;
     /** #3931 step 3: the sqlite fast lane. Null when the selected backend
      *  is a network backend (mysql) — then every sync facade method below
      *  returns its miss value (null / [] / no-op) and callers fall back to
@@ -529,6 +540,7 @@ export class UnifiedShadow {
             throw err;
         }
         const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null), undefined, path.join(dir, "index.db"));
+        if (store.hasLegacyTables() === false) shadow.skipViewVerification = true;
         recordSidecarInstance(shadow);
         const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
         const walTag = ` [wal-cap: ${walLimit}]`;
@@ -746,7 +758,7 @@ export class UnifiedShadow {
             // chronic loop source). The egress probe (client bytes vs flow
             // sampled rows) is the sole verification for egress-on sessions.
             const egressOn = legacy.metadata?.egressAuthority === true && egressPlaneGateOn();
-            if (!egressOn && (count - 1) % VERIFY_EVERY_INGESTS === 0) {
+            if (!egressOn && !this.skipViewVerification && (count - 1) % VERIFY_EVERY_INGESTS === 0) {
                 this.stats.verifySamples++;
                 const sessionRow = this.sync.getSessionRow(legacy.id);
                 if (!sessionRow) throw new Error(`session row missing after ingest: ${legacy.id}`);

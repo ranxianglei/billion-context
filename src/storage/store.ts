@@ -677,6 +677,15 @@ export class UnifiedStore {
         }
     }
 
+    /** KDD #25: whether the legacy table group (messages, content, blocks,
+     *  refs, dead_refs, ccr_entries, orphan_blocks, conversations, …) exists
+     *  in this store's DB. Egress-plane fresh DBs create only the core group
+     *  (schema.ts STORAGE_DDL_V1_CORE) — read getters above return "no data"
+     *  and the write path degrades to core-only ingest on this flag. */
+    hasLegacyTables(): boolean {
+        return this.legacyTablesPresent;
+    }
+
     static open(
         path: string,
         engine?: SqliteEngineName,
@@ -1289,6 +1298,131 @@ export class UnifiedStore {
         });
     }
 
+    /** #7857 review F3: core-tables-only ingest for instances whose DB has
+     *  no legacy group (egress-plane fresh DBs, schema.ts). Same transaction
+     *  shape as the full path's head — the core `sessions` upsert (byte-for
+     *  byte the same SQL/semantics) plus the row-backed kstate fields
+     *  (session_ext IS a core table) — everything that writes the legacy
+     *  group is skipped instead of crashing. The orphan journal keeps its
+     *  MERGE semantics in the sessions column (the orphan_blocks table is
+     *  legacy; getOrphanViews unions the column, so the data stays
+     *  readable). last_ingested_seq stays NULL: without messages rows the
+     *  delta trust ladder has nothing to vouch for (primeIngestTrust does
+     *  exactly that on a foreign process boundary). */
+    private ingestCoreSessionOnly(
+        s: SessionRow,
+        input: IngestSessionInput,
+        opts?: { completeLog?: boolean; envelopeImport?: boolean },
+    ): boolean {
+        this.db.transaction((): void => {
+            // stored-column ∪ incoming — the applyOrphanBlocks merge minus
+            // the legacy table rows (which cannot exist here).
+            let orphansJson = s.orphansJson ?? null;
+            const col = this.getOrphansJson(s.sessionId);
+            if (col !== null) {
+                const merged: Record<string, unknown> = {};
+                let colParsed: unknown = null;
+                try {
+                    colParsed = JSON.parse(col);
+                } catch { /* corrupt stored journal → start fresh */ }
+                if (colParsed && typeof colParsed === "object") Object.assign(merged, colParsed);
+                if (orphansJson !== null) {
+                    let inc: unknown = null;
+                    try {
+                        inc = JSON.parse(orphansJson);
+                    } catch { /* corrupt incoming → drop it, keep stored */ }
+                    if (inc && typeof inc === "object") Object.assign(merged, inc);
+                }
+                orphansJson = Object.keys(merged).length > 0 ? JSON.stringify(merged) : null;
+            }
+            // #6785 step 8 write side: state_fields is a LEGACY table. In
+            // the 7-table shape the row-backed kstate fields ride the
+            // kstate_json column instead — getStateFields already returns
+            // null here ("missing = no data"), so the load path reads them
+            // back from the column (rows-win-over-column degenerates to the
+            // column, which now carries everything).
+            let kstateJson = s.kstateJson;
+            const stateFields = input.stateFields ?? {};
+            if (Object.keys(stateFields).length > 0) {
+                let col: Record<string, unknown> = {};
+                try {
+                    const parsed = JSON.parse(s.kstateJson || "{}") as unknown;
+                    if (parsed && typeof parsed === "object") col = parsed as Record<string, unknown>;
+                } catch { /* corrupt stored kstate → rebuild from the rows */ }
+                for (const [f, valueJson] of Object.entries(stateFields)) {
+                    try { col[f] = JSON.parse(valueJson); } catch { /* corrupt field → skip it */ }
+                }
+                kstateJson = JSON.stringify(col);
+            }
+            this.db
+                .prepare(
+                    `INSERT INTO sessions (session_id, parent_session_id, fork_point_seq, protocol, label, title, host_title, namespace, origin,
+                       status, created_at, updated_at, next_block_id, next_run_id,
+                       meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq, orphans_json)
+                     VALUES (@sessionId, @parentSessionId, @forkPointSeq, @protocol, @label, @title, @hostTitle, @namespace, @origin,
+                       @status, @createdAt, @updatedAt, @nextBlockId, @nextRunId,
+                       @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson, @lastIngestedSeq, @orphansJson)
+                     ON CONFLICT(session_id) DO UPDATE SET
+                       parent_session_id = COALESCE(sessions.parent_session_id, excluded.parent_session_id),
+                       fork_point_seq = CASE WHEN sessions.parent_session_id IS NULL THEN excluded.fork_point_seq ELSE sessions.fork_point_seq END,
+                       protocol = excluded.protocol,
+                       label = excluded.label,
+                       title = excluded.title,
+                       host_title = excluded.host_title,
+                       namespace = excluded.namespace,
+                       origin = excluded.origin,
+                       status = excluded.status,
+                       updated_at = excluded.updated_at,
+                       next_block_id = excluded.next_block_id,
+                       next_run_id = excluded.next_run_id,
+                       meta_json = excluded.meta_json,
+                       -- #7156: identical guard to the full path — an ENVELOPE
+                       -- import must never regress stored lifetime counters.
+                       stats_json = CASE
+                           WHEN @statsGuard = 1
+                                AND json_valid(sessions.stats_json)
+                                AND json_valid(excluded.stats_json)
+                                AND json_extract(excluded.stats_json, '$.requests') IS NOT NULL
+                                AND json_extract(sessions.stats_json, '$.requests')
+                                    >= json_extract(excluded.stats_json, '$.requests')
+                           THEN sessions.stats_json
+                           ELSE excluded.stats_json
+                       END,
+                       metadata_json = CASE WHEN metadata_json IS excluded.metadata_json THEN sessions.metadata_json ELSE excluded.metadata_json END,
+                       kstate_json = CASE WHEN kstate_json IS excluded.kstate_json THEN sessions.kstate_json ELSE excluded.kstate_json END,
+                       tail_json = excluded.tail_json,
+                       ccr_json = CASE WHEN ccr_json IS excluded.ccr_json THEN sessions.ccr_json ELSE excluded.ccr_json END,
+                       last_ingested_seq = excluded.last_ingested_seq,
+                       orphans_json = excluded.orphans_json`,
+                )
+                .run({
+                    sessionId: s.sessionId,
+                    parentSessionId: s.parentSessionId ?? null,
+                    forkPointSeq: s.forkPointSeq ?? null,
+                    protocol: s.protocol ?? null,
+                    label: s.label ?? null,
+                    title: s.title ?? null,
+                    hostTitle: s.hostTitle ?? null,
+                    namespace: s.namespace ?? "proxy",
+                    origin: s.origin ?? null,
+                    status: s.status ?? "active",
+                    createdAt: s.createdAt,
+                    updatedAt: s.updatedAt,
+                    nextBlockId: s.nextBlockId,
+                    nextRunId: s.nextRunId,
+                    metaJson: s.metaJson,
+                    statsJson: s.statsJson,
+                    metadataJson: s.metadataJson,
+                    kstateJson,
+                    tailJson: s.tailJson,
+                    ccrJson: s.ccrJson,
+                    statsGuard: opts?.envelopeImport === true ? 1 : 0,
+                    lastIngestedSeq: null,
+                    orphansJson,
+                });
+        });
+        return true;
+    }
     /** Ingests one session plan as a single transaction. Full path (no
      *  `delta`): identity-based absolute-seq remap of every plan row; the
      *  watermark becomes the abs seq backing the plan's LAST tail message
@@ -1323,6 +1457,7 @@ export class UnifiedStore {
      *  foreign writer's partial counts). Organic saves pass the flag off and
      *  keep the authoritative-set discipline.
      */
+
     ingestSession(
         input: IngestSessionInput,
         delta?: { trustedSeq: number; boundaryMsgId: string; boundaryHash: string; trustedTailSeqs: number[] },
@@ -1330,6 +1465,24 @@ export class UnifiedStore {
         reanchor?: { trustedTailSeqs: number[] },
     ): boolean {
         const s = input.session;
+        if (!this.legacyTablesPresent) {
+            // KDD #25 WRITE side (#7857 review F3): an egress-plane fresh DB
+            // does not create the legacy group (messages, content, blocks,
+            // refs, dead_refs, ccr_entries, orphan_blocks, conversations,
+            // message_media — schema.ts STORAGE_DDL_V1_LEGACY), and the read
+            // getters already treat "missing = no data" (:1227/:1242/…).
+            // The write path must too: a session whose egress authority is
+            // never armed (client that does not pin the msgid envelope) keeps
+            // the legacy ingest path, and its first `no such table: messages`
+            // rolled back the WHOLE ingest transaction — including the core
+            // `sessions` upsert — so the metadata row (pluginAgent, title)
+            // was lost permanently in pure-sqlite mode and every subsequent
+            // save re-crashed (the #7857 gate opencode lane-claim red). Core
+            // tables only; the legacy projection is simply absent for these
+            // sessions (their history is not projected anywhere else —
+            // non-armed sessions have no egress op log either).
+            return this.ingestCoreSessionOnly(s, input, opts);
+        }
         const ok = this.db.transaction((): boolean => {
             let messages: MessageRow[];
             let watermark: number | null;
@@ -3097,6 +3250,7 @@ export class UnifiedStore {
      *  never collide with an existing slot — rows above the watermark,
      *  e.g. a fold's summary, are expected and harmless). */
     probeIngestBoundary(sessionId: string, seq: number): { msgId: string; contentHash: string; maxSeq: number } | null {
+        if (!this.legacyTablesPresent) return null; // KDD #25: missing legacy group = no data (the delta path degrades to the full ingest)
         const row = this.db
             .prepare("SELECT msg_id, content_hash FROM messages WHERE session_id = ? AND seq = ?")
             .get(sessionId, seq) as { msg_id: string; content_hash: string } | undefined;
@@ -3112,6 +3266,7 @@ export class UnifiedStore {
      *  id-only by design (content-derived ids make a rewrite visible without
      *  re-serializing a potentially MB-sized row). */
     headRowMsgId(sessionId: string, seq: number): string | null {
+        if (!this.legacyTablesPresent) return null; // KDD #25: missing legacy group = no data
         const row = this.db
             .prepare("SELECT msg_id FROM messages WHERE session_id = ? AND seq = ?")
             .get(sessionId, seq) as { msg_id: string } | undefined;
