@@ -167,9 +167,18 @@ export function wirePinGroups(msgs: BiliMessage[]): WirePinGroups | null {
  * the host resends; a '#' -free head decodes to itself — the legacy behavior.
  */
 export function wireElementIds(ledgerIds: readonly string[]): string[] {
-    return ledgerIds
-        .filter((id) => elementOfCore(id).ordinal === 0)
-        .map((id) => elementOfCore(id).element);
+    const els: string[] = [];
+    for (const id of ledgerIds) {
+        const el = elementOfCore(id);
+        if (el.ordinal !== 0) continue;
+        // #7836 Path A: the egress ledger stores a message's parts under ONE
+        // element msgid (every part row decodes to ordinal 0) — count the
+        // element once. Legacy ledgers never repeat an element id, so this
+        // changes nothing for them.
+        if (els[els.length - 1] === el.element) continue;
+        els.push(el.element);
+    }
+    return els;
 }
 
 /** Wire-form validation: same entry rules as the per-core path, length
