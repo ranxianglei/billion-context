@@ -98,7 +98,7 @@ test("#847: reversed refs surface an explicit note on gate failure instead of si
     assert.match(out, /reversed/, "explicit reversal note present");
 });
 
-test("#847: repeated identical failing spec escalates; success clears the streak", () => {
+test("#847: repeated identical failing spec escalates; armed breaker blocks the would-be-successful call (#7418)", () => {
     const msgs: CoreMessage[] = [
         textMsg("raw_1", "assistant", "a".repeat(800)),
         textMsg("raw_2", "assistant", "b".repeat(800)),
@@ -122,13 +122,20 @@ test("#847: repeated identical failing spec escalates; success clears the streak
     // direction still counts as the same spec.
     assert.match(third, /COMPRESS CIRCUIT BREAKER: 3 consecutive/, "third consecutive failure upgrades to the loop breaker");
 
+    // #7418 Option A: once armed, EVERY model-initiated compress call is
+    // refused before execution — even a large range that would be a substantial
+    // success. The "success disarms while armed" recovery path is removed:
+    // under the #7418 trigger conditions no successful spec exists, so probing
+    // just extends the loop. The breaker disarms on 10 min without a failing
+    // call (bounded cycle, no deadlock).
     const success = applyRanges(parseCompressInput(compressArgs("m00003", "m00008")), ctx).text;
-    assert.ok(success.startsWith("[Compressed "), `large range compresses (got: ${success.slice(0, 100)})`);
-    assert.equal(ctx.session.metadata["compressFailKeys"], undefined, "streak cleared on success");
+    assert.match(success, /the compress circuit breaker is armed/, "large range is blocked while the breaker is armed (#7418)");
+    assert.match(success, /NOT because of your range selection/, "refusal states the reason is the streak, not range choice");
+    assert.equal((ctx.session.metadata["compressFailStreak"] as { n: number }).n, 3, "blocked call does not clear the streak");
 
     const after = applyRanges(parseCompressInput(compressArgs("m00001", "m00002")), ctx).text;
-    assert.ok(after.startsWith("[Compression FAILED:"), "small range still fails after the successful compress");
-    assert.ok(!after.includes("Repeat-failure guard"), "streak restarted after the clear");
+    assert.match(after, /the compress circuit breaker is armed/, "subsequent call still blocked while armed");
+    assert.equal((ctx.session.metadata["compressFailStreak"] as { n: number }).n, 3, "streak unchanged across blocked calls");
 });
 
 test("#847: preflight reports honest exhaustion when every listed range is sub-gate, without calling upstream", async () => {

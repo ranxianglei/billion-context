@@ -300,6 +300,19 @@ function armedRefusalReceipt(n: number, decayMinutes: number): string {
     return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' is ONE string holding every range — each block starts with its 'mNNNNN–mNNNNN optional topic' header line followed by its summary markdown, using refs from your visible history. The breaker disarms on one substantial fold (a trivial one that saves almost nothing does not count) or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
 }
 
+// #7418: the armed breaker must actually BLOCK execution, not just append
+// prose. This is the terminal refusal returned for EVERY model-initiated
+// compress call while the breaker is armed (n >= threshold, within the decay
+// window). The refusal explicitly states the reason (N consecutive failures +
+// cooldown) and forbids any "try another range" / "combine more messages"
+// wording — the #7418 loop was driven by the failure receipt inviting range
+// changes while the breaker sat armed. The breaker disarms on 10 min without
+// a failing call; a blocked model makes no new failing call, so the quiet
+// window runs from the last failure (bounded cycle, no deadlock).
+function armedBlockReceipt(n: number, decayMinutes: number): string {
+    return `[Compression refused: the compress circuit breaker is armed (${n} consecutive failures in this session, ${decayMinutes}-minute cooldown). This refusal is because of the failure streak, NOT because of your range selection — while the breaker stays armed, compress is BLOCKED before execution and no range is folded. Do not re-issue compress with any range; the breaker disarms on ${decayMinutes} minutes without a failing call. Continue your task without compressing — compression happens again only when there is genuinely new content to fold.]`;
+}
+
 // #5986 review fix: the observed failure mode after a compress rejection is the
 // model getting entangled in compression bookkeeping and then stopping out —
 // every parse-failure receipt ends with this explicit return-to-task instruction
@@ -1240,6 +1253,24 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     // failures have separate reporting (noteSkip) and must not arm the
     // model-facing circuit breaker on attempts the model never made.
     const trackLoop = opts?.loopTracking !== false;
+    // #7418: the armed breaker must actually BLOCK, not just append prose.
+    // Once armed (n >= threshold, within the decay window), refuse EVERY
+    // model-initiated compress call with a terminal refusal BEFORE execution —
+    // the model is in a loop, and running the call would just burn tokens on a
+    // deterministic failure. The breaker disarms on 10 min without a failing
+    // call (a blocked model makes no new failing call, so the quiet window runs
+    // from the last failure — bounded cycle, no deadlock). This is the
+    // enforcement layer #7197 found missing: the pause paragraph said
+    // "STOP calling compress" but no code path ever actually stopped it.
+    // Preflight overflow-compress (trackLoop=false) is exempt — bili's own
+    // internal lane, same as the gate below.
+    if (trackLoop) {
+        const armed = compressBreakerDetail(ctx.session);
+        if (armed !== undefined) {
+            ctx.log(`[acp-proxy: compress REFUSED — circuit breaker armed (n=${armed.n}, threshold=${armed.threshold}, decay=${armed.decayMinutes}min); execution blocked, not just prose (#7418)]`);
+            return compressResult(armedBlockReceipt(armed.n, armed.decayMinutes), "refused", 0, "breaker-armed");
+        }
+    }
     // #5683/#5943: unprompted-compression policy gate (timing). Model-initiated
     // calls only — bili's own overflow backstop folds ride loopTracking:false
     // above and never reach this check, so availability is unaffected even when
