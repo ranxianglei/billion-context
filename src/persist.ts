@@ -2035,7 +2035,7 @@ export class SessionStore {
     /** Egress usage plane (8th egress table): a cold-loaded egress-on
      *  session whose in-memory cache ledger is EMPTY (fresh process; a
      *  7+1-table instance has no envelope ledger) is rebuilt from the
-     *  egress_usage event stream — the ledger's own recordCacheSample /
+     *  eg_usage event stream — the ledger's own recordCacheSample /
      *  pushFold re-run, so the output is byte-identical to the live run
      *  (modulo the documented seam-observation boundary). A restored
      *  non-empty envelope ledger (legacy 19-table mode) wins over the
@@ -2060,7 +2060,7 @@ export class SessionStore {
                 events.push({ type: r.rowType, at: r.at, payload });
             }
             const n = rebuildCacheLedgerFromUsageEvents(session, events);
-            this.log("info", `[persist] rebuilt the cache ledger for ${session.id} from the egress_usage stream (${n.lines} line(s), ${n.folds} fold(s))`);
+            this.log("info", `[persist] rebuilt the cache ledger for ${session.id} from the eg_usage stream (${n.lines} line(s), ${n.folds} fold(s))`);
         } catch (err) {
             this.log("warn", `[persist] egress usage replay failed for ${session.id} (${err instanceof Error ? err.message : String(err)}) — serving an empty ledger; new samples book fresh from this load`);
         }
@@ -2559,8 +2559,8 @@ export class SessionStore {
         return this.liveShadow().snapPinLiveIds(sessionId);
     }
 
-    /** #7398 seg 3: egress op-log surface (dual tables egress_state/
-     *  egress_flow). Null when the sqlite lane is unavailable (legacy mode,
+    /** #7398 seg 3: egress op-log surface (dual tables eg_state/
+     *  eg_flow). Null when the sqlite lane is unavailable (legacy mode,
      *  network backends) — callers skip recording for the turn (shadow lane,
      *  zero impact). */
     egressOpLogStore(): import("./storage/store.js").UnifiedStore | null {
@@ -2982,7 +2982,7 @@ export class SessionStore {
         };
         await this.persistForkSession(sessionId, child);
         // #7577 (dual clocks, owner ruling 2026-11-24): report the FLOW high
-        // water (egress_flow's MAX) — the reference clock for point forks.
+        // water (eg_flow's MAX) — the reference clock for point forks.
         // Block rows align to it via their flow_op_seq pointer; the block
         // table's own op_seq space is self-contained and not part of the
         // watermark.
@@ -3438,7 +3438,7 @@ export class SessionStore {
 
     /** #7474 P2 (ruling 7439, proposal comment-19805485): the egress-on
      *  session's transcript authority lives in the op log
-     *  (egress_state/egress_flow), so the per-turn unified-index ingest — the
+     *  (eg_state/eg_flow), so the per-turn unified-index ingest — the
      *  O(ledger) double bookkeeping behind the 2s→5.7s @10w-row steady RT
      *  (#7474) — stops: the messages projection is FROZEN and rebuilt lazily
      *  by the first legacy FULL ingest after the plane rolls back (the rollback

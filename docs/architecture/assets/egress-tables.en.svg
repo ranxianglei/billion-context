@@ -2,7 +2,7 @@
 <rect width="1240" height="500" fill="#ffffff"/>
 <text x="40" y="22" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="16" font-weight="bold" fill="#1a2b4a">Egress plane tables (dual clocks + one-way pointer; materialized state, #7773)</text>
 <rect x="40" y="70" width="360" height="190" rx="8" fill="#fdeedd" stroke="#3a5a8a" stroke-width="1.5"/>
-<text x="52" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_flow — message op log (authority)</text>
+<text x="52" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">eg_flow — message op log (authority)</text>
 <text x="52" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, op_seq), dense within the table</text>
 <text x="52" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">row_type: I insert / D delete / U update (no B)</text>
 <text x="52" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">I rows: msgid + log_seq (canonical, never</text>
@@ -13,7 +13,7 @@
 <text x="52" y="215" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">any point stays reconstructible (egressStateAt)</text>
 <text x="52" y="230" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" font-weight="bold">the retired B base row is gone (#7773)</text>
 <rect x="40" y="290" width="360" height="120" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
-<text x="52" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_state — materialized live view</text>
+<text x="52" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">eg_state — materialized live view</text>
 <text x="52" y="330" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, msgid); pos-ordered, one row</text>
 <text x="52" y="345" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">per LIVE message; no compaction, no base row</text>
 <text x="52" y="360" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">Same-tx apply: I inserts + shifts, U in-place,</text>
@@ -21,7 +21,7 @@
 <text x="52" y="390" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">snapPinLiveIds / serving reads hit it; damaged</text>
 <text x="52" y="405" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">copy rebuilt by full-history replay, then served</text>
 <rect x="460" y="70" width="360" height="190" rx="8" fill="#fdeedd" stroke="#3a5a8a" stroke-width="1.5"/>
-<text x="472" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_block_flow — block history (own clock)</text>
+<text x="472" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">eg_block_flow — block history (own clock)</text>
 <text x="472" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, op_seq) — its own number pool</text>
 <text x="472" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">row_type: I born / U changed / D reaped (no B)</text>
 <text x="472" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">D rows carry the block's FULL terminal snapshot</text>
@@ -32,7 +32,7 @@
 <text x="472" y="215" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">kstate sidecar: residual field list</text>
 <text x="472" y="230" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7a3b0f" font-weight="bold">append-only, like the message flow</text>
 <rect x="460" y="290" width="360" height="120" rx="8" fill="#eaf1fb" stroke="#3a5a8a" stroke-width="1.5"/>
-<text x="472" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">egress_block_state — materialized live blocks</text>
+<text x="472" y="310" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">eg_block_state — materialized live blocks</text>
 <text x="472" y="330" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">PK (session_id, block_id); pos-ordered, one</text>
 <text x="472" y="345" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">row per non-reaped block; reap physically</text>
 <text x="472" y="360" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">deletes the row (flow keeps the terminal D)</text>

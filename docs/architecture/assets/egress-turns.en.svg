@@ -50,7 +50,7 @@
 <text x="702" y="350" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">no per-turn unified ingest (KDD #23)</text>
 <rect x="1000" y="70" width="200" height="190" rx="8" fill="#e8f6ec" stroke="#3a5a8a" stroke-width="1.5"/>
 <text x="1012" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">⑦ Restart / recovery</text>
-<text x="1012" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">replay flow → egress_state (bounded)</text>
+<text x="1012" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">replay flow → eg_state (bounded)</text>
 <text x="1012" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">tsStamps / token stats derived</text>
 <text x="1012" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">from the replay</text>
 <text x="1012" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">kstate = residual list only</text>
@@ -60,8 +60,8 @@
 <text x="1012" y="215" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">(7439-5)</text>
 <rect x="1000" y="300" width="200" height="110" rx="8" fill="#fff6e6" stroke="#3a5a8a" stroke-width="1.5"/>
 <text x="1012" y="320" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">Tables (see egress-tables)</text>
-<text x="1012" y="340" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress_flow / egress_state</text>
-<text x="1012" y="355" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress_block_flow / _state</text>
+<text x="1012" y="340" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">eg_flow / eg_state</text>
+<text x="1012" y="355" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">eg_block_flow / _state</text>
 <text x="1012" y="370" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">per-turn writes = new rows only</text>
 <line x1="280" y1="150" x2="340" y2="155" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
 

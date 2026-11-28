@@ -119,8 +119,8 @@ test("C3 a pinned session on a damaged log fails with 500 on every wire — the 
                 const db = new DatabaseSync(dbPath);
                 try {
                     db.exec("PRAGMA busy_timeout = 15000");
-                    const st = db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(sid);
-                    const fl = db.prepare("UPDATE egress_flow SET payload = ? WHERE session_id = ?").run('{"x":1}', sid);
+                    const st = db.prepare("DELETE FROM eg_state WHERE session_id = ?").run(sid);
+                    const fl = db.prepare("UPDATE eg_flow SET payload = ? WHERE session_id = ?").run('{"x":1}', sid);
                     if (st.changes > 0 && fl.changes > 0) return;
                 } catch (err) {
                     if (attempt === 50) throw err;

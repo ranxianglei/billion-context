@@ -64,7 +64,7 @@ function tablesOf(db: Db): string[] {
         .sort();
 }
 
-const EG_CORE_TABLES = ["egress_block_flow", "egress_block_state", "egress_flow", "egress_state", "egress_usage", "kv_store", "session_ext", "sessions"];
+const EG_CORE_TABLES = ["eg_block_flow", "eg_block_state", "eg_flow", "eg_state", "eg_usage", "kv_store", "session_ext", "sessions"];
 const LEGACY_TABLES = ["blocks", "checkpoints", "ccr_entries", "conversations", "content", "dead_refs", "l1_world", "message_media", "messages", "orphan_blocks", "refs", "state_fields"];
 
 // ---------------------------------------------------------------------------
@@ -460,7 +460,7 @@ test("B1: fresh eg-mode database after a real pinned lane — exactly 8 tables, 
                 assert.equal(row[0].session_id, "p1");
                 assert.equal(JSON.parse(String(row[0].metadata_json)).egressAuthority, true, "first row already carries egressAuthority=true");
                 assert.equal(row[0].namespace, "dsh", "identity columns mirror the ingest mapping (pluginAgent → namespace)");
-                const flow = db.prepare("SELECT COUNT(*) AS n FROM egress_flow").get() as { n: number };
+                const flow = db.prepare("SELECT COUNT(*) AS n FROM eg_flow").get() as { n: number };
                 assert.ok(flow.n >= 3, "the op log holds the bootstrap rows (eg tables write first, as before)");
             } finally { db.close(); }
         }
@@ -504,7 +504,7 @@ test("B1: fresh eg-mode database after a real pinned lane — exactly 8 tables, 
                 assert.ok(allowed.has(k), `unexpected metadata key in the identity row: ${k}`);
             }
             // the egress tables carried the whole conversation
-            const flow = db.prepare("SELECT COUNT(*) AS n FROM egress_flow").get() as { n: number };
+            const flow = db.prepare("SELECT COUNT(*) AS n FROM eg_flow").get() as { n: number };
             assert.ok(flow.n >= 5, `egress flow holds the seeded cells (got ${flow.n})`);
             assert.ok(!existsSync(join(h.dir, "billion-context", "plugin-conversations.json")), "no legacy plugin-conversations file in eg mode");
             assert.ok(!existsSync(join(h.dir, "billion-context", "prefix-affinity.json")), "no legacy prefix-affinity file in eg mode (identified client, gated)");
@@ -563,11 +563,11 @@ test("C1 (KDD #25 gate): deleteSession on a 7-table instance — the identity ro
     try {
         store.ensureEgressIdentity(identityInput("c1-s1"));
         db.prepare(
-            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
+            `INSERT INTO eg_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
              VALUES ('c1-s1', 1, 0, 'I', 'egress-system', '{"t":1}', '7', 1000)`,
         ).run();
         db.prepare(
-            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
+            `INSERT INTO eg_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
              VALUES ('c1-s1', 2, 1, 'I', 'm1', '{"t":2}', '7', 1000)`,
         ).run();
         // Pre-gate this threw on the missing messages table and rolled the
@@ -576,7 +576,7 @@ test("C1 (KDD #25 gate): deleteSession on a 7-table instance — the identity ro
         const n = (t: string) => Number((db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get() as { n: number }).n);
         assert.equal(n("sessions"), 0, "the identity row dies");
         assert.equal(n("session_ext"), 0, "ext rows die");
-        assert.equal(n("egress_flow"), 0, "the op log dies");
+        assert.equal(n("eg_flow"), 0, "the op log dies");
     } finally {
         try { store.close(); } catch { /* already closed */ }
         rmBestEffort(dir);
@@ -590,7 +590,7 @@ test("C2 (KDD #25 gate): gc on a 7-table instance — the legacy CAS sweep is sk
     try {
         store.ensureEgressIdentity(identityInput("c2-s1"));
         db.prepare(
-            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
+            `INSERT INTO eg_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
              VALUES ('c2-s1', 1, 1, 'I', 'm1', '{"t":2}', '7', 1000)`,
         ).run();
         // Pre-gate this threw on the missing content table (the zero-ref
@@ -619,7 +619,7 @@ test("C3 (KDD #25 gate): gcPlan on a 7-table instance — the zero-ref report is
     try {
         store.ensureEgressIdentity(identityInput("c3-s1"));
         db.prepare(
-            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
+            `INSERT INTO eg_flow (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at)
              VALUES ('c3-s1', 1, 1, 'I', 'm1', '{"t":2}', '7', 1000)`,
         ).run();
         const plan = store.gcPlan(30);

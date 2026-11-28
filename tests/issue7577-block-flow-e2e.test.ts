@@ -151,7 +151,7 @@ test("dual-clock e2e: real fold on an isolated DB survives save, restart, and po
         const row2 = recordEgressTurn({ store: ustore()!, sessionId: sid, prev: row1, conversation: folded, systemText: "sys", nowMs: 1_005_000 });
         assert.equal(row2.length, 51, "system row + 50 folded messages");
         // SAVE after the fold — the production interleaving: the block I row
-        // lands in egress_block_flow AFTER this turn's message ops.
+        // lands in eg_block_flow AFTER this turn's message ops.
         await store.writeNow(persistable(ctx.session, folded));
 
         // the block row exists with the REAL kernel snapshot
@@ -185,7 +185,7 @@ test("dual-clock e2e: real fold on an isolated DB survives save, restart, and po
         await store.writeNow(persistable(ctx.session, ctx.messages));
 
         // 1. flow density on the RAW rows — strictly +1, no gaps
-        const seqs = (dbv.prepare(`SELECT op_seq FROM egress_flow WHERE session_id = ? ORDER BY op_seq`).all(sid) as { op_seq: number }[]).map((r) => r.op_seq);
+        const seqs = (dbv.prepare(`SELECT op_seq FROM eg_flow WHERE session_id = ? ORDER BY op_seq`).all(sid) as { op_seq: number }[]).map((r) => r.op_seq);
         assert.ok(seqs.length > 0, "flow rows exist");
         for (let i = 1; i < seqs.length; i++) {
             assert.equal(seqs[i], seqs[i - 1]! + 1, `flow stays dense at op ${seqs[i]} (was: jump from ${seqs[i - 1]})`);
@@ -198,10 +198,10 @@ test("dual-clock e2e: real fold on an isolated DB survives save, restart, and po
         assert.ok(egressStateAt(dbv, sid, midSeq).length > 0, "point-in-time reads work inside the log");
 
         // 3. the block row's dual-clock fields, on the raw rows
-        const ptrRow = dbv.prepare(`SELECT op_seq, flow_op_seq FROM egress_block_flow WHERE session_id = ?`).get(sid) as { op_seq: number; flow_op_seq: number };
+        const ptrRow = dbv.prepare(`SELECT op_seq, flow_op_seq FROM eg_block_flow WHERE session_id = ?`).get(sid) as { op_seq: number; flow_op_seq: number };
         assert.equal(ptrRow.op_seq, 1, "the block table numbers itself (its first and only row is op 1)");
         assert.ok(ptrRow.flow_op_seq <= ustore()!.egressStateMaxSeq(sid), "pointer within the flow's span");
-        const statePtr = dbv.prepare(`SELECT op_seq, flow_op_seq FROM egress_block_state WHERE session_id = ?`).get(sid) as { op_seq: number; flow_op_seq: number };
+        const statePtr = dbv.prepare(`SELECT op_seq, flow_op_seq FROM eg_block_state WHERE session_id = ?`).get(sid) as { op_seq: number; flow_op_seq: number };
         assert.deepEqual([statePtr.op_seq, statePtr.flow_op_seq], [ptrRow.op_seq, ptrRow.flow_op_seq], "state replica row carries the same clock fields");
 
         // ---------------- restart: new store over the same DB --------------
@@ -216,7 +216,7 @@ test("dual-clock e2e: real fold on an isolated DB survives save, restart, and po
         assert.deepEqual(VIEW_KEY(view4), VIEW_KEY(row3), "post-restart view is byte-equal (replay works over the interleaved log)");
         const tsStamps = db2.egressTsStamps(sid);
         assert.ok(tsStamps && Object.keys(tsStamps).length >= 52, "tsStamps derive from the log after the trim");
-        const replayed = egressBlockReplay(dbv, sid, (dbv.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_block_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx);
+        const replayed = egressBlockReplay(dbv, sid, (dbv.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM eg_block_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx);
         assert.equal(replayed.blocks.size, 1, "block table replays to the live set");
         assert.equal(replayed.blocks.get(blk.blockId)?.active, true);
 
@@ -229,7 +229,7 @@ test("dual-clock e2e: real fold on an isolated DB survives save, restart, and po
         const childView = egressStateView(dbv, childId);
         assert.deepEqual(VIEW_KEY(childView), VIEW_KEY(row3), "child flow is byte-equal to the parent's");
         assert.equal(db2.egressBlockView(childId).get(blk.blockId)?.active, true, "child inherited the block");
-        for (const t of ["egress_flow", "egress_block_flow", "egress_state", "egress_block_state"]) {
+        for (const t of ["eg_flow", "eg_block_flow", "eg_state", "eg_block_state"]) {
             const n = (s: string) => (dbv.prepare(`SELECT COUNT(*) AS n FROM ${t} WHERE session_id = ?`).get(s) as { n: number }).n;
             assert.equal(n(childId), n(sid), `${t} row count carried over`);
         }

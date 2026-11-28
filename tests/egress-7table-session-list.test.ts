@@ -49,7 +49,7 @@ test("B4: a 7-table egress session appears in the web list (absent blocks table)
             title: "eg7 title", hostTitle: null, namespace: "proxy", origin: null,
             createdAt: now, updatedAt: now, metaJson: "{}", metadataJson: "{}",
         });
-        // one turn → egress_state rows (the non-system rows count as egressRecords).
+        // one turn → eg_state rows (the non-system rows count as egressRecords).
         recordEgressTurn({
             store: st, sessionId: sid, prev: undefined,
             conversation: [core("u0", "user", "hello", 0), core("a0", "assistant", "hi", 1)],

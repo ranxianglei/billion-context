@@ -3,7 +3,7 @@
 > 范围:`2026-11-15_msgid-snapshot-unified` @ `39941c816`(base `origin/master` `b10c1a0d4`)。
 > 134 文件 +13740/−367。本文是本 PR 的**审查级**完整梳理:四部分(表结构 / 实现逻辑 / 数据流转 / 开关)+ 实测验证 + 本轮发现与修复。行号均指 head 处源码。
 > **第 2 轮（owner 裁定 7439-2，KDD #23，2026-11-22）已落在同一分支、晚于本快照**——op log 正史编号、窗口 re-anchor delta、messages 惰性投影与常驻性能门。见 **§6**（与本文件 §1.2 egress DDL 草图、§5.4 遗留项冲突处以 §6 为准）。
-> **退役注（合入后，引用本文表清单前先读）：**截至 #7439 系列终态，`l1_world` 已降级为**占位行**（R3 latch 载体迁至 `sessions.r3_latched_at`；egress-on 的 stage-0 无状态——#7617），`conversations` 对 egress-on 退役，`fold_journal`/`egress_snapshot` 合入前已删。当前表清单——含 `egress_flow`/`egress_state` op log 与双时钟的 `egress_block_flow`/`egress_block_state`——见 [architecture/storage.md](./architecture/storage.zh-CN.md) 与一站式 [egress-plane.md](./egress-plane.zh-CN.md)；退役登记见 [deprecations.md](./deprecations.zh-CN.md)。
+> **退役注（合入后，引用本文表清单前先读）：**截至 #7439 系列终态，`l1_world` 已降级为**占位行**（R3 latch 载体迁至 `sessions.r3_latched_at`；egress-on 的 stage-0 无状态——#7617），`conversations` 对 egress-on 退役，`fold_journal`/`egress_snapshot` 合入前已删。当前表清单——含 `eg_flow`/`eg_state` op log 与双时钟的 `eg_block_flow`/`eg_block_state`——见 [architecture/storage.md](./architecture/storage.zh-CN.md) 与一站式 [egress-plane.md](./egress-plane.zh-CN.md)；退役登记见 [deprecations.md](./deprecations.zh-CN.md)。
 
 
 ---
@@ -14,8 +14,8 @@
 
 | 块 | 提案/来源 | 开关(默认) |
 |---|---|---|
-| ~~① 快照底座 v2~~(fold 日志 + egress_snapshot + scope-rev) | #5874 v2 / #7064 瘦身 | **本 PR 已退役**(bc51c9445,7439 裁定):平面从未上线——被 round-2 op log(`egress_state`/`egress_flow`,KDD #23)整体取代;stage-0 身份账本(L1 world / pf pin)保留,但 `storage.snapBase.*` 已从配置面**移除**——你配置里残留的 `snapBase` 键是死键(被忽略) |
-| ② 出站 op-log(egress_state/egress_flow + 重建 serve + 服务端权威) | 讨论区 7398/7439 | `egressPlane`(0)——整条新链路的**唯一开关** |
+| ~~① 快照底座 v2~~(fold 日志 + egress_snapshot + scope-rev) | #5874 v2 / #7064 瘦身 | **本 PR 已退役**(bc51c9445,7439 裁定):平面从未上线——被 round-2 op log(`eg_state`/`eg_flow`,KDD #23)整体取代;stage-0 身份账本(L1 world / pf pin)保留,但 `storage.snapBase.*` 已从配置面**移除**——你配置里残留的 `snapBase` 键是死键(被忽略) |
+| ② 出站 op-log(eg_state/eg_flow + 重建 serve + 服务端权威) | 讨论区 7398/7439 | `egressPlane`(0)——整条新链路的**唯一开关** |
 | ③ 全量重发水位 + delta 尾切片 | #5403/#5418 + 本 PR | `pluginFullResendWatermark`(5)/ `pluginDeltaResend`(0) |
 | ④ 增量 msgid pin(tail-ids 尾形态) | #7064 §8 | `pluginMsgIdIncremental`(**100**,本 PR 起默认开) |
 | ⑤ 服务端正史 GA | #4491 | `pluginLaneServerHistory`(**100**,本 PR 从 0 翻到 100) |
@@ -104,7 +104,7 @@ PRIMARY KEY (session_id, field)
 
 字段集**冻结**在 slim.ts `ROW_BACKED_KSTATE_FIELDS`(9 个:tokenSnapshot, tsStamps, lastPassIds, hiddenOrphanRefs, sweptOrphanCallIds, renderDeferredRefs, viewLatches, absorbed, rules),`tests/issue5874-state-fields` 钉死。
 
-**egress_state / egress_flow**(schema.ts:508-530,7398 提案)—— 出站会话 op-log,双表同构:
+**eg_state / eg_flow**(schema.ts:508-530,7398 提案)—— 出站会话 op-log,双表同构:
 
 ```
 session_id TEXT NOT NULL, log_seq INTEGER NOT NULL,
@@ -113,12 +113,12 @@ msgid TEXT,          -- B/D 为 NULL;I/U 必填
 payload TEXT NOT NULL,
 created_at INTEGER NOT NULL,
 PRIMARY KEY (session_id, log_seq)
-+ idx_egress_state_msgid(session_id, msgid)
-+ idx_egress_flow_msgid (session_id, msgid)
++ idx_eg_state_msgid(session_id, msgid)
++ idx_eg_flow_msgid (session_id, msgid)
 ```
 
-- `egress_state` = serve 读 + 压实物理裁剪(水位以下删);
-- `egress_flow` = append-only **永不删**(任意 log_seq 可重建,回滚以此表为据,不靠客户端重发)。2026-11-23 的一个构建(df7ac0929)曾让压缩也裁这张表(「只留最新一条基线行及其之后的行」);2026-11-26 按 #7439 裁定恢复——压实只裁 `egress_state`,flow 保持 append-only。
+- `eg_state` = serve 读 + 压实物理裁剪(水位以下删);
+- `eg_flow` = append-only **永不删**(任意 log_seq 可重建,回滚以此表为据,不靠客户端重发)。2026-11-23 的一个构建(df7ac0929)曾让压缩也裁这张表(「只留最新一条基线行及其之后的行」);2026-11-26 按 #7439 裁定恢复——压实只裁 `eg_state`,flow 保持 append-only。
 
 行 payload 契约(egress-state.ts):
 - `I`: `{"after": msgid|null, "ref", "tokens", "type", "content_hash", "role"?, "cas_ref"?}`
@@ -139,7 +139,7 @@ PRIMARY KEY (session_id, log_seq)
 ### 1.4 MySQL 对等(mysql.ts +274)
 
 移植了:`orphan_blocks`、`state_fields`、`ccr_entries.orig_hash`(+ 索引、probe 迁移、归档/恢复/级联)。
-**未移植**:`l1_world / fold_journal / egress_snapshot / egress_scope_rev / egress_state / egress_flow`——快照/egress 平面是 **SQLite 车道专属**(shadow.ts `egressOpLogSync()` 网络后端返回 null,录制器整轮跳过)。
+**未移植**:`l1_world / fold_journal / egress_snapshot / egress_scope_rev / eg_state / eg_flow`——快照/egress 平面是 **SQLite 车道专属**(shadow.ts `egressOpLogSync()` 网络后端返回 null,录制器整轮跳过)。
 
 ---
 
@@ -263,7 +263,7 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 
 `deleteSession`(store.ts:~2586):messages/media/blocks/**fold_journal/egress_snapshot/egress_scope_rev/orphan_blocks/state_fields** + dead_refs/refs/ccr_entries/conversations/session_ext/sessions + l1_world(按 ledger_id)+ CAS 释放与 scoped collect。
 `archiveSession`:同上(除 l1_world),JSONL 导出**先于** COMMIT 追加,状态翻 archived。
-**本轮修复**:两处都补了 `egress_state/egress_flow` 清扫(原漏删 ⇒ op-log 行永久孤儿,属"存储只增不减"p1 类;CAS 引用的 egress 半也一并释放,消息字节仍由 messages 行持有)。
+**本轮修复**:两处都补了 `eg_state/eg_flow` 清扫(原漏删 ⇒ op-log 行永久孤儿,属"存储只增不减"p1 类;CAS 引用的 egress 半也一并释放,消息字节仍由 messages 行持有)。
 
 ---
 
@@ -323,7 +323,7 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 
 ### 5.3 本轮发现与修复(小问题直接修,已随本报告提交)
 
-1. **[p1 存储只增不减] deleteSession/archiveSession 漏删 egress_state/egress_flow** ⇒ op-log 行 + 其 CAS 引用永久孤儿。修:store.ts `deleteEgressOps` + 两处级联。
+1. **[p1 存储只增不减] deleteSession/archiveSession 漏删 eg_state/eg_flow** ⇒ op-log 行 + 其 CAS 引用永久孤儿。修:store.ts `deleteEgressOps` + 两处级联。
 2. **[p1 存储只增不减] buildEgressViewRows 每轮对每条未变行重复 putContent**(CAS refcount 每轮每行 +1,无对应释放)⇒ 开了 egress 键的会话内容库无限膨胀。修:未变行复用 prev casRef(缺的补上,变的重新 put)。
 3. **[文档] `docs/proposals/snapshot-compression-foundation/`** 描述已退役的 v1 四表平面(snap_rows/snap_log/snap_ckpt 合入前删除;标题还说 "DDL landed in #5901"),与现 v12 形态矛盾 ⇒ **整目录移除**。
 4. **[文档] `docs/storage-relations.{en,zh}.svg`** 缺 5 张新表、fold_journal 卡片还写已删的 covered_ids、egress_snapshot 卡片还写 ids_json、⑦级联卡片不准确 ⇒ **移除**,由本报告接替。
@@ -346,7 +346,7 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 ### 6.1 R-A:正史消息编号(op_seq / log_seq)
 
 - 两张 egress 表各带两个键:`op_seq`(PK,每表 append-only 行游标——恢复/截断键)与 `log_seq`(正史消息编号,**仅 I 行**;D/U/B 行为 NULL)。`log_seq` 会话内作用域、**永不重发**(kernel id 契约);每条 I 行的 `log_seq` = 该轮新增行在存活视图里的正史下标,记账时戳定——编号不再依赖位置、也不再依赖 messages 表。
-- `recoverEgressBase` 有界(state 表被 compaction 物理裁剪);无行会话经新 B op 引导;有行但**无健康点**的 pinned 会话整轮**硬失败**(裁定 7439-5:500 + `x-bili-egress: unreadable` + `{type:'egress_flow_unreadable'}`,经 `EgressAuthorityRejectError`——车道 catch 不再吞掉;会话永不截断自己的坏行、永不从客户端字节重引导)。
+- `recoverEgressBase` 有界(state 表被 compaction 物理裁剪);无行会话经新 B op 引导;有行但**无健康点**的 pinned 会话整轮**硬失败**(裁定 7439-5:500 + `x-bili-egress: unreadable` + `{type:'eg_flow_unreadable'}`,经 `EgressAuthorityRejectError`——车道 catch 不再吞掉;会话永不截断自己的坏行、永不从客户端字节重引导)。
 - R-B:fork = `egressFork` 整表 op log 拷贝(self-fork 抛错;空父 no-op)。
 
 ### 6.2 B:事务内窗口 re-anchor delta(#7474——2s 地板的根因)
@@ -360,7 +360,7 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 对 `metadata.egressAuthority === true`(且 `egressPlane` 开)的会话:
 
 - **不再逐轮统一 ingest**:`ingestRowsNow` 与防抖统一腿早退——这些会话的 `messages` 表降级为**惰性投影**(平面回滚 / web 读 / 副本恢复时一次性 O(n) 重建)。重启后的引导仍走 op log(`recoverEgressBase`),不走投影。
-- **pin 通道读 op log**:KDD #21/#22 pin 账本(尾重叠 / 活 id 重盖)在 egress-on 会话上改从 `egress_flow` I 行(msgid + log_seq)解析,不经 messages 账本(`snapPinLiveIds` shim)。wire 不变。
+- **pin 通道读 op log**:KDD #21/#22 pin 账本(尾重叠 / 活 id 重盖)在 egress-on 会话上改从 `eg_flow` I 行(msgid + log_seq)解析,不经 messages 账本(`snapPinLiveIds` shim)。wire 不变。
 - **信封在 bootstrap 冻结**(`d28d9ff3a`):不再逐轮读+写 15.5MB 的会话 JSON(kernel refs 永不裁剪——10w 时 messageRefs 10MB + tsStamps 5.5MB);冻结路由必须保持常驻字段不被裁剪(`9183ea817`,#4788 D2),否则 pinned 轮 502。
 - **校验**:egress 探针(flow vs 客户端抽样)是 egress-on 会话唯一的漂移校验器——`BatchedViewVerification` 对它们关闭(`13b9baae2`):客户端 vs 正史那条腿只会量到已知的服务端赢分歧(裁定 7439-5),并把 drift 永远锁死。
 - flow 损坏语义:硬失败,出站无投影兜底——flow 与 messages 同生共死(flow 独立性,裁定 7439-2 §2)。
@@ -376,7 +376,7 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 | ep18 / ep20 | ON 合并后 | dbf4b140b | 730 / 761 · **638 / 655 ms** | 462 / 456 s |
 | ep22 | OFF 合并后 | dbf4b140b | 2016 / 2957 ms | 1070 s |
 
-**验收线「10w 累计 <1s」由 ON 臂达成(638ms p50,比修复前快 9×);ON 臂现在比同 build 的 OFF 臂更快。** ep20 DB:无 JSON 信封,egress-on 会话 messages 表 0 行,egress_flow 每轮 1 行,state 25 行有界,WAL 上限 8MiB(journal_size_limit)。OFF 臂地板(~2s)属修复前 #5744 家族(逐轮全量读+写膨胀的 JSON 信封 + 244MB DB fsync)——按单开关裁定不在本 PR 范围。ep14c 时代 2.2GB WAL 异常是 WAL 上限前的 build;上限后的 build 稳在 8MiB。
+**验收线「10w 累计 <1s」由 ON 臂达成(638ms p50,比修复前快 9×);ON 臂现在比同 build 的 OFF 臂更快。** ep20 DB:无 JSON 信封,egress-on 会话 messages 表 0 行,eg_flow 每轮 1 行,state 25 行有界,WAL 上限 8MiB(journal_size_limit)。OFF 臂地板(~2s)属修复前 #5744 家族(逐轮全量读+写膨胀的 JSON 信封 + 244MB DB fsync)——按单开关裁定不在本 PR 范围。ep14c 时代 2.2GB WAL 异常是 WAL 上限前的 build;上限后的 build 稳在 8MiB。
 
 ### 6.5 常驻性能门(裁定:e2e bench ×3,不超基线 +20%)
 
@@ -414,7 +414,7 @@ fold tx:blocks 插/更 + 覆盖行 retire(同事务)+ fold_journal 一行
 - **回退到最后一个健康点**(并删掉之后的行)只在日志确实无法重放时发生,而且只针对「以服务端为准」的会话。数据库忙/锁住/IO 错误原样抛出,不删任何东西。
 - **同一会话两个请求。** 开始时基于旧日志的那个写入会被拒绝(`EgressConcurrentWriteError`),它的轮次照常下发、只是不记录。会把日志写坏的批次在写入之前就被拒绝。
 - **压缩。** 带删除的轮次在同一次写入里完成压缩。压实裁**state**表新基线行以下的行;**flow**表保留它写过的每一行(append-only,#7439 裁定——2026-11-26 在 2026-11-23 的构建把 flow 裁到最新基线以下之后恢复),所以 `egressStateAt` 能重建任意历史点。增长是推迟的优化项(#7475),另行解决,绝不靠保留策略。
-- **服务副本**(`egress_state`)每次读取都和日志比对;副本坏了就从日志重新拷贝,日志有洞会被报出来。
+- **服务副本**(`eg_state`)每次读取都和日志比对;副本坏了就从日志重新拷贝,日志有洞会被报出来。
 - **非空视图上的 `after: null` 表示「新的第一行」**,两个重放一致。(之前:校验放第一、存储放最后,下一轮要付出一次删除+插入的重写。)
 - **开关关闭** = 什么都不读操作日志,哪怕会话已经有日志:钉住的 id 从 `messages` 读,漂移检查关闭。
 

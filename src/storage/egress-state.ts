@@ -38,11 +38,11 @@
  * retirement, which is exactly why it cannot serve as a row id.
  *
  * THE TWO TABLES (7773 §2):
- *   egress_flow  — the record: EVERY I/U/D op in order, append-only,
+ *   eg_flow  — the record: EVERY I/U/D op in order, append-only,
  *                  physically NEVER deleted. Growth optimization is a
  *                  separate, deferred project (#7475 family) — nothing
  *                  here ever prunes it.
- *   egress_state — the MATERIALIZED live view: one row per live message
+ *   eg_state — the MATERIALIZED live view: one row per live message
  *                  (PK (session_id, rid); msgid kept as an indexed column —
  *                  the client-facing identity, read by the pin channel),
  *                  pos = the row's position in the current view. I inserts
@@ -167,18 +167,44 @@ export interface EgressViewRow {
 }
 
 type EgressOpType = "I" | "D" | "U";
+/** 'G' is not an op — it is the GENERATION BOUNDARY row (discussions/7896):
+ * a trust boundary written when the writer's LEDGER_GENERATION differs from
+ * the flow's last row. Its payload is a FULL materialized-view snapshot;
+ * replays start from the latest G at or below their target, so the pre-G
+ * prefix (written under an older semantics) is never judged by the new law. */
+type EgressFlowRowType = EgressOpType | "G";
+
+/** Ledger GENERATION (discussions/7896, pre-GA discipline): the version
+ * stamp of the ROW SEMANTICS of the eg_flow / eg_block_flow logs — the
+ * numbering law, the replay invariants, the addressing scheme. DDL/layout
+ * changes are NOT generations (they follow the storage schema version); a
+ * semantics change is one that makes OLD rows unreadable under the new
+ * rules, so the log can no longer be judged row-by-row against it.
+ * Raising this constant REQUIRES (review gate, AGENTS.md rule):
+ *   (a) the writer appends a 'G' boundary row on the first turn under the
+ *       new generation (maybeWriteGenerationBoundary — payload = the full
+ *       materialized view at the boundary);
+ *   (b) every replay (egressStateAt / egressFlowWalkBack / egressBlockReplay)
+ *       starts from the latest G at or below its target — the pre-G prefix
+ *       is never judged by the new law;
+ *   (c) a cross-generation fixture test (an old prefix containing rows the
+ *       new law would reject, replaying cleanly from its G boundary).
+ * Rows copied from the pre-rename egress_flow tables carry gen=0 (their
+ * writer's law is gone with the old code — same boundary semantics). */
+export const LEDGER_GENERATION = 1;
 
 interface FlowRow {
     op_seq: number;
     log_seq: number | null;
-    row_type: EgressOpType;
+    row_type: EgressFlowRowType;
     rid: number | null;
     msgid: string | null;
     payload: string;
     bytes: string | null;
+    gen: number;
 }
 
-/** One row of the materialized live view (egress_state). `log_seq` is the
+/** One row of the materialized live view (eg_state). `log_seq` is the
  * number the I op assigned (immutable — the I-twin anchor into the flow);
  * `num` is the row's CURRENT canonical number (a U with an explicit num
  * changes it; demote → 0). `sysIn` is the system row only: the CLIENT RAW
@@ -200,9 +226,9 @@ interface StateRow {
     bytes: string;
 }
 
-const INSERT_FLOW = `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-const INSERT_STATE_ROW = `INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
-const SELECT_STATE_ROWS = `SELECT rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes FROM egress_state WHERE session_id = ? ORDER BY pos ASC`;
+const INSERT_FLOW = `INSERT INTO eg_flow (session_id, op_seq, log_seq, row_type, rid, msgid, payload, bytes, gen, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+const INSERT_STATE_ROW = `INSERT INTO eg_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+const SELECT_STATE_ROWS = `SELECT rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes FROM eg_state WHERE session_id = ? ORDER BY pos ASC`;
 
 /** The canonical message frontier: the highest number ever ISSUED
  * (retired messages included — I rows only advance it, D/U never do).
@@ -213,7 +239,7 @@ const SELECT_STATE_ROWS = `SELECT rid, msgid, pos, log_seq, num, ref, tokens, ty
  * gone with the B row. */
 export function egressMessageHighWater(db: SqliteDatabase, sessionId: string): number {
     const row = db
-        .prepare("SELECT COALESCE(MAX(log_seq), 0) AS n FROM egress_flow WHERE session_id = ?")
+        .prepare("SELECT COALESCE(MAX(log_seq), 0) AS n FROM eg_flow WHERE session_id = ?")
         .get(sessionId) as { n: number } | undefined;
     return Number(row?.n) || 0;
 }
@@ -226,27 +252,27 @@ export function egressMessageHighWater(db: SqliteDatabase, sessionId: string): n
  * allocates new rids strictly above it. */
 export function egressRowHighWater(db: SqliteDatabase, sessionId: string): number {
     const row = db
-        .prepare("SELECT COALESCE(MAX(rid), 0) AS n FROM egress_flow WHERE session_id = ?")
+        .prepare("SELECT COALESCE(MAX(rid), 0) AS n FROM eg_flow WHERE session_id = ?")
         .get(sessionId) as { n: number } | undefined;
     return Number(row?.n) || 0;
 }
 
 function nextSeqs(db: SqliteDatabase, sessionId: string): { opSeq: number; num: number } {
-    // egress_flow is the record and a superset of egress_state after every
+    // eg_flow is the record and a superset of eg_state after every
     // turn, so the flow maxima ARE the session's high-waters: the op_seq
     // ordering cursor and the canonical message-number cursor (I rows only
     // — D/U carry NULL and never advance it).
     // #7577 (owner ruling 2026-11-24): DUAL CLOCKS — the block lifecycle log
-    // numbers itself (egress_block_flow.op_seq dense within its own table,
+    // numbers itself (eg_block_flow.op_seq dense within its own table,
     // see egress-block.ts); its rows carry flow_op_seq as a POINTER to this
     // clock (flow's MAX at write time) for cross-table alignment at point
     // forks. The flow table keeps its exclusive number pool: the op_seq and
-    // log_seq cursors are egress_flow-only, and its density invariant
+    // log_seq cursors are eg_flow-only, and its density invariant
     // (#7574) stays intact regardless of what the block table does.
     //
     // #7574: must be read INSIDE the append transaction, never before it.
     const row = db
-        .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o FROM egress_flow WHERE session_id = ?")
+        .prepare("SELECT COALESCE(MAX(op_seq), 0) AS o FROM eg_flow WHERE session_id = ?")
         .get(sessionId) as { o: number } | undefined;
     const head = Number(row?.o) || 0;
     return { opSeq: head + 1, num: egressMessageHighWater(db, sessionId) + 1 };
@@ -560,8 +586,65 @@ export function diffEgressView(prev: EgressViewRow[], next: EgressViewRow[], tra
 
 /** Write one FLOW row (the record). The state table is applied separately
  * (materialized, 7773) — there is no twin-pair copy anymore. */
-function writeFlowRow(db: SqliteDatabase, sessionId: string, opSeq: number, logSeq: number | null, rowType: EgressOpType, rid: number | null, msgid: string | null, payload: string, bytes: string | null, nowMs: number): void {
-    db.prepare(INSERT_FLOW).run(sessionId, opSeq, logSeq, rowType, rid, msgid, payload, bytes, nowMs);
+function writeFlowRow(db: SqliteDatabase, sessionId: string, opSeq: number, logSeq: number | null, rowType: EgressFlowRowType, rid: number | null, msgid: string | null, payload: string, bytes: string | null, gen: number, nowMs: number): void {
+    db.prepare(INSERT_FLOW).run(sessionId, opSeq, logSeq, rowType, rid, msgid, payload, bytes, gen, nowMs);
+}
+
+/** Decode + validate a 'G' boundary row's payload into the full view it
+ * snapshots. Throws EgressStateCorruptError on any malformation (a corrupt
+ * boundary is a corrupt log — the caller's ladder decides the damage).
+ * Rows are positional: the snapshot is the view at the boundary, in pos
+ * order; every field the I-row validation requires is required here too
+ * (the snapshot IS the materialized view). */
+function decodeGenSnapshot(sessionId: string, row: FlowRow): EgressViewRow[] {
+    let parsed: Record<string, unknown>;
+    try {
+        parsed = JSON.parse(row.payload) as Record<string, unknown>;
+    } catch {
+        throw new EgressStateCorruptError(sessionId, `G boundary at op_seq=${row.op_seq} is not an object`);
+    }
+    if (parsed.gen !== LEDGER_GENERATION) {
+        throw new EgressStateCorruptError(sessionId, `G boundary at op_seq=${row.op_seq} names an unknown generation ${String(parsed.gen)}`);
+    }
+    if (!Array.isArray(parsed.rows)) {
+        throw new EgressStateCorruptError(sessionId, `G boundary at op_seq=${row.op_seq} has no rows array`);
+    }
+    const view: EgressViewRow[] = [];
+    const seenRids = new Set<number>();
+    for (let i = 0; i < parsed.rows.length; i++) {
+        const o = parsed.rows[i] as Record<string, unknown>;
+        if (typeof o?.rid !== "number" || o.rid < 1 || typeof o.num !== "number" || o.num < 0
+            || typeof o.msgid !== "string" || typeof o.ref !== "string" || typeof o.tokens !== "number"
+            || typeof o.type !== "string" || typeof o.bytes !== "string") {
+            throw new EgressStateCorruptError(sessionId, `G boundary at op_seq=${row.op_seq} has a malformed snapshot row ${i}`);
+        }
+        if (seenRids.has(o.rid)) {
+            throw new EgressStateCorruptError(sessionId, `G boundary at op_seq=${row.op_seq} has a duplicate row id ${o.rid}`);
+        }
+        seenRids.add(o.rid);
+        const entry: EgressViewRow = { rid: o.rid, num: o.num, msgid: o.msgid, ref: o.ref, tokens: o.tokens, type: o.type, bytes: o.bytes };
+        if (o.role !== undefined) entry.role = String(o.role);
+        if (typeof o.ts === "number") entry.ts = o.ts;
+        view.push(entry);
+    }
+    return view;
+}
+
+/** 7896: return the op_seq the NEW ops must start at. When the flow's last
+ * row was written by an OLDER generation, close the old prefix with a 'G'
+ * boundary row first — payload = the full live view read BEFORE any of the
+ * new ops apply (the boundary is exactly "the view as the old generation
+ * left it") — and the ops take the slot after it. A fresh log (no rows)
+ * or a same-generation log needs no boundary. Runs inside the caller's
+ * write transaction. */
+function maybeWriteGenerationBoundary(db: SqliteDatabase, sessionId: string, firstOpSeq: number, nowMs: number): number {
+    const last = db
+        .prepare("SELECT gen FROM eg_flow WHERE session_id = ? ORDER BY op_seq DESC LIMIT 1")
+        .get(sessionId) as { gen: number } | undefined;
+    if (last === undefined || last.gen === LEDGER_GENERATION) return firstOpSeq;
+    const snapshot = egressStateView(db, sessionId);
+    writeFlowRow(db, sessionId, firstOpSeq, null, "G", null, null, JSON.stringify({ gen: LEDGER_GENERATION, rows: snapshot }), null, LEDGER_GENERATION, nowMs);
+    return firstOpSeq + 1;
 }
 
 /** Write a batch of ops to the FLOW. Every op gets the next op_seq; each I
@@ -606,11 +689,11 @@ function writeFlowOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], fi
             if (op.sysIn !== undefined) payload["sysIn"] = op.sysIn;
             const citedLog = !isSystem && typeof op.num === "number" && op.num > 0 ? op.num : 0;
             const logSeq = isSystem ? 0 : (citedLog > 0 ? citedLog : num);
-            writeFlowRow(db, sessionId, opSeq, logSeq, "I", op.rid, op.msgid, JSON.stringify(payload), op.bytes, nowMs);
+            writeFlowRow(db, sessionId, opSeq, logSeq, "I", op.rid, op.msgid, JSON.stringify(payload), op.bytes, LEDGER_GENERATION, nowMs);
         } else if (op.type === "D") {
             // 2026-11-27: the range endpoints are RIDS (self-issued, never
             // re-issued) — the msgid never indexes the log again.
-            writeFlowRow(db, sessionId, opSeq, null, "D", null, null, JSON.stringify({ start: op.start, end: op.end }), null, nowMs);
+            writeFlowRow(db, sessionId, opSeq, null, "D", null, null, JSON.stringify({ start: op.start, end: op.end }), null, LEDGER_GENERATION, nowMs);
         } else {
             const payload: Record<string, unknown> = { role: op.role };
             if (op.sysIn !== undefined) payload["sysIn"] = op.sysIn;
@@ -618,7 +701,7 @@ function writeFlowOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], fi
                 payload["num"] = op.num;
                 num = Math.max(num, op.num);
             }
-            writeFlowRow(db, sessionId, opSeq, null, "U", op.rid, op.msgid, JSON.stringify(payload), op.bytes, nowMs);
+            writeFlowRow(db, sessionId, opSeq, null, "U", op.rid, op.msgid, JSON.stringify(payload), op.bytes, LEDGER_GENERATION, nowMs);
         }
     }
 }
@@ -636,7 +719,7 @@ function writeFlowOps(db: SqliteDatabase, sessionId: string, ops: EgressOp[], fi
 export function egressMaterializeState(db: SqliteDatabase, sessionId: string, view: EgressViewRow[], nowMs: number): number {
     const anchors = new Map<number, number>();
     for (const r of db
-        .prepare("SELECT rid, log_seq FROM egress_flow WHERE session_id = ? AND row_type = 'I' ORDER BY op_seq ASC")
+        .prepare("SELECT rid, log_seq FROM eg_flow WHERE session_id = ? AND row_type = 'I' ORDER BY op_seq ASC")
         .all(sessionId) as { rid: number | null; log_seq: number | null }[]) {
         if (typeof r.rid !== "number") throw new EgressStateCorruptError(sessionId, `I row has no rid`);
         if (typeof r.log_seq !== "number") throw new EgressStateCorruptError(sessionId, `I row rid ${r.rid} has no log_seq`);
@@ -644,7 +727,7 @@ export function egressMaterializeState(db: SqliteDatabase, sessionId: string, vi
         anchors.set(r.rid, r.log_seq);
     }
     const removed = db
-        .prepare("DELETE FROM egress_state WHERE session_id = ?")
+        .prepare("DELETE FROM eg_state WHERE session_id = ?")
         .run(sessionId) as { changes: number };
     for (let i = 0; i < view.length; i++) {
         const r = view[i];
@@ -704,8 +787,8 @@ export function egressStateView(db: SqliteDatabase, sessionId: string): EgressVi
 function assertStateTwinOfFlow(db: SqliteDatabase, sessionId: string): void {
     const stray = db
         .prepare(
-            `SELECT COUNT(*) AS c FROM egress_state s
-               LEFT JOIN egress_flow f ON f.session_id = s.session_id AND f.rid = s.rid AND f.log_seq = s.log_seq AND f.row_type = 'I'
+            `SELECT COUNT(*) AS c FROM eg_state s
+               LEFT JOIN eg_flow f ON f.session_id = s.session_id AND f.rid = s.rid AND f.log_seq = s.log_seq AND f.row_type = 'I'
               WHERE s.session_id = ? AND f.op_seq IS NULL`,
         )
         .get(sessionId) as { c: number };
@@ -714,8 +797,8 @@ function assertStateTwinOfFlow(db: SqliteDatabase, sessionId: string): void {
     }
     const counts = db
         .prepare(
-            `SELECT (SELECT COUNT(*) FROM egress_state WHERE session_id = ?) AS s,
-                    (SELECT COUNT(*) FROM egress_flow WHERE session_id = ?) AS f`,
+            `SELECT (SELECT COUNT(*) FROM eg_state WHERE session_id = ?) AS s,
+                    (SELECT COUNT(*) FROM eg_flow WHERE session_id = ?) AS f`,
         )
         .get(sessionId, sessionId) as { s: number; f: number };
     if (Number(counts.s) > 0 && Number(counts.f) === 0) {
@@ -794,7 +877,7 @@ function applyOpsToState(db: SqliteDatabase, sessionId: string, ops: EgressOp[],
             if (at === undefined && op.after !== null) throw new EgressStateCorruptError(sessionId, `state apply: insert anchor rid ${op.after} missing`);
             const pos = (at ?? -1) + 1;
             const assign = numOf.get(op.rid) ?? 0;
-            db.prepare("UPDATE egress_state SET pos = pos + 1 WHERE session_id = ? AND pos >= ?").run(sessionId, pos);
+            db.prepare("UPDATE eg_state SET pos = pos + 1 WHERE session_id = ? AND pos >= ?").run(sessionId, pos);
             db.prepare(INSERT_STATE_ROW).run(
                 sessionId, op.rid, op.msgid, pos, assign, assign, op.ref, op.tokens, op.typeTag,
                 op.role ?? null, op.ts ?? null, op.sysIn ?? null, op.bytes, nowMs,
@@ -808,8 +891,8 @@ function applyOpsToState(db: SqliteDatabase, sessionId: string, ops: EgressOp[],
             if (e === undefined) throw new EgressStateCorruptError(sessionId, `state apply: delete end rid ${op.end} missing`);
             if (s > e) throw new EgressStateCorruptError(sessionId, "state apply: delete range inverted");
             const span = e - s + 1;
-            db.prepare("DELETE FROM egress_state WHERE session_id = ? AND pos BETWEEN ? AND ?").run(sessionId, s, e);
-            db.prepare("UPDATE egress_state SET pos = pos - ? WHERE session_id = ? AND pos > ?").run(span, sessionId, e);
+            db.prepare("DELETE FROM eg_state WHERE session_id = ? AND pos BETWEEN ? AND ?").run(sessionId, s, e);
+            db.prepare("UPDATE eg_state SET pos = pos - ? WHERE session_id = ? AND pos > ?").run(span, sessionId, e);
             for (const [k, p] of posOf) {
                 if (p >= s && p <= e) posOf.delete(k);
                 else if (p > e) posOf.set(k, p - span);
@@ -831,7 +914,7 @@ function applyOpsToState(db: SqliteDatabase, sessionId: string, ops: EgressOp[],
                 sets.push("num = ?");
                 params.push(op.num);
             }
-            db.prepare(`UPDATE egress_state SET ${sets.join(", ")} WHERE session_id = ? AND rid = ?`).run(...params, sessionId, op.rid);
+            db.prepare(`UPDATE eg_state SET ${sets.join(", ")} WHERE session_id = ? AND rid = ?`).run(...params, sessionId, op.rid);
         }
     }
 }
@@ -854,15 +937,16 @@ export function egressStateAppend(
     return db.transaction(() => {
         const seqs = nextSeqs(db, sessionId);
         const stamped = egressReplay(egressStateView(db, sessionId), ops, seqs.num - 1, sessionId);
-        writeFlowOps(db, sessionId, ops, seqs.opSeq, seqs.num, nowMs);
+        const firstOpSeq = maybeWriteGenerationBoundary(db, sessionId, seqs.opSeq, nowMs);
+        writeFlowOps(db, sessionId, ops, firstOpSeq, seqs.num, nowMs);
         applyOpsToState(db, sessionId, ops, stamped, nowMs);
         const n = db
-            .prepare("SELECT COUNT(*) AS c FROM egress_state WHERE session_id = ?")
+            .prepare("SELECT COUNT(*) AS c FROM eg_state WHERE session_id = ?")
             .get(sessionId) as { c: number };
         if (Number(n.c) !== stamped.length) {
             throw new EgressStateCorruptError(sessionId, `state apply diverged: ${Number(n.c)} rows but the stamped view has ${stamped.length}`);
         }
-        return Array.from({ length: ops.length }, (_, i) => seqs.opSeq + i);
+        return Array.from({ length: ops.length }, (_, i) => firstOpSeq + i);
     });
 }
 
@@ -891,10 +975,11 @@ export function egressAppendTurn(
             throw new EgressConcurrentWriteError(sessionId, guard.baseSeq, seqs.opSeq - 1);
         }
         const stamped = egressReplay(egressStateView(db, sessionId), ops, seqs.num - 1, sessionId);
-        writeFlowOps(db, sessionId, ops, seqs.opSeq, seqs.num, nowMs);
+        const firstOpSeq = maybeWriteGenerationBoundary(db, sessionId, seqs.opSeq, nowMs);
+        writeFlowOps(db, sessionId, ops, firstOpSeq, seqs.num, nowMs);
         applyOpsToState(db, sessionId, ops, stamped, nowMs);
         const n = db
-            .prepare("SELECT COUNT(*) AS c FROM egress_state WHERE session_id = ?")
+            .prepare("SELECT COUNT(*) AS c FROM eg_state WHERE session_id = ?")
             .get(sessionId) as { c: number };
         if (Number(n.c) !== stamped.length) {
             throw new EgressStateCorruptError(sessionId, `state apply diverged: ${Number(n.c)} rows but the stamped view has ${stamped.length}`);
@@ -909,7 +994,7 @@ export function egressAppendTurn(
 export function egressStateAt(db: SqliteDatabase, sessionId: string, x: number): EgressViewRow[] {
     const rows = db
         .prepare(
-            "SELECT op_seq, log_seq, row_type, rid, msgid, payload, bytes FROM egress_flow WHERE session_id = ? AND op_seq <= ? ORDER BY op_seq ASC",
+            "SELECT op_seq, log_seq, row_type, rid, msgid, payload, bytes, gen FROM eg_flow WHERE session_id = ? AND op_seq <= ? ORDER BY op_seq ASC",
         )
         .all(sessionId, x) as unknown as FlowRow[];
     return applyOps(sessionId, rows);
@@ -929,18 +1014,18 @@ export function egressFork(db: SqliteDatabase, fromSessionId: string, toSessionI
     if (fromSessionId === toSessionId) throw new Error("egressFork: conflicting fork lineage (child equals parent)");
     return db.transaction(() => {
         const n = db
-            .prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ?")
+            .prepare("SELECT COUNT(*) AS c FROM eg_flow WHERE session_id = ?")
             .get(fromSessionId) as { c: number };
         if (Number(n.c) === 0) return 0; // no egress rows — nothing to copy
-        db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(toSessionId);
-        db.prepare("DELETE FROM egress_flow WHERE session_id = ?").run(toSessionId);
+        db.prepare("DELETE FROM eg_state WHERE session_id = ?").run(toSessionId);
+        db.prepare("DELETE FROM eg_flow WHERE session_id = ?").run(toSessionId);
         db.prepare(
-            `INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at)
-             SELECT ?, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at FROM egress_flow WHERE session_id = ?`,
+            `INSERT INTO eg_flow (session_id, op_seq, log_seq, row_type, rid, msgid, payload, bytes, gen, created_at)
+             SELECT ?, op_seq, log_seq, row_type, rid, msgid, payload, bytes, gen, created_at FROM eg_flow WHERE session_id = ?`,
         ).run(toSessionId, fromSessionId);
         db.prepare(
-            `INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at)
-             SELECT ?, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at FROM egress_state WHERE session_id = ?`,
+            `INSERT INTO eg_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at)
+             SELECT ?, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at FROM eg_state WHERE session_id = ?`,
         ).run(toSessionId, fromSessionId);
         // The usage event stream rides with the whole copy (owner ruling:
         // one usage stream per session) — idempotent re-fork: replace.
@@ -1028,12 +1113,22 @@ function applyRow(sessionId: string, view: EgressViewRow[], row: FlowRow): Egres
 
 /** Full-history replay of the flow (op_seq dense from 1 — a jump means a
  * row was lost or removed between two survivors, and every later anchor
- * would refer to a view that never existed). Throws
- * EgressStateCorruptError on any anchor/endpoint/id violation. */
+ * would refer to a view that never existed). 7896: the latest 'G' row in
+ * the prefix is the trust boundary — rows BEFORE it were written by an
+ * older generation and are never judged by this code (its numbering law
+ * may differ); the G snapshot IS the starting view, and density counting
+ * resumes at the G row itself. Throws EgressStateCorruptError on any
+ * anchor/endpoint/id violation (and on a malformed G payload). */
 function applyOps(sessionId: string, rows: FlowRow[]): EgressViewRow[] {
+    let boundary = -1;
+    for (let i = rows.length - 1; i >= 0; i--) {
+        if (rows[i].row_type === "G") { boundary = i; break; }
+    }
     let view: EgressViewRow[] = [];
+    if (boundary >= 0) view = decodeGenSnapshot(sessionId, rows[boundary]);
     let prevSeq: number | null = null;
-    for (const row of rows) {
+    for (let i = boundary + 1; i < rows.length; i++) {
+        const row = rows[i];
         if (typeof row.op_seq !== "number" || (prevSeq !== null && row.op_seq !== prevSeq + 1)) {
             throw new EgressStateCorruptError(sessionId, `op_seq jumps from ${String(prevSeq)} to ${String(row.op_seq)}`);
         }
@@ -1058,12 +1153,30 @@ function applyOps(sessionId: string, rows: FlowRow[]): EgressViewRow[] {
 export function egressFlowWalkBack(db: SqliteDatabase, sessionId: string): { seq: number; view: EgressViewRow[] } | null {
     const rows = db
         .prepare(
-            "SELECT op_seq, log_seq, row_type, rid, msgid, payload, bytes FROM egress_flow WHERE session_id = ? ORDER BY op_seq ASC",
+            "SELECT op_seq, log_seq, row_type, rid, msgid, payload, bytes, gen FROM eg_flow WHERE session_id = ? ORDER BY op_seq ASC",
         )
         .all(sessionId) as unknown as FlowRow[];
+    // 7896 trust boundary (same rule as applyOps): when a G row exists, the
+    // walk starts AFTER it (its snapshot is the starting view; the pre-G rows
+    // are an older generation's and are never applied). A malformed G
+    // payload is a corrupt floor (return null) — the pre-G prefix cannot be
+    // replayed under any law this code knows.
+    let boundary = -1;
+    for (let i = rows.length - 1; i >= 0; i--) {
+        if (rows[i].row_type === "G") { boundary = i; break; }
+    }
     let view: EgressViewRow[] = [];
     let prevSeq: number | null = null;
-    for (let i = 0; i < rows.length; i++) {
+    if (boundary >= 0) {
+        try {
+            view = decodeGenSnapshot(sessionId, rows[boundary]);
+        } catch (err) {
+            if (err instanceof EgressStateCorruptError) return null;
+            throw err;
+        }
+        prevSeq = rows[boundary].op_seq;
+    }
+    for (let i = boundary + 1; i < rows.length; i++) {
         const row = rows[i];
         try {
             if (typeof row.op_seq !== "number" || (prevSeq !== null && row.op_seq !== prevSeq + 1)) {
@@ -1074,7 +1187,7 @@ export function egressFlowWalkBack(db: SqliteDatabase, sessionId: string): { seq
         } catch (err) {
             if (!(err instanceof EgressStateCorruptError)) throw err;
             // Row i does not apply: the newest healthy prefix ends at i-1.
-            if (i > 0 && view.length > 0) {
+            if (i > boundary && view.length > 0) {
                 return { seq: rows[i - 1].op_seq, view };
             }
             return null;

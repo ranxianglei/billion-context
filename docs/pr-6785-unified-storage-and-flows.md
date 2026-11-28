@@ -3,7 +3,7 @@
 > Scope: `2026-11-15_msgid-snapshot-unified` @ `39941c816` (base `origin/master` `b10c1a0d4`).
 > 134 files, +13740/−367. This is the **review-grade** full walkthrough of this PR: four parts (table structure / implementation logic / data flow / switches) plus measured validation and this round's findings and fixes. All line numbers refer to source at head.
 >
-> **Retirement note (post-merge, read before relying on the table list):** as of the #7439 series end-state, `l1_world` is a **degraded placeholder** (R3 latch carrier moved to `sessions.r3_latched_at`; egress-on stage-0 is stateless — #7617), `conversations` is retired for egress-on, and the `fold_journal`/`egress_snapshot` tables were dropped before merge. The current tables — including the `egress_flow`/`egress_state` op log and the `egress_block_flow`/`egress_block_state` dual-clock block log — are documented in [architecture/storage.md](./architecture/storage.md) and the one-stop [egress-plane.md](./egress-plane.md); the retirement register is [deprecations.md](./deprecations.md).
+> **Retirement note (post-merge, read before relying on the table list):** as of the #7439 series end-state, `l1_world` is a **degraded placeholder** (R3 latch carrier moved to `sessions.r3_latched_at`; egress-on stage-0 is stateless — #7617), `conversations` is retired for egress-on, and the `fold_journal`/`egress_snapshot` tables were dropped before merge. The current tables — including the `eg_flow`/`eg_state` op log and the `eg_block_flow`/`eg_block_state` dual-clock block log — are documented in [architecture/storage.md](./architecture/storage.md) and the one-stop [egress-plane.md](./egress-plane.md); the retirement register is [deprecations.md](./deprecations.md).
 
 ---
 
@@ -13,8 +13,8 @@ It turns the two O(full) paths — "recompute the outbound view from scratch eve
 
 | Block | Proposal / origin | Switch (default) |
 |---|---|---|
-| ~~① Snapshot base v2~~ (fold journal + egress-snapshot + scope-rev) | #5874 v2 / #7064 slimming | **RETIRED by this PR** (bc51c9445, 7439 ruling): the plane never shipped — replaced wholesale by the round-2 op log (`egress_state`/`egress_flow`, KDD #23); its stage-0 identity ledger (L1 world / pf pin) stays, but `storage.snapBase.*` is GONE from the config surface — a leftover `snapBase` key in your config is a dead key (ignored) |
-| ② Outbound op-log (egress_state/egress_flow + rebuild-serve + server authority) | Discussion #7398/#7439 | `egressPlane` (0) — ONE switch for the whole new path |
+| ~~① Snapshot base v2~~ (fold journal + egress-snapshot + scope-rev) | #5874 v2 / #7064 slimming | **RETIRED by this PR** (bc51c9445, 7439 ruling): the plane never shipped — replaced wholesale by the round-2 op log (`eg_state`/`eg_flow`, KDD #23); its stage-0 identity ledger (L1 world / pf pin) stays, but `storage.snapBase.*` is GONE from the config surface — a leftover `snapBase` key in your config is a dead key (ignored) |
+| ② Outbound op-log (eg_state/eg_flow + rebuild-serve + server authority) | Discussion #7398/#7439 | `egressPlane` (0) — ONE switch for the whole new path |
 | ③ Full-resend watermark + delta tail slice | #5403/#5418 + this PR | `pluginFullResendWatermark` (5) / `pluginDeltaResend` (0) |
 | ④ Incremental msgid pin (tail-ids tail form) | #7064 §8 | `pluginMsgIdIncremental` (**100**, on by default from this PR) |
 | ⑤ Server-side canonical history GA | #4491 | `pluginLaneServerHistory` (**100**, flipped 0→100 by this PR) |
@@ -103,7 +103,7 @@ PRIMARY KEY (session_id, field)
 
 The field set is **frozen** at slim.ts `ROW_BACKED_KSTATE_FIELDS` (9 fields: tokenSnapshot, tsStamps, lastPassIds, hiddenOrphanRefs, sweptOrphanCallIds, renderDeferredRefs, viewLatches, absorbed, rules); `tests/issue5874-state-fields` pins it.
 
-**egress_state / egress_flow** (schema.ts:508-530, discussion #7398) — the outbound conversation op-log, two structurally identical tables:
+**eg_state / eg_flow** (schema.ts:508-530, discussion #7398) — the outbound conversation op-log, two structurally identical tables:
 
 ```
 session_id TEXT NOT NULL, log_seq INTEGER NOT NULL,
@@ -112,12 +112,12 @@ msgid TEXT,          -- NULL for B/D; required for I/U
 payload TEXT NOT NULL,
 created_at INTEGER NOT NULL,
 PRIMARY KEY (session_id, log_seq)
-+ idx_egress_state_msgid(session_id, msgid)
-+ idx_egress_flow_msgid (session_id, msgid)
++ idx_eg_state_msgid(session_id, msgid)
++ idx_eg_flow_msgid (session_id, msgid)
 ```
 
-- `egress_state` = serving reads + compaction physically trims below the watermark;
-- `egress_flow` = append-only, **never deleted** (any historical log_seq can be rebuilt; rollback is based on this table, not on client resends). A 2026-11-23 build (df7ac0929) made compaction trim this table too ("keeps the newest base row plus everything after it"); the #7439 ruling restored on 2026-11-26 — compaction prunes `egress_state` only, the flow stays append-only.
+- `eg_state` = serving reads + compaction physically trims below the watermark;
+- `eg_flow` = append-only, **never deleted** (any historical log_seq can be rebuilt; rollback is based on this table, not on client resends). A 2026-11-23 build (df7ac0929) made compaction trim this table too ("keeps the newest base row plus everything after it"); the #7439 ruling restored on 2026-11-26 — compaction prunes `eg_state` only, the flow stays append-only.
 
 Row payload contracts (egress-state.ts):
 - `I`: `{"after": msgid|null, "ref", "tokens", "type", "content_hash", "role"?, "cas_ref"?}`
@@ -138,7 +138,7 @@ Row payload contracts (egress-state.ts):
 ### 1.4 MySQL parity (mysql.ts +274)
 
 Ported: `orphan_blocks`, `state_fields`, `ccr_entries.orig_hash` (+ index, probe migration, archive/restore/cascade).
-**Not ported**: `l1_world / fold_journal / egress_snapshot / egress_scope_rev / egress_state / egress_flow` — the snapshot/egress planes are **SQLite-lane only** (shadow.ts `egressOpLogSync()` returns null on the network backend; the recorder skips the whole turn).
+**Not ported**: `l1_world / fold_journal / egress_snapshot / egress_scope_rev / eg_state / eg_flow` — the snapshot/egress planes are **SQLite-lane only** (shadow.ts `egressOpLogSync()` returns null on the network backend; the recorder skips the whole turn).
 
 ---
 
@@ -262,7 +262,7 @@ Fold tx: blocks insert/update + covered rows retired (same tx) + one fold_journa
 
 `deleteSession` (store.ts:~2586): messages/media/blocks/**fold_journal/egress_snapshot/egress_scope_rev/orphan_blocks/state_fields** + dead_refs/refs/ccr_entries/conversations/session_ext/sessions + l1_world (by ledger_id) + CAS release and scoped collection.
 `archiveSession`: same (minus l1_world); the JSONL export is appended **before** COMMIT, state flips to archived.
-**Fixed this round**: both now also sweep `egress_state/egress_flow` (previously leaked ⇒ op-log rows were permanently orphaned, the "storage only grows" p1 class; their CAS-referenced halves are released with them, while message bytes stay held by the messages rows).
+**Fixed this round**: both now also sweep `eg_state/eg_flow` (previously leaked ⇒ op-log rows were permanently orphaned, the "storage only grows" p1 class; their CAS-referenced halves are released with them, while message bytes stay held by the messages rows).
 
 ---
 
@@ -322,7 +322,7 @@ Construction = the user scenario's plugin shape: client history grows from 1 mes
 
 ### 5.3 Findings and fixes this round (minor issues fixed directly, shipped with this report)
 
-1. **[p1 storage-only-grows] deleteSession/archiveSession missed egress_state/egress_flow** ⇒ op-log rows + their CAS references permanently orphaned. Fix: store.ts `deleteEgressOps` + both cascade call sites.
+1. **[p1 storage-only-grows] deleteSession/archiveSession missed eg_state/eg_flow** ⇒ op-log rows + their CAS references permanently orphaned. Fix: store.ts `deleteEgressOps` + both cascade call sites.
 2. **[p1 storage-only-grows] buildEgressViewRows putContent-ed every unchanged row every turn** (CAS refcount +1 per row per turn, no matching release) ⇒ the content store of any egress-keyed session grew without bound. Fix: unchanged rows reuse the prev casRef (missing ones backfilled, changed rows re-put).
 3. **[docs] `docs/proposals/snapshot-compression-foundation/`** described the RETIRED v1 four-table plane (snap_rows/snap_log/snap_ckpt were dropped before merge; the title still claimed "DDL landed in #5901") — contradicts the current v12 shape ⇒ **removed entirely**.
 4. **[docs] `docs/storage-relations.{en,zh}.svg`** was missing 5 new tables, the fold_journal card still listed the dropped covered_ids, the egress_snapshot card still listed ids_json, and the ⑦ cascade card was inaccurate ⇒ **removed**, superseded by this report.
@@ -345,7 +345,7 @@ Construction = the user scenario's plugin shape: client history grows from 1 mes
 ### 6.1 R-A: canonical message numbering (op_seq / log_seq)
 
 - Both egress tables carry TWO keys: `op_seq` (PK, per-table append-only row cursor — the recovery/truncation key) and `log_seq` (canonical message number, **I rows only**; D/U/B rows are NULL). `log_seq` is session-scoped and **never re-issued** (kernel id contract); every I row's `log_seq` = the canonical index of that turn's new row in the live view, stamped at record time — numbering no longer derives from position or from the messages table.
-- `recoverEgressBase` is bounded (the state table is physically compacted); a row-less session bootstraps via a fresh B op; a pinned session with rows but **no healthy point hard-fails the turn** (ruling 7439-5: 500 + `x-bili-egress: unreadable` + `{type:'egress_flow_unreadable'}` via `EgressAuthorityRejectError` — the lane catch no longer swallows it; the session never truncates its own corrupt rows and never re-bootstraps from client bytes).
+- `recoverEgressBase` is bounded (the state table is physically compacted); a row-less session bootstraps via a fresh B op; a pinned session with rows but **no healthy point hard-fails the turn** (ruling 7439-5: 500 + `x-bili-egress: unreadable` + `{type:'eg_flow_unreadable'}` via `EgressAuthorityRejectError` — the lane catch no longer swallows it; the session never truncates its own corrupt rows and never re-bootstraps from client bytes).
 - R-B: fork = `egressFork` whole-table op-log copy (self-fork throws; empty parent no-ops).
 
 ### 6.2 B: in-txn window re-anchor delta (#7474 — the 2s-floor root cause)
@@ -359,7 +359,7 @@ Fix: `planIngestReanchor` + the `ingestSession` re-anchor txn branch. Per window
 For sessions with `metadata.egressAuthority === true` (and `egressPlane` on):
 
 - **No per-turn unified ingest**: `ingestRowsNow` and the debounced unified legs early-return — the `messages` table is demoted to a **lazy projection** for these sessions (rebuilt one-time O(n) on plane rollback / web read / replica restore). Boot after restart still comes from the op log (`recoverEgressBase`), not from the projection.
-- **Pin channel reads the op log**: the KDD #21/#22 pin ledger (tail-overlap / live-id re-stamp) for egress-on sessions resolves from `egress_flow` I rows (msgid + log_seq) instead of the messages ledger (`snapPinLiveIds` shim). Wire unchanged.
+- **Pin channel reads the op log**: the KDD #21/#22 pin ledger (tail-overlap / live-id re-stamp) for egress-on sessions resolves from `eg_flow` I rows (msgid + log_seq) instead of the messages ledger (`snapPinLiveIds` shim). Wire unchanged.
 - **Envelope frozen at bootstrap** (`d28d9ff3a`): no per-turn read+rewrite of the 15.5MB growing session JSON (kernel refs are never pruned — messageRefs 10MB + tsStamps 5.5MB at 100k); the frozen route must keep the resident fields unthinned (`9183ea817`, #4788 D2) or the pinned turn 502s.
 - **Verification**: the egress probe (flow vs client sample) is the SOLE drift verifier for egress-on sessions — `BatchedViewVerification` is off for them (`13b9baae2`): the client-vs-canonical leg would only measure the known server-wins divergence (ruling 7439-5) and re-latch drift forever.
 - Flow-corruption semantics: HARD FAIL, no projection fallback for outbound — flow and messages die together anyway (flow independence, ruling 7439-2 §2).
@@ -375,7 +375,7 @@ For sessions with `metadata.egressAuthority === true` (and `egressPlane` on):
 | ep18 / ep20 | ON merged | dbf4b140b | 730 / 761 · **638 / 655 ms** | 462 / 456 s |
 | ep22 | OFF merged | dbf4b140b | 2016 / 2957 ms | 1070 s |
 
-**Acceptance `<1s` @ 10w cumulative met by the ON arm (638 ms p50, 9× faster than pre-fix); ON is now faster than the same-build OFF arm.** ep20 DB: no JSON envelope, messages table 0 rows for the egress-on session, egress_flow 1 row/turn, state 25 rows bounded, WAL capped at 8 MiB (journal_size_limit). The OFF-arm floor (~2s) is the pre-PR #5744 family (per-turn full read+rewrite of the growing JSON envelope + 244MB DB fsync) — out of scope per the single-switch ruling. The ep14c-era 2.2GB WAL anomaly was a pre-WAL-cap build; post-cap builds hold 8 MiB.
+**Acceptance `<1s` @ 10w cumulative met by the ON arm (638 ms p50, 9× faster than pre-fix); ON is now faster than the same-build OFF arm.** ep20 DB: no JSON envelope, messages table 0 rows for the egress-on session, eg_flow 1 row/turn, state 25 rows bounded, WAL capped at 8 MiB (journal_size_limit). The OFF-arm floor (~2s) is the pre-PR #5744 family (per-turn full read+rewrite of the growing JSON envelope + 244MB DB fsync) — out of scope per the single-switch ruling. The ep14c-era 2.2GB WAL anomaly was a pre-WAL-cap build; post-cap builds hold 8 MiB.
 
 ### 6.5 Resident perf gate (ruling: e2e bench ×3, ≤+20% over baseline)
 
@@ -413,7 +413,7 @@ A request of 1 MiB or more that carries an `x-bili-pf-*` header has its JSON dec
 - **Walking back** (and truncating after the last healthy point) happens only when the log really does not replay, and only for authority sessions. A busy/locked/I/O error is passed on and deletes nothing.
 - **Two requests on one session.** The writer whose turn started on an older log is refused (`EgressConcurrentWriteError`) and its turn is served unrecorded. A batch that would break the log is refused before anything is written.
 - **Compaction.** A turn that deletes compacts in the same write. The compaction trims the **state** table below the new base row; the **flow** table keeps every row it ever wrote (append-only, #7439 ruling — restored 2026-11-26 after a 2026-11-23 build pruned it below the newest base), so `egressStateAt` rebuilds any historical point. Growth is a deferred optimization (#7475), addressed elsewhere, never by retention.
-- **The serving copy** (`egress_state`) is compared with the log on every read; a damaged copy is copied again from the log, a hole in the log is reported.
+- **The serving copy** (`eg_state`) is compared with the log on every read; a damaged copy is copied again from the log, a hole in the log is reported.
 - **`after: null` on a non-empty view means "the new first row"**, in both replays. (Before: validation put it first, storage put it last, and the next turn paid a delete-and-insert rewrite.)
 - **Plane off** = nothing reads the op log, even for sessions that have one: the pin ledger reads `messages`, the drift checks are off.
 

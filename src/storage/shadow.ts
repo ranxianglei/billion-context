@@ -437,6 +437,10 @@ export class UnifiedShadow {
                     // asserting the LEGACY table shape while egressPlane=1
                     // simulate a pre-gate DB and set it — production never does.
                     legacyTables: !egressPlaneGateOn() || !!process.env.BILI_TEST_FORCE_FULL_DDL,
+                    // discussions/7896: the egress family follows its OWN
+                    // gate — egressPlane off = the eg_* tables do not exist
+                    // on this database at all (converged on every open).
+                    egressTables: egressPlaneGateOn() || !!process.env.BILI_TEST_FORCE_FULL_DDL,
                 });
             } catch (err) {
                 // #4175: anything else throwing StorageIntegrityError means quick_check

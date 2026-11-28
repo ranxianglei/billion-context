@@ -36,6 +36,6 @@
 | [auto-merge-guardrails](auto-merge-guardrails.md) | Evidence appendix behind §7 of `AGENTS.md` (AI auto-dev review history) |
 | [unified-loop-spec](unified-loop-spec.md) | Historical design: unified compress-loop spec (implemented; code is the source of truth) |
 | [PR #6785 in depth](pr-6785-unified-storage-and-flows.md) / [中文](pr-6785-unified-storage-and-flows.zh-CN.md) | Review-grade walkthrough of PR #6785: unified-storage tables (schema v12) / implementation logic / per-turn data flow / full switch ledger + measured validation (#5874/#7064/#7398/#4491) + round 2: op-log canonical numbering, lazy projection, window re-anchor, resident perf gate (KDD #23) |
-| [egress block flow](egress-block-flow.md) / [中文](egress-block-flow.zh-CN.md) | Block canonical history + checkpoint retirement (#7577): `egress_block_flow`/`egress_block_state` tables, kstate sidecar, point-fork, kstate trim |
+| [egress block flow](egress-block-flow.md) / [中文](egress-block-flow.zh-CN.md) | Block canonical history + checkpoint retirement (#7577): `eg_block_flow`/`eg_block_state` tables, kstate sidecar, point-fork, kstate trim |
 | [egress plane](egress-plane.md) / [中文](egress-plane.zh-CN.md) | The egress plane one-stop: design lineage (#7439→#7581→#7617), dual clocks, identity consolidation, switch dependency + on/off resolution order, operator runbook |
 | [deprecations](deprecations.md) / [中文](deprecations.zh-CN.md) | Retirement register: l1 placeholder, conversations, D-lane trigger conditions, msgid switch removals, physical DROP batch |

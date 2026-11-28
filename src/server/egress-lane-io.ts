@@ -278,12 +278,12 @@ export function resolveEgressAuthority(args: {
     // its flow rows accumulated). Idempotent upsert = self-healing +
     // updated_at keeps the sessions row fresh. Best-effort: a failure
     // degrades to the existing fallback (isEgressOnSession probes
-    // egress_flow directly) — it never fails the request.
+    // eg_flow directly) — it never fails the request.
     if (armed || session.metadata["egressAuthority"] === true) {
         try {
         st.ensureEgressIdentity?.(buildEgressIdentityInput(session));
         } catch (err) {
-            log("warn", `[${sessionId}] egress: identity row upsert failed (best-effort; the egress_flow probe still covers identity): ${String((err as { message?: unknown })?.message ?? err).slice(0, 200)}`);
+            log("warn", `[${sessionId}] egress: identity row upsert failed (best-effort; the eg_flow probe still covers identity): ${String((err as { message?: unknown })?.message ?? err).slice(0, 200)}`);
         }
     }
     if (!armed) {
@@ -356,7 +356,7 @@ export function recordAuthorityTurn(
 /**
  * #7439 follow-up (C6): egress-on sequence authority. For a session the
  * op log records, the FLOW is the transcript: each core carries its
- * canonical message number (egress_flow.log_seq — the renumbered citation
+ * canonical message number (eg_flow.log_seq — the renumbered citation
  * space: the system row is 0, the first real message 1) as `ledgerSeq`, the
  * same display space the kernel's refs/prune/sync/compress consume (CoreMessage
  * .ledgerSeq, refs #4316 L3). Block coordinates resolved from the same flow

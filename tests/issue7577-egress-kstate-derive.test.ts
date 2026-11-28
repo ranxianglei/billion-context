@@ -99,8 +99,8 @@ test("a corrupt egress log derives null — it never throws into the load path",
         // damage the log so the serving read goes to the rebuild path and
         // the rebuild replay meets the damaged row: a structurally stray
         // state row (pos density breaks) + an unreplayable flow payload
-        h.db.prepare(`INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 9)`).run(sid);
-        h.db.prepare(`UPDATE egress_flow SET payload = 'not-json' WHERE session_id = ? AND row_type = 'I'`).run(sid);
+        h.db.prepare(`INSERT INTO eg_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 9)`).run(sid);
+        h.db.prepare(`UPDATE eg_flow SET payload = 'not-json' WHERE session_id = ? AND row_type = 'I'`).run(sid);
         assert.equal(h.store.egressTsStamps(sid), null);
     } finally { closeH(h); }
 });

@@ -3,8 +3,8 @@
 //
 // 1. The egress op-log group is two tables plus two indexes. It used to be
 //    executed bare, so a crash after the first CREATE left a library with
-//    egress_state and no egress_flow — and because the next open probed
-//    only egress_state, the half-built pair never completed. The group is
+//    eg_state and no eg_flow — and because the next open probed
+//    only eg_state, the half-built pair never completed. The group is
 //    now applied in one transaction and the probe asks for both tables, so
 //    a library that was interrupted by the old code converges on its next
 //    open.
@@ -44,7 +44,7 @@ test("#7574 a library interrupted between the two egress tables completes on its
     try {
         // The state a mid-PR dev build left behind: the first CREATE of the
         // batch committed, the process died before the second one.
-        db.exec(`CREATE TABLE egress_state (
+        db.exec(`CREATE TABLE eg_state (
             session_id TEXT NOT NULL,
             op_seq INTEGER NOT NULL,
             log_seq INTEGER,
@@ -55,29 +55,29 @@ test("#7574 a library interrupted between the two egress tables completes on its
             created_at INTEGER NOT NULL,
             PRIMARY KEY (session_id, op_seq)
         )`);
-        db.prepare("INSERT INTO egress_state VALUES ('s1', 1, 1, 'B', 'm1', '{}', NULL, 0)").run();
-        assert.ok(!tables(db).includes("egress_flow"), "precondition: the pair is half-built");
+        db.prepare("INSERT INTO eg_state VALUES ('s1', 1, 1, 'B', 'm1', '{}', NULL, 0)").run();
+        assert.ok(!tables(db).includes("eg_flow"), "precondition: the pair is half-built");
 
         migrateSchema(db);
 
         const names = tables(db);
-        assert.ok(names.includes("egress_state"), "egress_state is still there");
-        assert.ok(names.includes("egress_flow"), "the missing egress_flow is created");
-        const idx = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_egress_state_msgid', 'idx_egress_flow_msgid') ORDER BY name").all() as unknown as { name: string }[])
+        assert.ok(names.includes("eg_state"), "eg_state is still there");
+        assert.ok(names.includes("eg_flow"), "the missing eg_flow is created");
+        const idx = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_eg_state_msgid', 'idx_eg_flow_msgid') ORDER BY name").all() as unknown as { name: string }[])
             .map((r) => r.name);
-        assert.deepEqual(idx, ["idx_egress_flow_msgid", "idx_egress_state_msgid"], "both msgid lookup indexes exist (PK is now (session_id, rid) — 2026-11-27 owner ruling)");
+        assert.deepEqual(idx, ["idx_eg_flow_msgid", "idx_eg_state_msgid"], "both msgid lookup indexes exist (PK is now (session_id, rid) — 2026-11-27 owner ruling)");
         assert.ok(
-            (db.prepare("SELECT COUNT(*) AS n FROM pragma_table_info('egress_state') WHERE name = 'pos'").get() as { n: number }).n === 1,
+            (db.prepare("SELECT COUNT(*) AS n FROM pragma_table_info('eg_state') WHERE name = 'pos'").get() as { n: number }).n === 1,
             "the rebuilt state table carries the 7773 materialized shape (pos column)",
         );
         assert.equal(
-            (db.prepare("SELECT COUNT(*) AS n FROM egress_state").get() as { n: number }).n,
+            (db.prepare("SELECT COUNT(*) AS n FROM eg_state").get() as { n: number }).n,
             0,
             "7773 §7: the tables were never released — the interim rows are dropped, not migrated",
         );
         // Idempotent: the next open is a no-op for the group.
         migrateSchema(db);
-        assert.ok(tables(db).includes("egress_flow"));
+        assert.ok(tables(db).includes("eg_flow"));
     } finally {
         db.close();
         fs.rmSync(path.dirname(file), { recursive: true, force: true });
@@ -131,7 +131,7 @@ test("#7574 a database born on this build is unchanged by the two probes", () =>
         const res = migrateSchema(db);
         assert.equal(res.from, 0);
         const names = tables(db);
-        for (const t of ["egress_state", "egress_flow", "conversations", "state_fields", "orphan_blocks", "l1_world"]) {
+        for (const t of ["eg_state", "eg_flow", "conversations", "state_fields", "orphan_blocks", "l1_world"]) {
             assert.ok(names.includes(t), `fresh library has ${t}`);
         }
         assert.match(plan(db, "SELECT conversation_id FROM conversations WHERE session_id = 's7'"), /idx_conversations_session/);

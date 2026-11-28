@@ -72,8 +72,8 @@ function close(H: Harness): void {
 
 /** the two planes, by what each table says: the state's live msgids in pos order and the flow's row types in op_seq order */
 function shape(H: Harness, S: string): { state: string[]; flow: string[] } {
-    const state = (H.db.prepare("SELECT msgid FROM egress_state WHERE session_id = ? ORDER BY pos").all(S) as { msgid: string }[]).map((r) => r.msgid);
-    const flow = (H.db.prepare("SELECT row_type FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all(S) as { row_type: string }[]).map((r) => r.row_type);
+    const state = (H.db.prepare("SELECT msgid FROM eg_state WHERE session_id = ? ORDER BY pos").all(S) as { msgid: string }[]).map((r) => r.msgid);
+    const flow = (H.db.prepare("SELECT row_type FROM eg_flow WHERE session_id = ? ORDER BY op_seq").all(S) as { row_type: string }[]).map((r) => r.row_type);
     return { state, flow };
 }
 
@@ -169,19 +169,19 @@ test("the materialized state is healed by a full-history replay; a state row the
         const max = H.store.egressStateMaxSeq(S);
         // 1. the state alone is damaged (an orphan row): the self-healing
         //    read replays the flow and rebuilds the state in place
-        H.db.prepare("INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 9)")
+        H.db.prepare("INSERT INTO eg_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 9)")
             .run(S);
         assert.deepEqual(ids(H.store.egressStateView(S)), good, "the read answers from the flow, healed");
         assert.equal(H.store.egressStateMaxSeq(S), max, "the flow is untouched");
         assert.deepEqual(shape(H, S).state, good, "the orphan row was removed when the state was rebuilt");
         // 2. the state alone runs AHEAD of the flow (a write that reached
         //    one table): the row the flow does not carry is not served
-        H.db.prepare("INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 9, 9, 'm00009', 1, 'text', 'user', 0, 0, 'x', 9)")
+        H.db.prepare("INSERT INTO eg_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 9, 9, 'm00009', 1, 'text', 'user', 0, 0, 'x', 9)")
             .run(S);
         assert.deepEqual(ids(H.store.egressStateView(S)), good, "a row the flow does not have is not served");
         assert.deepEqual(shape(H, S).state, good, "the state is the flow, row for row");
         // 3. the FLOW itself has a hole: reported, nothing is deleted
-        H.db.prepare("DELETE FROM egress_flow WHERE session_id = ? AND op_seq = 2").run(S);
+        H.db.prepare("DELETE FROM eg_flow WHERE session_id = ? AND op_seq = 2").run(S);
         assert.throws(() => H.store.egressStateView(S), (e: unknown) => e instanceof EgressStateCorruptError && /op_seq jumps from 1 to 3/.test(e.message));
         assert.equal(H.store.egressStateMaxSeq(S), max, "a corrupt flow is left as it is");
     } finally {
@@ -194,12 +194,12 @@ test("the rebuild replays the flow row for row and leaves nothing of the old sta
     try {
         const S = "s-rebuild";
         const view = recordEgressTurn({ store: H.ops, sessionId: S, prev: undefined, conversation: [M("a", "1"), M("b", "2")], systemText: "sys", nowMs: 1 });
-        H.db.prepare("DELETE FROM egress_state WHERE session_id = ?").run(S);
-        H.db.prepare("INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 9)")
+        H.db.prepare("DELETE FROM eg_state WHERE session_id = ?").run(S);
+        H.db.prepare("INSERT INTO eg_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 9)")
             .run(S);
         const rebuilt = egressRebuildState(H.db, S);
         assert.deepEqual(rebuilt, view, "the view comes back from the flow");
-        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_state WHERE session_id = ?").get(S) as { c: number }).c, view.length, "the state is the replay, row for row");
+        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM eg_state WHERE session_id = ?").get(S) as { c: number }).c, view.length, "the state is the replay, row for row");
         assert.deepEqual(ids(H.store.egressStateView(S)), ids(view), "and the read serves it");
     } finally {
         close(H);

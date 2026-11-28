@@ -140,7 +140,7 @@ const bm = (id: string): BiliMessage => ({ id, role: "user", content: [{ type: "
 const STAGE0_BASE = { lane: "openai", incomingSeqs: null, log: () => {} } as const;
 
 const L1_COUNT = (db: Db, sid: string) => (db.prepare("SELECT count(*) AS n FROM l1_world WHERE sess_raw = ?").get(sid) as { n: number }).n;
-const FLOW_SEQS = (db: Db, sid: string) => (db.prepare("SELECT op_seq FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all(sid) as { op_seq: number }[]).map((r) => r.op_seq);
+const FLOW_SEQS = (db: Db, sid: string) => (db.prepare("SELECT op_seq FROM eg_flow WHERE session_id = ? ORDER BY op_seq").all(sid) as { op_seq: number }[]).map((r) => r.op_seq);
 const assertDense = (seqs: number[]) => {
     for (let i = 1; i < seqs.length; i++) {
         assert.equal(seqs[i], seqs[i - 1]! + 1, `flow stays dense at op ${seqs[i]}`);
@@ -287,16 +287,16 @@ test("C: after a REAL kernel fold the position frontier is MAX(log_seq), not the
         // ever wrote, so raw MAX(log_seq) IS the frontier.
         const view = egressStateView(vd(), sid);
         assert.equal(view.length, 51, "system row + the folded 50 — the live view SHRANK");
-        const flowTypes = (vd().prepare("SELECT row_type FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all(sid) as { row_type: string }[]).map((r) => r.row_type);
+        const flowTypes = (vd().prepare("SELECT row_type FROM eg_flow WHERE session_id = ? ORDER BY op_seq").all(sid) as { row_type: string }[]).map((r) => r.row_type);
         // the flow keeps everything (append-only, #7439): turn 1's 81 I rows
         // intact, then the fold's ops (the -D range for the covered originals,
         // the -U re-renders of the 49 survivors, the -I summary). The STATE
         // table in contrast holds the materialized live view (7773).
         const expectedFlowTypes = [...Array(81).fill("I"), "D", ...Array(49).fill("U"), "I"] as string[];
         assert.deepEqual(flowTypes, expectedFlowTypes, "the flow keeps everything (append-only, #7439): turn 1's 81 I rows, then the fold's ops (1 D for the covered range, 49 U re-renders of the survivors, 1 I summary) — the state plane is materialized, no base row");
-        const stateRows = (vd().prepare("SELECT COUNT(*) AS n FROM egress_state WHERE session_id = ?").get(sid) as { n: number }).n;
+        const stateRows = (vd().prepare("SELECT COUNT(*) AS n FROM eg_state WHERE session_id = ?").get(sid) as { n: number }).n;
         assert.equal(stateRows, 51, "the state table is the materialized live view (7773) — 51 live rows, no op copies, no base row");
-        const highWater = (vd().prepare("SELECT COALESCE(MAX(log_seq), 0) AS m FROM egress_flow WHERE session_id = ?").get(sid) as { m: number }).m;
+        const highWater = (vd().prepare("SELECT COALESCE(MAX(log_seq), 0) AS m FROM eg_flow WHERE session_id = ?").get(sid) as { m: number }).m;
         assert.equal(highWater, 81, "the system row is 0, the 80 originals 1..80, the fold's summary I-row 81 — the flow's MAX(log_seq) IS the frontier");
 
         // a steady-state turn echoing three LIVE ids: the verdict carries the
@@ -424,7 +424,7 @@ test("E: GC and manual archive — the idle egress-on session with a recent op l
         const status = (s: string) => (vd().prepare("SELECT status FROM sessions WHERE session_id = ?").get(s) as { status: string }).status;
         assert.equal(status(lSid), "archived", "legacy twin archived by the age sweep");
         assert.equal(status(eSid), "active", "the egress-on session survived — freshness = the op log (its updated_at alone would have archived it pre-fix)");
-        assert.equal((vd().prepare("SELECT count(*) AS n FROM egress_flow WHERE session_id = ?").get(eSid) as { n: number }).n, 2, "its op log is intact");
+        assert.equal((vd().prepare("SELECT count(*) AS n FROM eg_flow WHERE session_id = ?").get(eSid) as { n: number }).n, 2, "its op log is intact");
 
         // ---- manual archive (bili sessions archive) -----------------------
         const refused = store.unifiedArchiveSession(eSid);

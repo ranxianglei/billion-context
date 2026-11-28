@@ -6,7 +6,7 @@
  *   1. three recorded turns (append / fold / edit) leave the content table
  *      EMPTY and every view row carries its bytes inline; replayed views
  *      stay byte-equal across turns;
- *   2. deleteSession cascades egress_state/egress_flow — the tables are now
+ *   2. deleteSession cascades eg_state/eg_flow — the tables are now
  *      plain rows (no CAS refs to release), and the session disappears
  *      atomically.
  * Both directions asserted (#3617): the content table IS untouched on the
@@ -75,7 +75,7 @@ test("recording is content-table-free: rows carry bytes, content stays empty, re
     }
 });
 
-test("deleteSession cascades egress_state/egress_flow (plain rows, no CAS to release)", () => {
+test("deleteSession cascades eg_state/eg_flow (plain rows, no CAS to release)", () => {
     const dir = mkdtempSync(join(tmpdir(), "bili-egress-lifecycle-"));
     const store = UnifiedStore.open(join(dir, "index.db"));
     try {
@@ -90,16 +90,16 @@ test("deleteSession cascades egress_state/egress_flow (plain rows, no CAS to rel
             { type: "U", rid: 2, msgid: "m2", bytes: '{"id":"m2","role":"user","text":"beta!"}', role: "user" },
         ], Date.now());
         const count = (t: string) => (db.prepare(`SELECT count(*) AS n FROM ${t}`).get() as { n: number }).n;
-        assert.equal(count("egress_flow"), 4, "the flow keeps every op (append-only)");
-        assert.equal(count("egress_state"), 1, "the state plane is materialized — the live rows only (7773)");
+        assert.equal(count("eg_flow"), 4, "the flow keeps every op (append-only)");
+        assert.equal(count("eg_state"), 1, "the state plane is materialized — the live rows only (7773)");
         const v = egressStateView(db, sid);
         assert.deepEqual(v.map((r) => r.msgid), ["m2"]);
         assert.equal(v[0].bytes, '{"id":"m2","role":"user","text":"beta!"}', "the +U replaced the bytes in place");
 
         store.deleteSession(sid);
 
-        assert.equal(count("egress_state"), 0, "egress_state rows cascade-deleted");
-        assert.equal(count("egress_flow"), 0, "egress_flow rows cascade-deleted");
+        assert.equal(count("eg_state"), 0, "eg_state rows cascade-deleted");
+        assert.equal(count("eg_flow"), 0, "eg_flow rows cascade-deleted");
     } finally {
         try { store.close(); } catch { /* already closed */ }
         try {

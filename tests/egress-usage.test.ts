@@ -1,7 +1,7 @@
 /**
  * egress usage plane (8th egress table, owner ruling 2026-11-27) — the cache
  * ledger is in-memory; on a 7+1-table instance it survives a restart ONLY
- * through the egress_usage event stream (M/S/F rows), replayed on load.
+ * through the eg_usage event stream (M/S/F rows), replayed on load.
  *
  * Coverage:
  *   A. storage layer — table creation, append/op_seq, rows, fork copy
@@ -146,13 +146,13 @@ const FOLDS: Array<{ id: string; at: number; S: number; sigmaChars: number; star
 // A: storage layer
 // ---------------------------------------------------------------------------
 
-test("A1: a fresh eg-mode database carries the egress_usage table (the 8th egress table)", () => {
+test("A1: a fresh eg-mode database carries the eg_usage table (the 8th egress table)", () => {
     const dir = mkdtempSync(join(testRoot, "a1-"));
     const store = openEgStore(dir);
     const db = (store as unknown as { db: Parameters<typeof egressUsageAppend>[0] }).db;
-    const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'egress%'").all() as { name: string }[]).map((r) => r.name).sort();
-    assert.deepEqual(tables, ["egress_block_flow", "egress_block_state", "egress_flow", "egress_state", "egress_usage"].sort());
-    const idx = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_egress_usage_at'").all() as unknown[]).length;
+    const tables = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('eg_block_flow', 'eg_block_state', 'eg_flow', 'eg_state', 'eg_usage')").all() as { name: string }[]).map((r) => r.name).sort();
+    assert.deepEqual(tables, ["eg_block_flow", "eg_block_state", "eg_flow", "eg_state", "eg_usage"].sort());
+    const idx = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_eg_usage_at'").all() as unknown[]).length;
     assert.equal(idx, 1, "the (session_id, at, op_seq) index exists");
 });
 
@@ -479,7 +479,7 @@ test("D3: a corrupt stream degrades to an empty ledger with a warn (never a thro
             store.ensureEgressIdentity(identityInput("d3-s1"));
             // raw SQL: a payload that is not JSON at all
             (store as unknown as { db: Parameters<typeof egressUsageAppend>[0] }).db
-                .prepare("INSERT INTO egress_usage (session_id, op_seq, row_type, at, payload, created_at) VALUES ('d3-s1', 1, 'S', ?, 'not-json', 1)")
+                .prepare("INSERT INTO eg_usage (session_id, op_seq, row_type, at, payload, created_at) VALUES ('d3-s1', 1, 'S', ?, 'not-json', 1)")
                 .run(T0);
             const sess = new SessionStore({ dir: sdir, enabled: true, debounceMs: 15 });
             _setStoreForTest(sess);

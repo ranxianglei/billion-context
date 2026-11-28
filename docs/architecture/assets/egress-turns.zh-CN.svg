@@ -43,7 +43,7 @@
 <text x="702" y="335" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">无逐轮统一 ingest（KDD #23）</text>
 <rect x="1000" y="70" width="200" height="190" rx="8" fill="#e8f6ec" stroke="#3a5a8a" stroke-width="1.5"/>
 <text x="1012" y="90" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">⑦ 重启 / 恢复</text>
-<text x="1012" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">重放 flow → egress_state（有界）</text>
+<text x="1012" y="110" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">重放 flow → eg_state（有界）</text>
 <text x="1012" y="125" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">tsStamps/token 统计从重放推导</text>
 <text x="1012" y="140" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">kstate 只留残差清单</text>
 <text x="1012" y="155" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">尾部损坏：recoverEgressBase</text>
@@ -51,8 +51,8 @@
 <text x="1012" y="185" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">无健康点 ⇒ 响亮硬失败（7439-5）</text>
 <rect x="1000" y="300" width="200" height="110" rx="8" fill="#fff6e6" stroke="#3a5a8a" stroke-width="1.5"/>
 <text x="1012" y="320" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="14" font-weight="bold" fill="#1a2b4a">表（见 egress-tables 图）</text>
-<text x="1012" y="340" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress_flow / egress_state</text>
-<text x="1012" y="355" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">egress_block_flow / _state</text>
+<text x="1012" y="340" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">eg_flow / eg_state</text>
+<text x="1012" y="355" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">eg_block_flow / _state</text>
 <text x="1012" y="370" font-family="Noto Sans CJK SC,Helvetica,Arial,sans-serif" font-size="11.5" fill="#333">每轮写 = 仅新增行</text>
 <line x1="280" y1="150" x2="340" y2="155" stroke="#3a5a8a" stroke-width="1.8" marker-end="url(#ah)"/>
 

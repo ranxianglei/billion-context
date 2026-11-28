@@ -54,9 +54,9 @@ function open(): Harness {
         egressAppendTurn: (sid, ops, baseSeq, nowMs) => egressAppendTurn(db, sid, ops, nowMs, { baseSeq }),
         egressStateView: (sid) => egressStateRead(db, sid),
         egressStateViewAt: (sid, seq) => egressStateAt(db, sid, seq),
-        egressStateMaxSeq: (sid) => (db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx,
+        egressStateMaxSeq: (sid) => (db.prepare(`SELECT COALESCE(MAX(op_seq), 0) AS mx FROM eg_flow WHERE session_id = ?`).get(sid) as { mx: number }).mx,
         egressStateTruncateAfter: (sid, seq) => {
-            const b = db.prepare(`DELETE FROM egress_flow WHERE session_id = ? AND op_seq > ?`).run(sid, seq);
+            const b = db.prepare(`DELETE FROM eg_flow WHERE session_id = ? AND op_seq > ?`).run(sid, seq);
             egressMaterializeState(db, sid, egressStateAt(db, sid, seq), Date.now());
             return Number(b.changes);
         },
@@ -130,7 +130,7 @@ test("recording: turn1 = full +I batch; turn2 tail append = exactly one +I", () 
         const t1 = [M("a", "one"), M("b", "two", "assistant")];
         let view = recordEgressTurn({ store: H.store, sessionId: S, prev: undefined, conversation: t1, systemText: "SYS", nowMs: 1000 });
         assert.equal(view.length, 3);
-        let rows = H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ?").get(S) as { c: number };
+        let rows = H.db.prepare("SELECT COUNT(*) AS c FROM eg_flow WHERE session_id = ?").get(S) as { c: number };
         assert.equal(rows.c, 3, "flow has one +I row per view row");
         assert.equal(view.every((r) => r.ref === "" || /^m\d{4,}$/.test(r.ref)), true);
 
@@ -138,9 +138,9 @@ test("recording: turn1 = full +I batch; turn2 tail append = exactly one +I", () 
         view = recordEgressTurn({ store: H.store, sessionId: S, prev: view, conversation: t2, systemText: "SYS", nowMs: 2000 });
         // Renumber (2026-11-25): turn1's rows are system=0, a=1, b=2 (the
         // system row no longer consumes number 1) — the new tail row is 3.
-        const added = H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ? AND log_seq > 2").get(S) as { c: number };
+        const added = H.db.prepare("SELECT COUNT(*) AS c FROM eg_flow WHERE session_id = ? AND log_seq > 2").get(S) as { c: number };
         assert.equal(added.c, 1, "tail append records exactly ONE new op row");
-        const last = H.db.prepare("SELECT row_type, msgid FROM egress_flow WHERE session_id = ? ORDER BY log_seq DESC LIMIT 1").get(S) as { row_type: string; msgid: string };
+        const last = H.db.prepare("SELECT row_type, msgid FROM eg_flow WHERE session_id = ? ORDER BY log_seq DESC LIMIT 1").get(S) as { row_type: string; msgid: string };
         assert.deepEqual({ row_type: last.row_type, msgid: last.msgid }, { row_type: "I", msgid: "c" });
         assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), [EGRESS_SYSTEM_MSGID, "a", "b", "c"]);
     } finally {
@@ -176,9 +176,9 @@ test("recording: fold shape = -D range + +I summary, state rows physically delet
         assert.equal(view.length, 4);
         // state = the live view exactly: 4 rows (system + a + summary + e),
         // b..d physically gone in the same write as the ops
-        const stateCount = H.db.prepare("SELECT COUNT(*) AS c FROM egress_state WHERE session_id = ?").get(S) as { c: number };
+        const stateCount = H.db.prepare("SELECT COUNT(*) AS c FROM eg_state WHERE session_id = ?").get(S) as { c: number };
         assert.equal(stateCount.c, 4, "the state table holds only the live rows");
-        const flowRows = H.db.prepare("SELECT row_type FROM egress_flow WHERE session_id = ? ORDER BY op_seq").all(S) as { row_type: string }[];
+        const flowRows = H.db.prepare("SELECT row_type FROM eg_flow WHERE session_id = ? ORDER BY op_seq").all(S) as { row_type: string }[];
         assert.deepEqual(flowRows.map((r) => r.row_type), ["I", "I", "I", "I", "I", "I", "D", "I"], "the flow is append-only: turn 1's six +I rows (system + a..e), then the fold's D + I — no B row in this form (7773)");
         assert.equal(egressStateView(H.db, S).length, 4, "view has the system row + a + summary + e");
         assert.deepEqual(egressStateView(H.db, S).map((r) => r.msgid), view.map((r) => r.msgid), "view survives the fold byte-identical");
@@ -194,7 +194,7 @@ test("recording: content edit of one row = exactly one +U, no D/I churn", () => 
         const store = H.store;
         let view = recordEgressTurn({ store, sessionId: S, prev: undefined, conversation: [M("a", "1"), M("b", "2", "assistant"), M("c", "3")], systemText: "SYS", nowMs: 1000 });
         view = recordEgressTurn({ store, sessionId: S, prev: view, conversation: [M("a", "1"), M("b", "2-edited", "assistant"), M("c", "3")], systemText: "SYS", nowMs: 2000 });
-        const rows = H.db.prepare("SELECT row_type, msgid FROM egress_flow WHERE session_id = ? AND op_seq > 4").all(S) as { row_type: string; msgid: string | null }[];
+        const rows = H.db.prepare("SELECT row_type, msgid FROM eg_flow WHERE session_id = ? AND op_seq > 4").all(S) as { row_type: string; msgid: string | null }[];
         assert.equal(rows.length, 1, "exactly one op");
         assert.equal(rows[0].row_type, "U", "it is a +U");
         assert.equal(rows[0].msgid, "b", "targeting the edited row");
@@ -216,7 +216,7 @@ test("recording: nudge-shaped churn is EXCLUDED (ephemeral rows never recorded)"
         // nudge is appended AFTER this seam by design, so it is structurally
         // absent; pin that the recorder's contract is the kernel view shape:
         view = recordEgressTurn({ store, sessionId: S, prev: view, conversation: [M("a", "1"), M("b", "2", "assistant")], systemText: "SYS", nowMs: 2000 });
-        const added = H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ? AND log_seq > 3").get(S) as { c: number };
+        const added = H.db.prepare("SELECT COUNT(*) AS c FROM eg_flow WHERE session_id = ? AND log_seq > 3").get(S) as { c: number };
         assert.equal(added.c, 0, "identical view → zero ops");
     } finally {
         close(H);
@@ -248,7 +248,7 @@ test("recording with refs ledger: protection rows lose their dense numbers and t
         assert.equal(byMsg.get("p1"), 0, "p1 demoted to 0 — its dense number is retired");
         assert.equal(byMsg.get("p2"), 0);
         // no rows were lost: the log advanced, not froze
-        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM egress_flow WHERE session_id = ?").get(S) as { c: number }).c, 7, "turn 1's 4 +I rows + turn 2's two demote-U + one +I");
+        assert.equal((H.db.prepare("SELECT COUNT(*) AS c FROM eg_flow WHERE session_id = ?").get(S) as { c: number }).c, 7, "turn 1's 4 +I rows + turn 2's two demote-U + one +I");
         // turn 3: p1/p2 finally leave protection and the kernel cited them
         // at 5/6 — the rows re-home onto their citations
         const t3 = t2.map((m) => m);

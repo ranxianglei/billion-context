@@ -11,11 +11,11 @@
  *     endpoints / update target missing / duplicate row id) throw, never
  *     degrade fuzzy — and addressing is by row id (2026-11-27): a msgid may
  *     collide or churn, the log's anchors never do;
- *   - egress_state is the MATERIALIZED live view: its row count == the
- *     live row count (ORDER BY pos serving read, no replay); egress_flow
+ *   - eg_state is the MATERIALIZED live view: its row count == the
+ *     live row count (ORDER BY pos serving read, no replay); eg_flow
  *     keeps every row forever (append-only, physically never deleted —
  *     growth optimization is the separate #7475 family);
- *   - rollback: ANY point (from 0) stays reconstructible from egress_flow;
+ *   - rollback: ANY point (from 0) stays reconstructible from eg_flow;
  *   - a batch that would not replay is refused at append time (#7574);
  *   - a manually planted corrupt FLOW row does not break serving while the
  *     state view is intact (the read is a consistent snapshot) — it is
@@ -87,21 +87,21 @@ const stamped = (rows: EgressViewRow[]): EgressViewRow[] => rows.map((r, i) => (
 /** Total rows of a session in BOTH tables. */
 function rows(h: Harness, S: string): number {
     const n = (table: string) => (h.db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE session_id = ?`).get(S) as { n: number }).n;
-    return n("egress_state") + n("egress_flow");
+    return n("eg_state") + n("eg_flow");
 }
 
 /** Live rows (materialized view) of a session. */
 function stateRows(h: Harness, S: string): number {
-    return (h.db.prepare(`SELECT COUNT(*) AS n FROM egress_state WHERE session_id = ?`).get(S) as { n: number }).n;
+    return (h.db.prepare(`SELECT COUNT(*) AS n FROM eg_state WHERE session_id = ?`).get(S) as { n: number }).n;
 }
 
 /** Flow rows (append-only record) of a session. */
 function flowRows(h: Harness, S: string): number {
-    return (h.db.prepare(`SELECT COUNT(*) AS n FROM egress_flow WHERE session_id = ?`).get(S) as { n: number }).n;
+    return (h.db.prepare(`SELECT COUNT(*) AS n FROM eg_flow WHERE session_id = ?`).get(S) as { n: number }).n;
 }
 
 /** Write one op row straight into the FLOW only, bypassing the append
- *  check (7773: egress_state is the materialized live view — a hand edit
+ *  check (7773: eg_state is the materialized live view — a hand edit
  *  targets the record, and the read path must survive it while the view is
  *  intact). */
 function plant(h: Harness, S: string, op: EgressOp, opSeq: number, nowMs: number): void {
@@ -112,7 +112,7 @@ function plant(h: Harness, S: string, op: EgressOp, opSeq: number, nowMs: number
                 ? ["D", null, null, JSON.stringify({ start: op.start, end: op.end }), null, null]
                 : ["U", op.rid, op.msgid, JSON.stringify({ role: op.role }), null, op.bytes];
     const [rowType, rid, msgid, payload, logSeq, bytes] = written as [string, number | null, string | null, string, number | null, string | null];
-    h.db.prepare(`INSERT INTO egress_flow (session_id, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(S, opSeq, logSeq, rowType, rid, msgid, payload, bytes, nowMs);
+    h.db.prepare(`INSERT INTO eg_flow (session_id, op_seq, log_seq, row_type, rid, msgid, payload, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(S, opSeq, logSeq, rowType, rid, msgid, payload, bytes, nowMs);
 }
 
 test("replay determinism: the five-op example from the proposal", () => {
@@ -238,7 +238,7 @@ test("hard errors: missing anchor / missing or inverted endpoints / update targe
         seed("healthy");
         assert.deepEqual(egressStateView(H.db, "healthy").map((r) => r.msgid), ["a", "b"]);
         // a GOOD op after a BAD op must not be masked: drop the bad row, replay OK
-        H.db.prepare("DELETE FROM egress_flow WHERE session_id = 'planted-anchor' AND op_seq = 3").run();
+        H.db.prepare("DELETE FROM eg_flow WHERE session_id = 'planted-anchor' AND op_seq = 3").run();
         assert.deepEqual(egressStateView(H.db, "planted-anchor").map((r) => r.msgid), ["a", "b"]);
         assert.deepEqual(egressStateAt(H.db, "planted-anchor", Number.MAX_SAFE_INTEGER).map((r) => r.msgid), ["a", "b"], "the full replay is healthy again once the bad row is gone");
     } finally {
@@ -269,12 +269,12 @@ test("materialized view: state row count == live row count, flow keeps its full 
         assert.equal(flowRows(H, S), 12);
         // the row alphabet is I/D/U — the B base letter never exists in this
         // form (not written, not read, not in the CHECK)
-        const types = (H.db.prepare("SELECT DISTINCT row_type AS t FROM egress_flow WHERE session_id = ? ORDER BY t").all(S) as { t: string }[]).map((r) => r.t);
+        const types = (H.db.prepare("SELECT DISTINCT row_type AS t FROM eg_flow WHERE session_id = ? ORDER BY t").all(S) as { t: string }[]).map((r) => r.t);
         assert.deepEqual(types, ["D", "I"]);
 
         assert.deepEqual(before.map((r) => r.num), [11, 7, 8, 9, 10], "I rows numbered in append order (fold=11)");
         // the state row's immutable I-twin anchor (log_seq) == the flow I row
-        const twin = H.db.prepare("SELECT log_seq, num FROM egress_state WHERE session_id = ? AND msgid = ?").get(S, "fold") as { log_seq: number; num: number };
+        const twin = H.db.prepare("SELECT log_seq, num FROM eg_state WHERE session_id = ? AND msgid = ?").get(S, "fold") as { log_seq: number; num: number };
         assert.equal(twin.log_seq, 11);
         assert.equal(twin.num, 11);
 
@@ -295,7 +295,7 @@ test("materialized view: state row count == live row count, flow keeps its full 
     }
 });
 
-test("rollback: every point — from 0 up — stays reconstructible from egress_flow (no base concept, 7773)", () => {
+test("rollback: every point — from 0 up — stays reconstructible from eg_flow (no base concept, 7773)", () => {
     const H = open();
     try {
         const S = "sess-5";
@@ -530,7 +530,7 @@ test("append: a U with num persists through state replay, compaction, and the de
         // the state rows carry the immutable I-twin anchors: the demoted rows
         // keep their ORIGINAL insertion numbers in log_seq while num is 0
         // (7773: the (msgid, log_seq) twin check reads the I-time number)
-        const p1twin = H.db.prepare("SELECT log_seq, num FROM egress_state WHERE session_id = ? AND msgid = ?").get(S, "p1") as { log_seq: number; num: number };
+        const p1twin = H.db.prepare("SELECT log_seq, num FROM eg_state WHERE session_id = ? AND msgid = ?").get(S, "p1") as { log_seq: number; num: number };
         assert.equal(p1twin.log_seq, 3, "p1's I-twin anchor is its insertion number");
         assert.equal(p1twin.num, 0, "... while its current number is demoted");
         // the REBUILD path must survive the demoted rows: a damaged state
@@ -538,10 +538,10 @@ test("append: a U with num persists through state replay, compaction, and the de
         // each row's I-time anchor into log_seq — a demoted row keeps its
         // anchor with num 0 (the pre-fix materialize threw on it, bricking
         // the session's recovery, 7773 review)
-        H.db.prepare("UPDATE egress_state SET pos = pos + 1 WHERE session_id = ? AND pos > 1").run(S);
+        H.db.prepare("UPDATE eg_state SET pos = pos + 1 WHERE session_id = ? AND pos > 1").run(S);
         const healed = egressStateRead(H.db, S);
         assert.deepEqual(healed.map((r) => r.num), [0, 2, 0, 0, 91], "the rebuild serves the demoted view");
-        const p2twin = H.db.prepare("SELECT log_seq, num FROM egress_state WHERE session_id = ? AND msgid = ?").get(S, "p2") as { log_seq: number; num: number };
+        const p2twin = H.db.prepare("SELECT log_seq, num FROM eg_state WHERE session_id = ? AND msgid = ?").get(S, "p2") as { log_seq: number; num: number };
         assert.equal(p2twin.log_seq, 4, "the rebuilt p2 keeps its I-twin anchor");
         assert.equal(p2twin.num, 0, "... with its demoted number");
         // full replay ends byte-identical to the materialized view (the
