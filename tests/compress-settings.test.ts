@@ -394,3 +394,30 @@ test("applyCompressSettings: maps tierNudgeTokens onto kernel nudge.tierGrowthTo
     assert.equal(absent.nudge.tierGrowthTokens, undefined);
     assert.equal(base.nudge.tierGrowthTokens, undefined, "base config not mutated");
 });
+
+test("mergeCompress / parseCompressSettings / applyCompressSettings: tier2Trigger and tier3Trigger", () => {
+    assert.deepEqual(
+        mergeCompress({ tier2Trigger: 10, tier3Trigger: 6 }, { tier2Trigger: 8 }, undefined),
+        { ...mergeCompress({}, {}, undefined), tier2Trigger: 8, tier3Trigger: 6 },
+    );
+    assert.deepEqual(parseCompressSettings({ tier2Trigger: 4, tier3Trigger: 8 }), { tier2Trigger: 4, tier3Trigger: 8 });
+    assert.equal(parseCompressSettings({ tier2Trigger: 1 }), undefined);
+    assert.equal(parseCompressSettings({ tier2Trigger: 0 }), undefined);
+    assert.equal(parseCompressSettings({ tier2Trigger: 2.5 }), undefined);
+    assert.equal(parseCompressSettings({ tier3Trigger: "8" }), undefined);
+    // Cross-field constraint (kernel invariant): tier3Trigger must be greater
+    // than tier2Trigger, judged against the EFFECTIVE values (unset fields fall
+    // back to the kernel defaults 1000/2000).
+    assert.equal(parseCompressSettings({ tier2Trigger: 8, tier3Trigger: 4 }), undefined, "t3 < t2 rejected");
+    assert.equal(parseCompressSettings({ tier2Trigger: 8, tier3Trigger: 8 }), undefined, "t3 == t2 rejected");
+    assert.equal(parseCompressSettings({ tier2Trigger: 2000 }), undefined, "t2 at the default t3 (2000) rejected");
+    assert.equal(parseCompressSettings({ tier3Trigger: 1000 }), undefined, "t3 at the default t2 (1000) rejected");
+    assert.deepEqual(parseCompressSettings({ tier3Trigger: 1001 }), { tier3Trigger: 1001 }, "t3 just above default t2 accepted");
+    assert.deepEqual(parseCompressSettings({ tier2Trigger: 1999 }), { tier2Trigger: 1999 }, "t2 just below default t3 accepted");
+    const base = defaultConfig(200000);
+    const out = applyCompressSettings(base, 200000, { tier2Trigger: 8, tier3Trigger: 4 });
+    assert.equal(out.tiers.tier2Trigger, 8);
+    assert.equal(out.tiers.tier3Trigger, 4);
+    assert.equal(base.tiers.tier2Trigger, 1000, "base config not mutated");
+    assert.equal(base.tiers.tier3Trigger, 2000, "base config not mutated");
+});

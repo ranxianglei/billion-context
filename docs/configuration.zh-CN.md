@@ -308,6 +308,8 @@
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | 客户端在轮次之间回退或改写历史时校准已折叠状态。 |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 压缩提示词包，按 项目包 → 用户包 → 内置 解析；不受 acknowledgePromptsRisk 门控。 |
 | `compress.tiers` | boolean | true | — | T1→T3 分级蒸馏把折叠成本摊到多代。 |
+| `compress.tier2Trigger` | number | kernel 1000 | — | 触发 T2 蒸馏提醒的活跃 T1 块数量阈值（映射内核 tiers.tier2Trigger；>= 2 的整数）。默认 1000 表示仅按 token 体积触发。 |
+| `compress.tier3Trigger` | number | kernel 2000 | — | 触发 T3 蒸馏提醒的活跃 T2 块数量阈值（映射内核 tiers.tier3Trigger；>= 2 的整数）。默认 2000 表示仅按 token 体积触发。 |
 | `compress.protectedUserPatterns` | string[] | none | — | 用户文本消息的字面子串：命中即永不折叠，即使它不是最后一条 user 消息。用于长会话里 host 标记的当前任务 prompt。 |
 | `compress.protectedTools` | string[] | none | — | 全历史硬排除：列出工具的结果永不折叠。路径模式（skill/<name>）可按名指定 skill（#1947）。 |
 | `compress.protectedLatestTools` | string[] | none | — | 只保护累积快照类工具「最新一次」实例（新结果覆盖旧结果的工具，如 todo 列表）。路径模式按 skill 分组各保最新（skill/*，#1947）。 |

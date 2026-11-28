@@ -308,6 +308,8 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.reconcile` | "off" \| "warn" \| "repair" | "repair" | BILI_FOLD_RECONCILE | Reconcile folded state when the client rewinds or rewrites history between turns. |
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | Compression prompt pack, resolved project pack → user pack → builtin; not gated by acknowledgePromptsRisk. |
 | `compress.tiers` | boolean | true | — | Tiered T1→T3 distillation spreads folding cost across generations. |
+| `compress.tier2Trigger` | number | kernel 1000 | — | Active tier-1 block count that triggers T2 distillation nudges (kernel tiers.tier2Trigger; integer >= 2). Default 1000 leaves T2 purely token-mass driven. |
+| `compress.tier3Trigger` | number | kernel 2000 | — | Active tier-2 block count that triggers T3 distillation nudges (kernel tiers.tier3Trigger; integer >= 2). Default 2000 leaves T3 purely token-mass driven. |
 | `compress.protectedUserPatterns` | string[] | none | — | Literal substrings on user text messages: matching prompts never fold, even when they are not the latest user message. For host-marked current-task prompts in long-lived sessions. |
 | `compress.protectedTools` | string[] | none | — | Hard exclusion across all history: results of listed tools never fold. Path patterns (skill/<name>) select skills by name (#1947). |
 | `compress.protectedLatestTools` | string[] | none | — | Protects only the LATEST instance of cumulative-snapshot tools whose newest result supersedes older ones (e.g. todo lists). Path patterns keep the latest instance per skill (skill/*, #1947). |

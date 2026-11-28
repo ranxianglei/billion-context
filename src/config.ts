@@ -383,6 +383,14 @@ export type CompressSettings = {
     minSummaryLength?: number;
     /** Enable multi-tier (T2/T3) distillation (kernel `tiers.enabled`). */
     tiers?: boolean;
+    /** Active tier-1 block count that enables T2 distillation nudges
+     *  (kernel `tiers.tier2Trigger`, default 1000 — disabled by count).
+     *  Integer >= 2; deepest level wins across global → provider → model. */
+    tier2Trigger?: number;
+    /** Active tier-2 block count that enables T3 distillation nudges
+     *  (kernel `tiers.tier3Trigger`, default 2000 — disabled by count).
+     *  Integer >= 2; deepest level wins across global → provider → model. */
+    tier3Trigger?: number;
     /** Tool-name patterns whose LATEST tool-call + paired result are never
      *  compressed (kernel `protectedLatestTools`, acp-kernel >= 0.0.80).
      *  Built for cumulative-snapshot tools (e.g. a client's todo/task list):
@@ -2674,7 +2682,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "requireNudge", "requireRecommendation", "postComPressTail",
     "preserveRecentMessages", "preserveRecentTokens",
     "minCompressRange", "minCompressRangeChars",
-    "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
+    "outputHeadroomMaxPct", "tiers", "tier2Trigger", "tier3Trigger", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
     "visibilityMarkers", "messageTimestamps", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "blockOps", "ccr", "search",
@@ -3433,6 +3441,23 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("tiers" in obj) {
         if (typeof obj.tiers !== "boolean") ok = false;
         else out.tiers = obj.tiers;
+    }
+    for (const key of ["tier2Trigger", "tier3Trigger"] as const) {
+        if (!(key in obj)) continue;
+        const v = obj[key];
+        if (typeof v !== "number" || !Number.isInteger(v) || v < 2) ok = false;
+        else out[key] = v;
+    }
+    // Kernel invariant (validateConfig): tier3Trigger must be greater than
+    // tier2Trigger. Enforce it against the EFFECTIVE values — unset fields fall
+    // back to the kernel defaults — so a combination that would only surface as
+    // a runtime kernel warning is rejected at parse time (fail-fast, matching
+    // the rest of this function).
+    {
+        const tierDefaults = defaultConfig(0).tiers;
+        const effT2 = out.tier2Trigger ?? tierDefaults.tier2Trigger;
+        const effT3 = out.tier3Trigger ?? tierDefaults.tier3Trigger;
+        if (effT3 <= effT2) ok = false;
     }
     if ("tierNudgeTokens" in obj && obj.tierNudgeTokens !== undefined) {
         const v = obj.tierNudgeTokens;
