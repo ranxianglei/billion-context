@@ -306,6 +306,7 @@
 | `compress.promptPack` | string (builtin: "default", "lean") | builtin "default" | — | 圧縮プロンプトパック。解決順序はプロジェクトパック → ユーザーパック → ビルトイン。`acknowledgePromptsRisk` によるゲートはされない。 |
 | `compress.tiers` | boolean | true | — | T1→T3 の階層型蒸留により、フォールドコストを世代間で分散する。 |
 | `compress.protectedUserPatterns` | string[] | none | — | ユーザー本文のリテラル部分文字列：一致したプロンプトは最新のユーザーメッセージでなくてもフォールドされない。長寿命セッションでホストが現在のタスクを示す用途。 |
+| `compress.preserveFirstUser` | boolean | true | — | 最初の user メッセージをプレフィックスキャッシュ先頭アンカーとして無条件に固定する（デフォルト true）。false にすると、他の未カバー user ターンが残る限りフォールド済み先頭 user を動的にプルーニングできる。 |
 | `compress.protectedTools` | string[] | none | — | 全履歴に対するハード除外：リストされたツールの結果は決してフォールドされない。パスパターン（`skill/<name>`）は名前でスキルを選択する（#1947）。 |
 | `compress.protectedLatestTools` | string[] | none | — | 最新の結果が古いものを上書きする累積スナップショット型ツールの最新インスタンスのみを保護する（例：todo リスト）。パスパターンはスキルごとに最新インスタンスを保持する（`skill/*`, #1947）。 |
 | `compress.neverPreserveRecentTools` | string[] ([] valid) | ["decompress", "search_context", "read", "bash"] (kernel) | — | 最近保護ゾーンから除外（即時圧縮可能）。空の配列は何も除外しない（最大保護）。 |

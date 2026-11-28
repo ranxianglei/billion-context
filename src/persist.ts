@@ -4796,7 +4796,9 @@ function boundedFoldedSnapshot(session: Session): CoreMessage[] | undefined {
     if (!msgs || msgs.length === 0) return undefined;
     const budget = persistTailTokens();
     if (budget === 0) return undefined;
-    let view = prune(msgs, session.state);
+    let view = prune(msgs, session.state, {
+        preserveFirstUser: (session.metadata["effectiveConfig"] as { preserveFirstUser?: boolean } | undefined)?.preserveFirstUser,
+    });
     let total = 0;
     for (const m of view) total += defaultCountTokens(m.text ?? "");
     if (total > budget) {

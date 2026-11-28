@@ -361,6 +361,10 @@ export type CompressSettings = {
     preserveRecentMessages?: number;
     /** Token budget reserved for recent messages (kernel `preserveRecentTokens`). */
     preserveRecentTokens?: number;
+    /** Pin the opening user message unconditionally (`true`, default) or allow
+     *  dynamic pruning once covered while another uncovered user turn survives
+     *  (`false`). Maps to kernel `preserveFirstUser`. */
+    preserveFirstUser?: boolean;
     /** Minimum compressible range size, in CHARACTERS (not tokens); smaller
      *  ranges are skipped. English/code averages ~4 chars per token, CJK
      *  ~1-2 chars per token, so the same number is ~4× more permissive for
@@ -2672,7 +2676,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "modelContextLimit", "maxContextLimit", "emergencyThresholdPercent",
     "nudgeGrowthTokens", "minPressureBenefitTokens", "requireUsageSampleForPressure", "maxEstimateHoldRounds", "tierNudgeTokens", "nudgeModelDecided", "nudgeDecisionMaxTokens",
     "requireNudge", "requireRecommendation", "postComPressTail",
-    "preserveRecentMessages", "preserveRecentTokens",
+    "preserveRecentMessages", "preserveRecentTokens", "preserveFirstUser",
     "minCompressRange", "minCompressRangeChars",
     "outputHeadroomMaxPct", "tiers", "protectedLatestTools", "protectedTools",
     "neverPreserveRecentTools", "preserveRecentTools",
@@ -3433,6 +3437,10 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     if ("tiers" in obj) {
         if (typeof obj.tiers !== "boolean") ok = false;
         else out.tiers = obj.tiers;
+    }
+    if ("preserveFirstUser" in obj) {
+        if (typeof obj.preserveFirstUser !== "boolean") ok = false;
+        else out.preserveFirstUser = obj.preserveFirstUser;
     }
     if ("tierNudgeTokens" in obj && obj.tierNudgeTokens !== undefined) {
         const v = obj.tierNudgeTokens;

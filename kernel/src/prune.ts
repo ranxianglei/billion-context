@@ -135,6 +135,12 @@ export interface PruneOptions {
    * call still awaiting its result is deleted while its bare-name twin survives.
    */
   isCompressTool?: (toolName: string) => boolean;
+  /**
+   * Pin the opening user message unconditionally (`true`, default, #2733 cache
+   * head) vs dynamically allow pruning it once covered as long as a later
+   * uncovered user message survives (`false`).
+   */
+  preserveFirstUser?: boolean;
 }
 
 export function prune(
@@ -148,60 +154,59 @@ export function prune(
   for (const id of covered) coveredBases.add(baseIdOf(id));
 
   const inject = options.injectSummaries ?? true;
+  const preserveFirstUser = options.preserveFirstUser ?? true;
   const isCompressTool =
     options.isCompressTool ?? ((name: string) => name === "compress");
-  const firstUserIndex = messages.findIndex(
-    (message) => message.role === "user",
-  );
-  // #3640: an unresolved anchor (no covered id present in this input) parks
-  // immediately BEFORE the newest user message, never at the list tail.
-  // Tail-parking put days-old summaries after the user's current question,
-  // and the model answered the stale recap instead of the question for every
-  // subsequent turn. Parking before the newest user turn also keeps the
-  // provider prefix cache intact: the insertion point sits inside the
-  // turn-over region that the next request rewrites anyway (#2733 trade-off
-  // reassessed). No user message at all: keep the legacy tail.
-  let lastUserIndex = -1;
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]!.role === "user") {
-      lastUserIndex = i;
-      break;
-    }
-  }
+  // #4316 layer 3: positional claims, built once per prune pass.
+  const seqIntervals = coveredSeqIntervals(state);
 
+  // Single-scan input index: collect first/last user indices, uncovered-user
+  // presence, base-id earliest positions, already-rendered summary indices,
+  // and wire-visible compress calls in one pass over `messages`.
+  let hasUncoveredUser = false;
+  let fallbackFirstUserIndex = -1;
+  let lastUserIndex = -1;
   const baseIndexById = new Map<string, number>();
   const summaryIndexById = new Map<string, number>();
-  messages.forEach((message, index) => {
-    const base = baseIdOf(message.id);
-    const existing = baseIndexById.get(base);
-    if (existing === undefined || index < existing)
-      baseIndexById.set(base, index);
-    if (isRenderedSummaryMessage(message))
-      summaryIndexById.set(message.id, index);
-  });
-
-  // #4311: a wire-visible compress call already carries the full summary
-  // draft in its arguments, and the call+receipt pair stays protected —
-  // re-rendering the block summary duplicates that text on the wire. Skip
-  // the anchor for blocks whose ORIGINATING call is visible in THIS view
-  // (the exchange itself is the model-visible recap); blocks whose call is
-  // gone (folded away, gateway-dropped) or that never had one (system folds,
-  // codex/dsh forged-summary lanes) keep their render. The skip must key on
-  // the exact compressCallId — never on range overlap — so a RE-FOLD that
-  // covers similar ground still renders its own summary.
   const visibleCompressCallIds = new Set<string>();
-  if (inject) {
-    for (const message of messages) {
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]!;
+    const base = baseIdOf(message.id);
+    if (!baseIndexById.has(base)) baseIndexById.set(base, i);
+    if (message.role === "user") {
+      if (fallbackFirstUserIndex === -1) fallbackFirstUserIndex = i;
+      lastUserIndex = i;
       if (
-        message.contentType === "tool-call" &&
-        message.toolCallId &&
-        typeof message.toolName === "string" &&
-        isCompressTool(message.toolName)
+        !coveredBases.has(base) &&
+        !isCoveredBySeq(message.ledgerSeq, seqIntervals)
       ) {
-        visibleCompressCallIds.add(message.toolCallId);
+        hasUncoveredUser = true;
       }
     }
+    if (isRenderedSummaryMessage(message)) {
+      summaryIndexById.set(message.id, i);
+    }
+    if (
+      inject &&
+      message.contentType === "tool-call" &&
+      message.toolCallId &&
+      typeof message.toolName === "string" &&
+      isCompressTool(message.toolName)
+    ) {
+      visibleCompressCallIds.add(message.toolCallId);
+    }
   }
+  // #2733: by default (`preserveFirstUser !== false`), pin the opening user
+  // message as the provider prefix-cache head anchor. When `preserveFirstUser`
+  // is explicitly `false`, dynamically drop the covered opening user message
+  // whenever another uncovered user turn survives, falling back to pinning it
+  // only if all user messages are covered so strict providers still see >=1 user.
+  const pinnedUserIndex = preserveFirstUser
+    ? fallbackFirstUserIndex
+    : hasUncoveredUser
+      ? -1
+      : fallbackFirstUserIndex;
+  // #3640: an unresolved anchor parks immediately BEFORE the newest user turn.
   const anchors = inject
     ? collectSummaryAnchors(
         state,
@@ -233,9 +238,8 @@ export function prune(
         rebuildMessages(
           messages,
           coveredBases,
-          // #4316 layer 3: positional claims, built once per prune pass.
-          coveredSeqIntervals(state),
-          firstUserIndex,
+          seqIntervals,
+          pinnedUserIndex,
           anchors,
           knownSummaryIds,
           options.headSummaryAnchors === true,
