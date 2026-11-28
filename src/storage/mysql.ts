@@ -2614,6 +2614,7 @@ export class MysqlBackend implements StorageBackend {
             firstTopic: nullableStr(r.firstTopic),
             firstSummary: nullableStr(r.firstSummary),
             activeCompressedTokens: num(r.activeCompressed),
+            egressRecords: 0,
             status: str(r.status ?? "active"),
         }));
     }

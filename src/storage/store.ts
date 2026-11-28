@@ -360,6 +360,13 @@ export interface CheckpointRow {
     firstTopic: string | null;
     firstSummary: string | null;
     activeCompressedTokens: number;
+    /** #B4 (KDD#25): non-system egress_state rows — set on a 7-table (egress)
+     *  instance (where the legacy `blocks` table is absent and the blocks
+     *  fields are zero); a >0 count marks a session that has egress records,
+     *  so isEmptyStub doesn't mistake a single-turn egress session for an
+     *  empty stub. Always 0 on legacy instances (their block/ledger signals
+     *  already cover it). */
+    egressRecords: number;
 }
 
 /** #3928: per-session footprint inside index.db, backing `bili sessions ls`.
@@ -4389,6 +4396,47 @@ export class UnifiedStore {
      *  compressed-token sum). Replaces the bounded envelope-file decode the
      *  disk index performs per refresh. */
     webSummaryRows(): WebSummaryRow[] {
+        // #B4 (KDD#25): a 7-table (egress) instance does NOT create the legacy
+        // CAS projection tables — the `blocks` CTE below would throw "no such
+        // table: blocks" and the whole list would crash to the disk walk, where
+        // egress sessions (no JSON files) are missing → the panel shows 0.
+        // When the legacy group is absent, query the sessions table alone
+        // (blocks-derived fields zero/NULL) and count the egress_state rows so
+        // a single-turn egress session isn't mistaken for an empty stub
+        // (isEmptyStub checks egressRecords).
+        if (!this.legacyTablesPresent) {
+            const rows = this.db
+                .prepare(
+                    `SELECT s.session_id AS sessionId, s.title AS title, s.host_title AS hostTitle, s.label AS label,
+                            s.protocol AS protocol, s.origin AS origin, s.status AS status, s.updated_at AS updatedAt,
+                            s.stats_json AS statsJson, s.metadata_json AS metadataJson,
+                            (SELECT COUNT(*) FROM egress_state es
+                              WHERE es.session_id = s.session_id AND es.msgid <> 'egress-system') AS egressRecords
+                     FROM sessions s`,
+                )
+                .all() as Array<{
+                    sessionId: string; title: string | null; hostTitle: string | null; label: string | null;
+                    protocol: string | null; origin: string | null; status: string; updatedAt: number;
+                    statsJson: string; metadataJson: string; egressRecords: number;
+                }>;
+            return rows.map((r) => ({
+                sessionId: r.sessionId,
+                title: r.title ?? undefined,
+                hostTitle: r.hostTitle ?? undefined,
+                label: r.label ?? undefined,
+                protocol: r.protocol ?? undefined,
+                origin: r.origin ?? undefined,
+                status: r.status,
+                updatedAt: r.updatedAt,
+                statsJson: r.statsJson,
+                metadataJson: r.metadataJson,
+                blocks: 0,
+                firstTopic: null,
+                firstSummary: null,
+                activeCompressedTokens: 0,
+                egressRecords: r.egressRecords ?? 0,
+            }));
+        }
         // #7156: a corrupt/empty payload_json (e.g. left by an interrupted
         // .recover) made json_extract throw "malformed JSON" and fail the WHOLE
         // .all() — the panel then silently fell back to 0 historical sessions.
@@ -4450,6 +4498,7 @@ export class UnifiedStore {
             firstTopic: r.firstTopic,
             firstSummary: r.firstSummary,
             activeCompressedTokens: r.activeCompressed ?? 0,
+            egressRecords: 0,
         }));
     }
 

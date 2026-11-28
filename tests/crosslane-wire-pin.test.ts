@@ -131,7 +131,10 @@ test("wire-granularity pin: agentic split + lane switch keeps ids and placement 
         assert.equal(r1.status, 200, `bootstrap turn must succeed (got ${r1.status}: ${r1.body.slice(0, 200)})`);
         await settle("conv-split");
         const pinIds = store!.snapPinLiveIds("conv-split");
-        for (const id of ["host-0", "host-1", "host-1#p1", "host-2"]) {
+        // Path A (coarsened op-log, #7855): a split element's part-rows share
+        // ONE element id in the ledger — the #pN sibling is a core-internal
+        // detail, not a ledger row. Assert the element ids.
+        for (const id of ["host-0", "host-1", "host-2"]) {
             assert.ok(pinIds.includes(id), `flow ledger must carry ${id} (got: ${JSON.stringify(pinIds)})`);
         }
         assert.ok(!logs.some((l) => l.includes("conv-split") && l.includes("pin rejected")), "the wire-form pin must not hit the reject path");
@@ -157,7 +160,7 @@ test("wire-granularity pin: agentic split + lane switch keeps ids and placement 
         );
         await settle("conv-split");
         const pinIds2 = store!.snapPinLiveIds("conv-split");
-        for (const id of ["host-0", "host-1", "host-1#p1", "host-2", "host-3"]) {
+        for (const id of ["host-0", "host-1", "host-2", "host-3"]) {
             assert.ok(pinIds2.includes(id), `post-switch ledger must carry ${id} (got: ${JSON.stringify(pinIds2)})`);
         }
         // Upstream placement: assistant [text, tool_use] ONE message, then a
