@@ -6,6 +6,8 @@ import { after, test } from "node:test";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-snapshot-read-"));
 process.env.BILI_STORAGE_UNIFIED = "full";
+// KDD #25 hermeticity: legacy read-failure fallback assertions — pin the plane OFF.
+process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
 process.env.BILI_SESSIONS_DIR = path.join(root, "sessions");
 process.env.XDG_STATE_HOME = path.join(root, "state");
 process.env.XDG_CACHE_HOME = path.join(root, "cache");

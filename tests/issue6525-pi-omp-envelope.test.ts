@@ -1,8 +1,11 @@
 /** #6525 (发): pi/omp full-resend msgid envelope — the LANE-INDEPENDENT send
  *  path. The incremental lane already stamps `msgIds` on the deltas it diverts
  *  (anthropic wire only); this is the envelope (`biliMsgIds`) on EVERY
- *  full-resend body — core-aligned via the kernel wireIndex proof, any
- *  mismatch bails to no field (byte-identical to today). Tests:
+ *  full-resend body — WIRE-ELEMENT-aligned (#7439 follow-up: the kernel
+ *  splits one element into N cores on agentic turns; the server dual-modes
+ *  the pin — per-core when 1:1, wire-groups with derived sibling ids when
+ *  split), any pairing mismatch bails to no field (byte-identical to
+ *  before). Tests:
  *    A. coreAlignEnvelopeIds — the core-alignment proof itself
  *    B. _bodyProxyVisibleForTest — the #1403 gate (blind tunnel: never stamp)
  *    C. _resolveEnvelopeIdsForFullResendForTest — resolver (walker + proof)
@@ -36,31 +39,30 @@ const OAI_WIRE_1TO1 = [
 ];
 const OAI_ALIGNED_1TO1 = ["bili-ps-0", "u1", "a2", "t3", "a4"];
 
-test("coreAlignEnvelopeIds: openai 1:1 with lead system → core ids (lead dropped)", () => {
-    const parsed = { messages: OAI_WIRE_1TO1, model: "m" };
+test("coreAlignEnvelopeIds: openai 1:1 with lead system → element ids (lead dropped)", () => {
     assert.deepEqual(
-        coreAlignEnvelopeIds("openai", OAI_ALIGNED_1TO1, OAI_WIRE_1TO1, parsed),
+        coreAlignEnvelopeIds(OAI_ALIGNED_1TO1, OAI_WIRE_1TO1),
         ["u1", "a2", "t3", "a4"],
     );
 });
 
-test("coreAlignEnvelopeIds: openai assistant text+tool_call splits one element into two cores → bail", () => {
+test("coreAlignEnvelopeIds: openai assistant text+tool_call splits one element into two cores → per-element ids (server pins the split via wire groups)", () => {
     const wire = [
         { role: "user", content: "q" },
         { role: "assistant", content: "talking", tool_calls: [{ id: "call_1", type: "function", function: { name: "t", arguments: "{}" } }] },
     ];
-    assert.equal(coreAlignEnvelopeIds("openai", ["u0", "a1"], wire, { messages: wire, model: "m" }), undefined);
+    assert.deepEqual(coreAlignEnvelopeIds(["u0", "a1"], wire), ["u0", "a1"]);
 });
 
-test("coreAlignEnvelopeIds: openai user [text, image] splits into two cores → bail", () => {
+test("coreAlignEnvelopeIds: openai user [text, image] splits into two cores → per-element ids", () => {
     const wire = [
         { role: "user", content: [{ type: "text", text: "see" }, { type: "image_url", image_url: { url: "http://x/i.png" } }] },
         { role: "user", content: "b" },
     ];
-    assert.equal(coreAlignEnvelopeIds("openai", ["u0", "u1"], wire, { messages: wire, model: "m" }), undefined);
+    assert.deepEqual(coreAlignEnvelopeIds(["u0", "u1"], wire), ["u0", "u1"]);
 });
 
-test("coreAlignEnvelopeIds: openai two tool_calls on one assistant → bail", () => {
+test("coreAlignEnvelopeIds: openai two tool_calls on one assistant → per-element ids", () => {
     const wire = [
         { role: "user", content: "q" },
         {
@@ -72,7 +74,7 @@ test("coreAlignEnvelopeIds: openai two tool_calls on one assistant → bail", ()
             ],
         },
     ];
-    assert.equal(coreAlignEnvelopeIds("openai", ["u0", "a1"], wire, { messages: wire, model: "m" }), undefined);
+    assert.deepEqual(coreAlignEnvelopeIds(["u0", "a1"], wire), ["u0", "a1"]);
 });
 
 test("coreAlignEnvelopeIds: a bili-ps- slot past the lead run (mid-body system) → bail", () => {
@@ -81,11 +83,11 @@ test("coreAlignEnvelopeIds: a bili-ps- slot past the lead run (mid-body system) 
         { role: "user", content: "q" },
         { role: "system", content: "mid" },
     ];
-    assert.equal(coreAlignEnvelopeIds("openai", ["bili-ps-0", "u1", "bili-ps-2"], wire, { messages: wire, model: "m" }), undefined);
+    assert.equal(coreAlignEnvelopeIds(["bili-ps-0", "u1", "bili-ps-2"], wire), undefined);
 });
 
 test("coreAlignEnvelopeIds: lead-only (everything hoisted) → nothing to align → bail", () => {
-    assert.equal(coreAlignEnvelopeIds("openai", ["bili-ps-0"], [{ role: "system", content: "s" }], { messages: [{ role: "system", content: "s" }], model: "m" }), undefined);
+    assert.equal(coreAlignEnvelopeIds(["bili-ps-0"], [{ role: "system", content: "s" }]), undefined);
 });
 
 test("coreAlignEnvelopeIds: duplicate id in the aligned tail → bail (no mis-pin)", () => {
@@ -93,7 +95,7 @@ test("coreAlignEnvelopeIds: duplicate id in the aligned tail → bail (no mis-pi
         { role: "user", content: "q" },
         { role: "user", content: "r" },
     ];
-    assert.equal(coreAlignEnvelopeIds("openai", ["u1", "u1"], wire, { messages: wire, model: "m" }), undefined);
+    assert.equal(coreAlignEnvelopeIds(["u1", "u1"], wire), undefined);
 });
 
 test("coreAlignEnvelopeIds: aligned array not 1:1 with the wire element count → bail", () => {
@@ -101,7 +103,7 @@ test("coreAlignEnvelopeIds: aligned array not 1:1 with the wire element count �
         { role: "user", content: "q" },
         { role: "user", content: "r" },
     ];
-    assert.equal(coreAlignEnvelopeIds("openai", ["u1"], wire, { messages: wire, model: "m" }), undefined);
+    assert.equal(coreAlignEnvelopeIds(["u1"], wire), undefined);
 });
 
 test("coreAlignEnvelopeIds: anthropic 1:1 (system is a separate field — no lead drop)", () => {
@@ -110,15 +112,14 @@ test("coreAlignEnvelopeIds: anthropic 1:1 (system is a separate field — no lea
         { role: "assistant", content: [{ type: "text", text: "a" }] },
         { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_1", content: "r" }] },
     ];
-    const parsed = { system: "sys", messages: wire, model: "claude" };
     assert.deepEqual(
-        coreAlignEnvelopeIds("anthropic", ["u0", "a1", "t2"], wire, parsed),
+        coreAlignEnvelopeIds(["u0", "a1", "t2"], wire),
         ["u0", "a1", "t2"],
     );
 });
 
 test("coreAlignEnvelopeIds: non-array wire → bail without throwing", () => {
-    assert.equal(coreAlignEnvelopeIds("openai", ["u0"], "garbage", { messages: "garbage", model: "m" }), undefined);
+    assert.equal(coreAlignEnvelopeIds(["u0"], "garbage"), undefined);
 });
 
 // ---------------------------------------------------------------------------
@@ -305,25 +306,22 @@ test("laneMsgIdsForResponsesWire: reasoning item → bail (conservative)", () =>
     assert.equal(laneMsgIdsForResponsesWire(wire, branch), undefined);
 });
 
-test("coreAlignEnvelopeIds: responses 1:1 with lead system → core ids (lead dropped)", () => {
+test("coreAlignEnvelopeIds: responses 1:1 with lead system → element ids (lead dropped)", () => {
     const wire = [{ type: "message", role: "system", content: "sys" }, { type: "message", role: "user", content: "q" }, { type: "message", role: "assistant", content: "a" }];
-    const parsed = { input: wire, model: "m" };
-    assert.deepEqual(coreAlignEnvelopeIds("responses", ["bili-ps-0", "u1", "a1"], wire, parsed), ["u1", "a1"]);
+    assert.deepEqual(coreAlignEnvelopeIds(["bili-ps-0", "u1", "a1"], wire), ["u1", "a1"]);
 });
 
-test("coreAlignEnvelopeIds: responses multi-part user splits into N cores → bail", () => {
+test("coreAlignEnvelopeIds: responses multi-part user splits into N cores → per-element ids (server pins the split via wire groups)", () => {
     const wire = [{ type: "message", role: "user", content: [{ type: "input_text", text: "a" }, { type: "input_text", text: "b" }] }];
-    const parsed = { input: wire, model: "m" };
-    assert.equal(coreAlignEnvelopeIds("responses", ["u0"], wire, parsed), undefined);
+    assert.deepEqual(coreAlignEnvelopeIds(["u0"], wire), ["u0"]);
 });
 
 test("coreAlignEnvelopeIds: responses duplicate id in the tail → bail (no mis-pin)", () => {
     const wire = [{ type: "message", role: "user", content: "q" }, { type: "message", role: "user", content: "r" }];
-    const parsed = { input: wire, model: "m" };
-    assert.equal(coreAlignEnvelopeIds("responses", ["u1", "u1"], wire, parsed), undefined);
+    assert.equal(coreAlignEnvelopeIds(["u1", "u1"], wire), undefined);
 });
 
-test("resolveEnvelopeIds: responses full-resend pairs the branch → core-aligned host ids", () => {
+test("resolveEnvelopeIds: responses full-resend pairs the branch → element-aligned host ids", () => {
     const wire = RESP_WIRE_1TO1;
     const parsed = { input: wire, model: "m" };
     assert.deepEqual(_resolveEnvelopeIdsForFullResendForTest(parsed, ctxWithBranch(respBranch())), ["u1", "a2", "t3", "a4"]);

@@ -6,7 +6,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { defaultPrompts, type CompressionCore, type Config, type PackSurface, type Prompts } from "acp-kernel";
-import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, googleSystemText, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
+import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, googleSystemText, responsesToCore, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
 import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type CompressSettings } from "../compress-settings.js";
 import { storeUnpromptedGate } from "../unprompted-gate.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, resolveModelEntry, type ProxyOptions } from "../config.js";
@@ -63,10 +63,10 @@ import { unwrapCommandcodeBody, type CommandcodeEnvelopeMeta } from "../commandc
 import { ZED_PROVIDER_PROTOCOL, ZED_PROVIDERS, unwrapZedEnvelope, type ZedEnvelopeMeta, type ZedProvider } from "../zed-wire.js";
 import { DecompressedTooLargeError, decodeRequestBody, IngestBodyTooLargeError } from "../content-encoding.js";
 import { matchModelEndpoint } from "../model-endpoints.js";
-import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
+import { autoModeForgeEnabled, dshAuthoredCompactionEnabled, egressPlaneGateOn, imageRescaleEnabled, limitsDecodedBytes as knobLimitsDecodedBytes, limitsIngestBytes as knobLimitsIngestBytes, noInjectTool as knobNoInjectTool, pluginBypassOverride, rawDumpDir as knobRawDumpDir } from "../knobs.js";
 import { buildForgeResponse, classifierForgeVariant, estimateCjkTokens, isAutoModeClassifier, requestText, summarizeAction } from "../auto-mode-forge.js";
 import { extractConversationId, isV1BackgroundSideRequest, isV1InternalRequest, unwrapV1Internal } from "../v1internal.js";
-import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, UNRESOLVED_MODEL_SESSION_THRESHOLD, windowSourceLogged } from "./context-window.js";
+import { anthropicBetaContextWindow, anthropicBetaMessageThreads, BILI_HOP_HEADER, capRegistryWindowByStandard, expandedContextSuffixWindow, launcherContextWindow, launcherMaxOutput, noteUnresolvedModelSession, noteWindowSource, UNRESOLVED_MODEL_SESSION_THRESHOLD } from "./context-window.js";
 import { NO_IDENTITY_MESSAGE, safeSessionId } from "./headers.js";
 import { demoteGate, hasLeakedBiliToolsOnly, hasSingleShotBudget, isAudioOutputCall, isClaudeCodeTitleRequest, isDshAutoReviewRequest, isDshSingleShotSidecar, isDshTitleRequest, isMcodeOneShotAuxRequest, isMcodeTitleRequest, isOpencodeTitleRequest, isResponsesServerToolSingleShot, isServerToolUtilityCall, isSideRequest, isStructuredOutputCall, resolveSideLane, restoreOutputBudget, sideRequestGuard, stripLeakedBiliTools } from "./side-request.js";
 import { DSH_COMPACTION_SHAPE_MSGS, DSH_REFUSAL_STORM_LOG_EVERY, detectPassthroughDshCompactionCall, dshCompactionRefusal, dshPassthroughGuardStats, isDshCompactionCall } from "./dsh-compaction-guard.js";
@@ -75,13 +75,18 @@ import { artifactSeedHit, detectAcpArtifacts } from "./chain-artifacts.js";
 import { piSubagentChannelFallback } from "./pi-subagent-channel.js";
 import { FORCE_TEXT_PROTOCOL } from "./inject.js";
 import { prepareAnthropic } from "./prepare-anthropic.js";
-import { MSG_IDS_BODY_FIELD, MSGID_MODE_HEADER, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
+import { MSG_IDS_BODY_FIELD, MSGID_MODE_HEADER, elementOfCore, incomingMsgIdsOf, incomingMsgIdsHeader } from "../msgid-pin.js";
+import { recordAuthorityTurn, resolveEgressAuthority, egressBlockLedgerFor, egressTinyBudget } from "./egress-lane-io.js";
+import { recoverEgressBase } from "../storage/egress-record.js";
+import { rebuildCoreFromLog } from "../storage/egress-serve.js";
+import { EGRESS_SYSTEM_MSGID } from "../storage/egress-state.js";
 import { DeltaReanchorError } from "./fastpath.js";
 import { synthesizeTopLevel } from "./fastpath-scan.js";
 import { harvestIdentity } from "../identity-harvest.js";
 import "../identity-sources.js"; // #5825: register every harvested lane (side effect)
 import { prepareOpenai } from "./prepare-openai.js";
 import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
+import { noteSessionLaneSwitch } from "./session-lane.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logRefusedForeignPath, logUnrecognizedPath } from "./observability.js";
@@ -803,7 +808,20 @@ async function handleRequest(
         if (protocol === "openai" && wireFamily === null && pfProto && bodyBuffer.length >= 1048576 && featureEnabled("pluginFullResendWatermark")) {
             const scanCounts = { total: 0 };
             const synth = synthesizeTopLevel(bodyText, scanCounts);
-            if (synth !== null) { parsed = synth; bodyParseDeferred = true; deferredMsgCount = scanCounts.total; }
+            // #7857 review: deferral must not break conversation identity. With
+            // NO client conversation header, conversationSignalOpenai falls to a
+            // first-user-message fingerprint — which the synthesized body
+            // (messages = null marker) cannot produce: it would yield
+            // hashId("default"), one shared key for every such client =
+            // cross-conversation compression state. A prompt_cache_key (scanned
+            // top-level) keeps identity safe via the pck promotion below; a
+            // header or a pck is required, otherwise fall back to the legacy
+            // full parse (byte-for-byte the pre-#7398 behavior).
+            const synthPck = synth !== null && typeof (synth as { prompt_cache_key?: unknown }).prompt_cache_key === "string"
+                ? (synth as { prompt_cache_key: string }).prompt_cache_key
+                : "";
+            const identitySafe = (clientConversationHeader(req.headers) ?? "").trim() !== "" || synthPck.trim() !== "";
+            if (synth !== null && identitySafe) { parsed = synth; bodyParseDeferred = true; deferredMsgCount = scanCounts.total; }
         }
         if (!bodyParseDeferred) {
             try {
@@ -1058,6 +1076,10 @@ async function handleRequest(
     // FALLBACK_EFFECTIVE_WINDOW_FLOOR). Cleared when an async registry hit
     // replaces the value.
     let nativeFromFallback = false;
+    // C4 (PR #7684): model judged on the anonymous default window THIS request
+    // (set inside the window block; read again where the session is bound, to
+    // apply / record the session-local ratchet).
+    let ratchetableWindowModel: string | undefined;
     // Effective compression prompts for this request: resolved from the same
     // three-level cascade (global → provider → model) as the limit above, then
     // threaded into every prepare* path so the system prompt, the nudge text,
@@ -1176,11 +1198,15 @@ async function handleRequest(
             // #2336: agent-registry recipes are the FALLBACK layer — bili's
             // own named providers (file) win per provider name.
             reqConfig = resolveRequestConfig(config, opts.routes, embeddedUrl, model, native, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} });
+        // C4 (PR #7684): remember that THIS request judged the model on the
+        // anonymous default window (no declaration of any kind, and an
+        // operator-tuned window never counts as the default). The session-local
+        // ratchet is applied / recorded where the session is bound (below).
+        if (native === undefined && !operatorWindowTuned) ratchetableWindowModel = model;
             {
                 const wsSource = betaWindow ? "anthropic-beta" : suffixWindow ? "model-suffix" : pluginWindow ? "plugin" : runtimeWindow ? "runtime-info" : launcherWindow ? "launcher" : configuredWindow ? "configured" : peekWindow ? "registry-peek" : native ? "table-or-registry" : "default";
                 wsSourceForLog = wsSource;
-                if (!windowSourceLogged.has(model)) {
-                    windowSourceLogged.add(model);
+                if (noteWindowSource(model)) {
                     // #2096: label what this value IS — the pre-reservation base.
                     // The output-headroom reservation below shrinks
                     // reqConfig.modelContextLimit per request; its result gets
@@ -1226,6 +1252,7 @@ async function handleRequest(
                 const before = reqConfig.modelContextLimit;
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
+                ratchetableWindowModel = undefined; // the client's declared window now owns this model — the ratchet must never re-parse it back (see :3064)
                 windowShrinkReason = "codex";
                 codexWindowNetsOutput = codexWindowNetsOutputHeadroom(aligned.source);
                 log("info", `[codex] effective window clamped ${before} → ${aligned.limit} (window source=${aligned.source} for model=${model}) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
@@ -1236,6 +1263,7 @@ async function handleRequest(
                 const before = reqConfig.modelContextLimit;
                 reqConfig = { ...reqConfig, modelContextLimit: aligned.limit };
                 nativeFromFallback = false;
+                ratchetableWindowModel = undefined; // bili's own codex table sized this model — declared knowledge, not the anonymous fallback the ratchet may touch
                 codexWindowNetsOutput = codexWindowNetsOutputHeadroom(aligned.source);
                 log("info", `[codex] effective window raised ${before} → ${aligned.limit} (window source=${aligned.source} for model=${model}; bili's anonymous fallback undersized the session — #7205) upstream=${embeddedUrl ? hostIdForLog(embeddedUrl) : "none"} route=${routeLabel}`);
             } else if (operatorWindowTuned && native !== undefined && reqConfig.modelContextLimit < native) {
@@ -2100,7 +2128,14 @@ async function handleRequest(
                 ...(anonAffinity.lineage ? { lineage: anonAffinity.lineage } : {}),
                 ...(existingProducer ? { producer: existingProducer } : anonProvenance ? { producer: anonProvenance } : {}),
             };
-        } else if (clientProvided && zcodeMemory === undefined) {
+        } else if (clientProvided && zcodeMemory === undefined &&
+            // KDD #25 (discussions/7735): an egress-on session resolves identity
+            // from the op log + its sessions identity row, not from the
+            // content-chain map — skip the #1486 identified-client tracking for
+            // it (the 1.8 MB prefix-affinity kv blob stays out of an eg
+            // database). Anonymous clients keep writing: they have no other
+            // identity source and availability outranks retirement.
+            !(session.metadata?.["egressAuthority"] === true && egressPlaneGateOn())) {
             // #1486: track identified clients' chains too, so a resume that
             // forks a NEW client id (cc --resume) can be matched back to its
             // parent across requests and proxy restarts (the #499 snapshot
@@ -3065,7 +3100,34 @@ async function handleRequest(
         // otherwise the request is degenerate (output >= whole window) and the
         // self-heal above handles the resulting overflow. Feeds reqConfig (→
         // processTurn `config`), so diagNudge shows the reserved window (no extra log).
-        const nativeWindow = reqConfig.modelContextLimit;
+        let nativeWindow = reqConfig.modelContextLimit;
+        // C4 (PR #7684): window ratchet — a model with no declared window rides
+        // the anonymous default until this session's own billing proves the
+        // upstream window bigger: settleUsageReport raises
+        // session.metadata.windowRatchet[model] to 2× the observation
+        // (monotonic) when a turn BILLS beyond the window the request was
+        // judged on. Re-resolve the request config with the raised number so
+        // preflight/nudge judge against it (declared windows are never in the
+        // ratchet map; an operator-tuned window outranks it by construction).
+        if (ratchetableWindowModel !== undefined) {
+            const ratchetedRaw = ((session.metadata.windowRatchet ?? {}) as Record<string, unknown>)[ratchetableWindowModel];
+            if (typeof ratchetedRaw === "number" && Number.isFinite(ratchetedRaw) && ratchetedRaw > nativeWindow) {
+                reqConfig = resolveRequestConfig(config, opts.routes, providerDestUrl, ratchetableWindowModel, ratchetedRaw, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} });
+                nativeWindow = reqConfig.modelContextLimit;
+                wsSourceForLog = "ratchet";
+                // Session-scoped key: noteWindowSource's set is process-global, so
+                // without the session id the "applied" line would fire once for
+                // the first session and stay silent for every other session
+                // with the same model@window pair.
+                const ratchetLogKey = `${sessionId}@${ratchetableWindowModel}@${ratchetedRaw}`;
+                if (noteWindowSource(ratchetLogKey)) {
+                    log("info", `[window-ratchet-applied] model=${ratchetableWindowModel} session=${sessionId}: billing proved the anonymous default small — judging this request against the session-raised window ${nativeWindow} (source=ratchet; monotonic, session-local)`);
+                }
+            }
+            // Record what window THIS request judged the model on: the billing
+            // funnel compares the next successful report against this number.
+            session.metadata.windowFallbackModels = { ...((session.metadata.windowFallbackModels ?? {}) as Record<string, number>), [ratchetableWindowModel]: nativeWindow };
+        }
         const headroomOrigin = normalizeUpstreamOrigin(route?.rewrittenUrl ?? upstreamOrigin);
         // #3450 follow-up (#3973): a 400 that stated a completion share disproves
         // any separate-wall evidence for this origin+model — judging input against
@@ -3419,6 +3481,60 @@ async function handleRequest(
                         typeof (work as ResponsesRequestBody).previous_response_id === "string" &&
                         (work as ResponsesRequestBody).previous_response_id!.length > 0 &&
                         (!Array.isArray((work as ResponsesRequestBody).input) || (work as ResponsesRequestBody).input!.length === 0);
+                    // #6181 B3 + egress plane (PR #7857 review F2 → fix): the
+                    // fast path skips prepareResponses — and with it the egress
+                    // record/authority seam (ruling 7439-4's single shared
+                    // implementation). B3 rounds never carry wire msgids, so
+                    // they are never ARMED (no pin) — but a RECORD-ONLY turn
+                    // must still land: a bare-string input is NEW user content
+                    // the provider keeps in its retained chain and the client
+                    // may never resend — without this it is missing from the
+                    // op log (the egress transcript, ruling 7439-5) forever.
+                    // The seam's core must be the lane's FULL view (the diff
+                    // truncates anything it loses), so compose it append-only:
+                    // the flow view + this turn's fresh cores. The kernel id
+                    // is deterministic (content-derived), so the preflight
+                    // re-prepare — and any identical resend — finds the row in
+                    // the flow and records nothing new. Empty-continuation
+                    // turns carry no new content → skipped (a zero-op record
+                    // would only burn a flow read). The fast path itself is
+                    // untouched: no probe, no swap, no hard-fail — the
+                    // client's continuation bytes still go out verbatim
+                    // (#6181's whole point).
+                    // Only a NON-EMPTY string input carries new content: a
+                    // missing/empty input is a pure continuation (the
+                    // provider's chain already holds everything) and the
+                    // kernel's responsesToCore does not parse absent input
+                    // at all — nothing to record, skip the flow read.
+                    const b3Input = (work as ResponsesRequestBody).input;
+                    if (
+                        pureChainContinuation
+                        && typeof b3Input === "string" && b3Input.length > 0
+                        && !egressTinyBudget(work)
+                        && egressPlaneGateOn()
+                    ) {
+                        const b3Fresh = responsesToCore(work as ResponsesRequestBody);
+                        if (b3Fresh.msgs.length > 0) {
+                            const st = getStore().egressOpLogStore();
+                            if (st) {
+                                const base0 = recoverEgressBase(st, session.id, { walk: false });
+                                if (base0 !== null) {
+                                    const flowCore = rebuildCoreFromLog(base0.view);
+                                    if (flowCore !== null) {
+                                        const seen = new Set(base0.view.map((r) => r.msgid));
+                                        const core = [
+                                            ...flowCore,
+                                            ...b3Fresh.msgs.filter((m) => !seen.has(m.id) && !seen.has(elementOfCore(m.id).element)),
+                                        ];
+                                        const auth = resolveEgressAuthority({ session, st, sessionId: session.id, core, log, armed: false });
+                                        const sysFromFlow = base0.view.find((r) => r.msgid === EGRESS_SYSTEM_MSGID)?.bytes ?? "";
+                                        const systemText = b3Fresh.systemParts.length > 0 ? b3Fresh.systemParts.join("\n\n") : sysFromFlow;
+                                        recordAuthorityTurn(st, session.id, auth, systemText, log, egressBlockLedgerFor(session), session.state.messageRefs);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     const preparedOut = protocol === "anthropic"
                         ? await prepareAnthropic(work as AnthropicRequestBody, req, opts, core, reqConfig, reqPrompts, reqSurface, log, session, pluginMode, upstreamOrigin, reasoningCfg, visibilityMarkers, requestModel, decide)
                         : protocol === "openai"
@@ -3452,6 +3568,11 @@ async function handleRequest(
                 // request (initial AND preflight re-prepares both flow through).
                 const runPrepare = async (): Promise<Prepared> => {
                     const p = await runPrepareInner();
+                    // C5 (PR #7684): a wire-lane change for this session is an
+                    // EVENT — one loud line with the explicit cross-wire loss
+                    // list (the stored history re-renders on the new lane from
+                    // here on). Same-lane re-prepares (preflight) re-log nothing.
+                    noteSessionLaneSwitch(session, p.protocol, p.originalMessages ?? p.processedMessages, log);
                     if (ccMeta !== undefined) p.commandcode = { meta: ccMeta };
                     if (wireFamily === "zed" && zedMeta !== undefined) p.zed = { meta: zedMeta };
                     return p;

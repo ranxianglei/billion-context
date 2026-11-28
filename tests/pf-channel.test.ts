@@ -346,7 +346,12 @@ test("laneMsgIdsForOpenAiWire: bails honestly on anything unprovable", () => {
         laneMsgIdsForOpenAiWire([{ role: "user", content: "x" }, { role: "system", content: "s" }], [...branch]),
         undefined,
     );
-    // reasoning-family field anywhere
+    // the OTHER reasoning-family fields (not statically provable here)
+    assert.equal(
+        laneMsgIdsForOpenAiWire([{ role: "user", content: "x" }, { role: "assistant", content: "y", thinking: "r" }], branch),
+        undefined,
+    );
+    // reasoning_content with NO entry explaining it (branch ends at the user)
     assert.equal(
         laneMsgIdsForOpenAiWire([{ role: "user", content: "x" }, { role: "assistant", content: "y", reasoning_content: "r" }], branch),
         undefined,
@@ -359,6 +364,74 @@ test("laneMsgIdsForOpenAiWire: bails honestly on anything unprovable", () => {
         ]),
         undefined,
     );
+});
+
+// --- reasoning_content acceptance (the qwen/sglang pi regression) ---
+// pi's openai-compat serializer puts the assistant's thinking blocks into
+// `reasoning_content` (joined with "\n" from turn 2 onward). The resolver
+// must pin those turns by host id — value-proven, drift-bailed — instead of
+// clearing the whole envelope (the bug: egress rows fell back to content-
+// hash mints from the second turn on).
+
+test("laneMsgIdsForOpenAiWire: assistant thinking block ↔ reasoning_content pins by id (single block)", () => {
+    const branch = [
+        { type: "message", id: "1111aaaa", message: { role: "user", content: "q" } },
+        { type: "message", id: "2222bbbb", message: { role: "assistant", content: [{ type: "thinking", thinking: "let me see", thinkingSignature: "reasoning_content" }, { type: "text", text: "a" }] } },
+        { type: "message", id: "3333cccc", message: { role: "user", content: "q2" } },
+    ];
+    const wire = [
+        { role: "system", content: "You are T." },
+        { role: "user", content: "q" },
+        { role: "assistant", content: "a", reasoning_content: "let me see" },
+        { role: "user", content: "q2" },
+    ];
+    assert.deepEqual(laneMsgIdsForOpenAiWire(wire, branch), ["bili-ps-0", "1111aaaa", "2222bbbb", "3333cccc"]);
+});
+
+test("laneMsgIdsForOpenAiWire: consecutive thinking blocks join with \\n into one reasoning_content field", () => {
+    const branch = [
+        { type: "message", id: "4444dddd", message: { role: "assistant", content: [
+            { type: "thinking", thinking: "step one", thinkingSignature: "reasoning_content" },
+            { type: "thinking", thinking: "step two", thinkingSignature: "reasoning_content" },
+            { type: "text", text: "a" },
+        ] } },
+    ];
+    const wire = [{ role: "assistant", content: "a", reasoning_content: "step one\nstep two" }];
+    assert.deepEqual(laneMsgIdsForOpenAiWire(wire, branch), ["4444dddd"]);
+});
+
+test("laneMsgIdsForOpenAiWire: empty-string reasoning_content padding is no content (tool-call assistant)", () => {
+    const branch = [
+        { type: "message", id: "5555eeee", message: { role: "assistant", content: [{ type: "toolCall", id: "tc9" }] } },
+    ];
+    const wire = [{ role: "assistant", content: "", tool_calls: [{ id: "tc9" }], reasoning_content: "" }];
+    assert.deepEqual(laneMsgIdsForOpenAiWire(wire, branch), ["5555eeee"]);
+});
+
+test("laneMsgIdsForOpenAiWire: pi's reasoning-block storage form ({type:reasoning}) aligns too", () => {
+    const branch = [
+        { type: "message", id: "6666ffff", message: { role: "assistant", content: [{ type: "reasoning", text: "r" }, { type: "text", text: "a" }] } },
+    ];
+    const wire = [{ role: "assistant", content: "a", reasoning_content: "r" }];
+    assert.deepEqual(laneMsgIdsForOpenAiWire(wire, branch), ["6666ffff"]);
+});
+
+test("laneMsgIdsForOpenAiWire: reasoning_content byte drift bails (never a similarity pin)", () => {
+    const branch = [
+        { type: "message", id: "7777aaaa", message: { role: "assistant", content: [{ type: "thinking", thinking: "let me see", thinkingSignature: "reasoning_content" }, { type: "text", text: "a" }] } },
+    ];
+    const wire = [{ role: "assistant", content: "a", reasoning_content: "let me see…" }];
+    assert.equal(laneMsgIdsForOpenAiWire(wire, branch), undefined);
+});
+
+test("laneMsgIdsForOpenAiWire: thinking flattened into content (requiresThinkingAsText compat) still bails", () => {
+    // pi flattens thinking into a leading TEXT part under that compat flag —
+    // a think entry part vs a text wire part is NOT the proven lowering.
+    const branch = [
+        { type: "message", id: "8888bbbb", message: { role: "assistant", content: [{ type: "thinking", thinking: "t", thinkingSignature: "x" }, { type: "text", text: "a" }] } },
+    ];
+    const wire = [{ role: "assistant", content: "t a" }];
+    assert.equal(laneMsgIdsForOpenAiWire(wire, branch), undefined);
 });
 
 // ---------------------------------------------------------------------------

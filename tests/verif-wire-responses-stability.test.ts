@@ -102,14 +102,31 @@ describe("verif: wire responses stability (responsesToCore/coreToResponses/patch
         assert.equal(coreIdsOf(1).length, 2, "multi-part item must split into 2 cores (#3642)");
     });
 
-    it("P1 pinned #4150: text-before-multipart rebuild DROPS the image today", () => {
+    it("P1 pinned #4150/#7824: text-before-multipart rebuild KEEPS the image", () => {
         const out = coreToResponses(proj.msgs);
-        const flat = JSON.stringify(out);
-        // #4150: adjacent string-content user item ahead of a multi-part item
-        // makes flushUserRun pick the STRING carrier → imageParts=[] → image
-        // silently dropped, and the two items merge. Flip this pin when fixed.
-        assert.ok(!flat.includes("input_image"), "#4150 fixed? — image survives now; flip this pin and restore P1 to deepEqual(STAMPED)");
-        assert.notDeepEqual(out, STAMPED, "#4150 fixed? — rebuild became verbatim; flip this pin");
+        // #4150 was: the string carrier won flushUserRun → imageParts=[] →
+        // image silently dropped. #7824 fixed the drop (image cores carry a
+        // bound part; a missing source now throws instead of vanishing).
+        // The two adjacent user items still MERGE into one multi-part item —
+        // the established canonical form for a multi-core user run
+        // (cache-stable), so the pin is the merged shape, not STAMPED.
+        const expect: unknown[] = [
+            {
+                type: "message",
+                role: "user",
+                content: [
+                    { type: "input_text", text: "first question" },
+                    { type: "input_text", text: "look at this" },
+                    { type: "input_image", image_url: "data:image/png;base64,AAAA" },
+                ],
+            },
+            { type: "function_call", call_id: "call_1", name: "get_weather", arguments: '{"city":"Tokyo"}' },
+            { type: "function_call_output", call_id: "call_1", output: "18C, rain" },
+            { type: "message", role: "assistant", content: "It is 18C and rainy." },
+            { type: "message", role: "user", content: "thanks" },
+        ];
+        assert.deepEqual(out, expect);
+        assert.ok(JSON.stringify(out).includes("input_image"), "#4150 regressed? — image dropped again");
     });
 
     it("P1b round-trip WITHOUT the #4150 shape (assistant content stringified — see #4150 comment 2)", () => {

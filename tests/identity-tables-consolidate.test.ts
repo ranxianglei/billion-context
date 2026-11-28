@@ -35,6 +35,11 @@ process.env.BILI_PERSIST_ZSTD = "0";
 // only reads the egress view when the egressPlane rollout is on (master's #7583
 // gate); force it on so the stateless stage-0 branch is exercised.
 process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
+// KDD #25: these suites assert the LEGACY table shape (l1 rows, R3
+// carriers, GC) while egressPlane=1 — they simulate a pre-gate DB, so
+// force the full table set (the production gate would skip the 12 legacy
+// tables on this fresh test database).
+process.env.BILI_TEST_FORCE_FULL_DDL = "1";
 const hermetic = fs.mkdtempSync(path.join(os.tmpdir(), "bili-identity-consolidate-hermetic-"));
 process.env.BILI_CONFIG_FILE = path.join(hermetic, "no-config.json");
 process.env.BILI_STORAGE_UNIFIED = "legacy";
@@ -85,12 +90,14 @@ function insertSession(db: ReturnType<typeof openSqliteDatabase>["db"], sid: str
 
 function egressOnRow(db: ReturnType<typeof openSqliteDatabase>["db"], sid: string, atMs: number, msgids: string[]): void {
     insertSession(db, sid, atMs, { egressAuthority: true });
-    let after: string | null = null;
+    let after: number | null = null;
+    let rid = 0;
     for (const m of msgids) {
+        rid += 1;
         egressStateAppend(db, sid, [
-            { type: "I", msgid: m, after, ref: "", tokens: 3, typeTag: "text", bytes: `{"id":"${m}","role":"user","text":"${m}"}`, role: "user" },
+            { type: "I", rid, msgid: m, after, ref: "", tokens: 3, typeTag: "text", bytes: `{"id":"${m}","role":"user","text":"${m}"}`, role: "user" },
         ], atMs);
-        after = m;
+        after = rid;
     }
 }
 
@@ -233,7 +240,10 @@ test("S2 (owner ruling 2026-11-24): egressPlane OFF → latch writes the legacy 
             assert.equal(h.db.prepare("SELECT sess_raw FROM l1_world WHERE sess_raw = ?").get("sid-ro"), undefined, "NOT keyed by the ledger sid");
             assert.equal(h.store.snapR3Latched("sid-ro"), true, "readable via the l1 fallback (keyed by sessRaw)");
         } finally {
-            delete process.env.BILI_ROLLOUT_EGRESS_PLANE; // restore the branch default (100) for the rest of the file
+            // restore the module-level plane for the rest of the file (the
+            // branch default is 0 since KDD #25 — "unset" means OFF, so an
+            // explicit restore is what keeps the egress-branch tests armed).
+            process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
         }
     } finally {
         closeStore(h);
@@ -312,7 +322,7 @@ test("S5: GC — an egress-on session with RECENT op-log activity is not stale e
     try {
         insertSession(h.db, sid, Date.now() - 100 * 86_400_000, { egressAuthority: true }); // row froze 100 days ago
         egressStateAppend(h.db, sid, [
-            { type: "I", msgid: "m1", after: null, ref: "", tokens: 3, typeTag: "text", bytes: '{"id":"m1","role":"user","text":"m1"}', role: "user" },
+            { type: "I", rid: 1, msgid: "m1", after: null, ref: "", tokens: 3, typeTag: "text", bytes: '{"id":"m1","role":"user","text":"m1"}', role: "user" },
         ], Date.now() - 60_000); // but the op log moved a minute ago
         const plan = h.store.gcPlan(30);
         assert.ok(!plan.candidates.some((c) => c.sessionId === sid), "freshness = max(updated_at, last op-log row) — the session is active");

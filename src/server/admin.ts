@@ -20,7 +20,7 @@ import { handlePluginAttribution, handlePluginCompact, handlePluginFork, handleP
 import { parseAgentProviderReport, recordAgentProviders, agentProviderRecipes, sanitizeAgentProviderField } from "../agent-providers.js";
 import { configDir, defaultLogFile } from "../paths.js";
 import { getUpdateVisibility, updateBannerPayload } from "../update-notes.js";
-import { installVersionAction, triggerManualCheck, updateActionsAvailable, updateStateSnapshot } from "./update-actions.js";
+import { clearPinAction, installVersionAction, pinCurrentAction, triggerManualCheck, updateActionsAvailable, updateStateSnapshot } from "./update-actions.js";
 import { getRefusedForeignPathStats, getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { r3FaultTracker } from "../snapshot/plane.js";
@@ -411,6 +411,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     }
     if (req.method === "POST" && req.url === "/__bili/update/check") return handleUpdateCheck(res);
     if (req.method === "POST" && req.url === "/__bili/update/install") return handleUpdateInstall(req, res, log);
+    if (req.method === "POST" && req.url === "/__bili/update/pin") return handleUpdatePin(req, res, log);
+    if (req.method === "POST" && req.url === "/__bili/update/pin/clear") return handleUpdatePinClear(res, log);
     if (req.method === "PUT" && req.url === "/__bili/config") {
         return handleConfigPut(req, res, () => {
             const fresh = loadOptions();
@@ -1172,6 +1174,47 @@ async function handleUpdateInstall(req: http.IncomingMessage, res: http.ServerRe
     log("info", `[update] web panel requested install ${version}`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(await installVersionAction(version), null, 2));
+}
+
+/** POST /__bili/update/pin {"duration":"1h"} — hold the INSTALLED version
+ *  (#6804): the auto-updater keeps checking + reporting but never installs.
+ *  `duration` uses the `bili pin` vocabulary ("1h"/"12h"/"1d"/"7d"/"forever");
+ *  omitted/empty body = indefinite. Always HTTP 200 {ok, error?}. */
+async function handleUpdatePin(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
+    let duration: string | undefined;
+    try {
+        const raw = (await readBody(req)).toString("utf8");
+        if (raw.trim().length > 0) {
+            const doc: unknown = JSON.parse(raw);
+            if (doc === null || typeof doc !== "object" || Array.isArray(doc)) throw new Error("pin body must be a JSON object");
+            const d: unknown = (doc as { duration?: unknown })["duration"];
+            if (d !== undefined && typeof d !== "string") throw new Error("pin duration must be a string");
+            if (typeof d === "string") duration = d;
+        }
+    } catch {
+        // malformed body: pin is input-optional, but a GARBAGE duration (or a
+        // non-object body / non-string duration) must not become "indefinite"
+        // — reject it like the other POSTs.
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: 'expected JSON body {"duration": "1h" | "12h" | "1d" | "7d" | "forever"} (or no body for indefinite)' }, null, 2));
+        return;
+    }
+    if (duration !== undefined && !/^(?:[0-9]+(?:h|d|m|s))+$|^forever$/i.test(duration.trim())) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "duration must look like 1h / 12h / 1d / 7d / forever (see `bili pin --help`)" }, null, 2));
+        return;
+    }
+    log("info", `[update] web panel requested a pin of the installed version ${duration ? `for ${duration}` : "indefinitely"}`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(await pinCurrentAction(VERSION, duration), null, 2));
+}
+
+/** POST /__bili/update/pin/clear — release the local version pin (#6804).
+ *  Always HTTP 200 {ok, error?}. */
+async function handleUpdatePinClear(res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
+    log("info", `[update] web panel requested to release the version pin`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(await clearPinAction(), null, 2));
 }
 
 // #2861: server-side dismissal of a host-plugin notice (body {"id": string}).

@@ -42,8 +42,8 @@ test("#7574 a library interrupted between the two egress tables completes on its
     const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bili-7574-egress-")), "index.db");
     const { db } = openSqliteDatabase(file);
     try {
-        // The state the old code left behind: the first CREATE of the batch
-        // committed, the process died before the second one.
+        // The state a mid-PR dev build left behind: the first CREATE of the
+        // batch committed, the process died before the second one.
         db.exec(`CREATE TABLE egress_state (
             session_id TEXT NOT NULL,
             op_seq INTEGER NOT NULL,
@@ -65,11 +65,15 @@ test("#7574 a library interrupted between the two egress tables completes on its
         assert.ok(names.includes("egress_flow"), "the missing egress_flow is created");
         const idx = (db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('idx_egress_state_msgid', 'idx_egress_flow_msgid') ORDER BY name").all() as unknown as { name: string }[])
             .map((r) => r.name);
-        assert.deepEqual(idx, ["idx_egress_flow_msgid", "idx_egress_state_msgid"], "both indexes of the group exist");
+        assert.deepEqual(idx, ["idx_egress_flow_msgid", "idx_egress_state_msgid"], "both msgid lookup indexes exist (PK is now (session_id, rid) — 2026-11-27 owner ruling)");
+        assert.ok(
+            (db.prepare("SELECT COUNT(*) AS n FROM pragma_table_info('egress_state') WHERE name = 'pos'").get() as { n: number }).n === 1,
+            "the rebuilt state table carries the 7773 materialized shape (pos column)",
+        );
         assert.equal(
             (db.prepare("SELECT COUNT(*) AS n FROM egress_state").get() as { n: number }).n,
-            1,
-            "the row that was already written survives",
+            0,
+            "7773 §7: the tables were never released — the interim rows are dropped, not migrated",
         );
         // Idempotent: the next open is a no-op for the group.
         migrateSchema(db);

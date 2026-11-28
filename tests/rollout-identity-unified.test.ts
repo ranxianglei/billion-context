@@ -11,6 +11,10 @@ import path from "node:path";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-rollout-"));
 process.env.BILI_STORAGE_UNIFIED = "full";
+// KDD #25: this suite exercises the legacy ingest path on fresh databases;
+// force the full table set so a host config with egressPlane forced on
+// cannot make the store skip the legacy group under the creation gate.
+process.env.BILI_TEST_FORCE_FULL_DDL = "1";
 process.env.BILI_SESSIONS_DIR = path.join(root, "sessions");
 process.env.XDG_STATE_HOME = path.join(root, "state");
 process.env.XDG_CACHE_HOME = path.join(root, "cache");

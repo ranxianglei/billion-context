@@ -2,13 +2,15 @@
  * #6525: dsh full-resend envelope (carrier ①) — resolver tests.
  *
  * The envelope stamps the model body's own parallel id array
- * (`biliMsgIds`, core-aligned) so host-pinned prefixes exist on EVERY
- * full-resend turn, not only the anthropic-wire incremental lane.
- * Resolution never re-implements the host's wire transforms: the pi-ai
- * lockstep walkers prove wire-element ⇔ host-message pairing, and the
- * kernel's own converters prove core-alignment via the #3642 wireIndex
- * back-pointer. These tests pin the resulting accept/bail matrix against
- * REAL kernel + REAL walker behavior (no re-implementations).
+ * (`biliMsgIds`, WIRE-ELEMENT-aligned — #7439 follow-up: the kernel splits
+ * one element into N cores on agentic turns; the server dual-modes the pin,
+ * per-core when 1:1, wire-groups with derived sibling ids when split) so
+ * host-pinned prefixes exist on EVERY full-resend turn, not only the
+ * anthropic-wire incremental lane. Resolution never re-implements the host's
+ * wire transforms: the pi-ai lockstep walkers prove wire-element ⇔
+ * host-message pairing; any pairing mismatch bails to no field. These tests
+ * pin the resulting accept/bail matrix against REAL walker behavior (no
+ * re-implementations).
  */
 import assert from "node:assert";
 import { test } from "node:test";
@@ -41,16 +43,16 @@ test("openai: no leading system → every id", () => {
     assert.deepStrictEqual(resolve(wire, host), ["u1", "u2"]);
 });
 
-test("openai: user [text, image_url] → bail (kernel splits one element into N cores)", () => {
+test("openai: user [text, image_url] → element id (kernel splits one element into N cores; the server pins the split via wire groups)", () => {
     const wire = oai([{ role: "user", content: [{ type: "text", text: "see" }, { type: "image_url", image_url: { url: "x" } }] }]);
     const host = [user("u1", [text("see"), { type: "image", data: "x", mimeType: "image/png" }])];
-    assert.strictEqual(resolve(wire, host), undefined);
+    assert.deepStrictEqual(resolve(wire, host), ["u1"]);
 });
 
-test("openai: assistant with parallel tool_calls → bail (N tool_call cores, one host id)", () => {
+test("openai: assistant with parallel tool_calls → element id (N tool_call cores, one host id; the server pins the split via wire groups)", () => {
     const wire = oai([{ role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }, { id: "c2", type: "function", function: { name: "g", arguments: "{}" } }] }]);
     const host = [asst("a1", [{ type: "toolCall", id: "c1", name: "f", arguments: {} }, { type: "toolCall", id: "c2", name: "g", arguments: {} }])];
-    assert.strictEqual(resolve(wire, host), undefined);
+    assert.deepStrictEqual(resolve(wire, host), ["a1"]);
 });
 
 test("openai: reasoning_content anywhere → bail (walker refuse, conversion not statically provable)", () => {
@@ -114,10 +116,10 @@ test("openai: dsh flat host shape (role tool + block tool-call) → core-aligned
     assert.deepStrictEqual(resolve(wire, host), ["u1", "a1", "t1", "a2"]);
 });
 
-test("openai: dsh parallel tool_calls still bail (one host id cannot cover N cores)", () => {
+test("openai: dsh parallel tool_calls → element id (dsh flat shape, one host id per wire element)", () => {
     const wire = oai([{ role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }, { id: "c2", type: "function", function: { name: "g", arguments: "{}" } }] }]);
     const host = [{ id: "a1", role: "assistant", content: [{ type: "tool-call", id: "c1", name: "f", arguments: "{}" }, { type: "tool-call", id: "c2", name: "g", arguments: "{}" }], timestamp: 1 }];
-    assert.strictEqual(resolve(wire, host), undefined);
+    assert.deepStrictEqual(resolve(wire, host), ["a1"]);
 });
 
 test("anthropic: system field separate, full conversation → 1:1 ids", () => {

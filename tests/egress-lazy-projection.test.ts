@@ -18,9 +18,9 @@ import * as path from "node:path";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { openSqliteDatabase } from "../src/storage/driver.ts";
 import { migrateSchema } from "../src/storage/schema.ts";
-import { egressAppendTurn, egressStateView } from "../src/storage/egress-state.ts";
+import { egressAppendTurn, egressFlowWalkBack, egressStateRead, egressStateView } from "../src/storage/egress-state.ts";
 import { recordEgressTurn, type EgressOpLogStore } from "../src/storage/egress-record.ts";
-import { featureEnabled } from "../src/rollout.ts";
+import { egressPlaneGateOn } from "../src/knobs.ts";
 
 // The pin read consults the op log only while the plane is on (#7574).
 process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
@@ -41,7 +41,7 @@ function openStore(): { store: UnifiedStore; adapter: EgressOpLogStore; db: Retu
     const store = UnifiedStore.open(path.join(dir, "index.db"));
     const adapter: EgressOpLogStore = {
         egressAppendTurn: (sid, ops, baseSeq, nowMs) => egressAppendTurn(db, sid, ops, nowMs, { baseSeq }),
-        egressStateView: (sid) => egressStateView(db, sid),
+        egressStateView: (sid) => egressStateRead(db, sid),
         egressStateViewAt: (sid, seq) => {
             const rows = db
                 .prepare("SELECT op_seq, log_seq, row_type, msgid, payload, bytes FROM egress_flow WHERE session_id = ? AND op_seq <= ? ORDER BY op_seq ASC")
@@ -54,10 +54,10 @@ function openStore(): { store: UnifiedStore; adapter: EgressOpLogStore; db: Retu
             return (db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?").get(sid) as { mx: number }).mx;
         },
         egressStateTruncateAfter: (sid, seq) => {
-            const a = db.prepare("DELETE FROM egress_state WHERE session_id = ? AND op_seq > ?").run(sid, seq);
             const b = db.prepare("DELETE FROM egress_flow WHERE session_id = ? AND op_seq > ?").run(sid, seq);
-            return Number(a.changes) + Number(b.changes);
+            return Number(b.changes);
         },
+        egressFlowWalkBack: (sid) => egressFlowWalkBack(db, sid),
     };
     return { store, adapter, db, dir };
 }
@@ -119,28 +119,30 @@ test("snapPinLiveIds: a damaged serving copy is copied again from the log; a cor
     try {
         let view = recordEgressTurn({ store: H.adapter, sessionId: "s3", prev: undefined, conversation: [M("m1", "alpha")], systemText: "sys", nowMs: 1 });
         view = recordEgressTurn({ store: H.adapter, sessionId: "s3", prev: view, conversation: [M("m1", "alpha"), M("m2", "beta")], systemText: "sys", nowMs: 2 });
-        // A +U whose target msgid does not exist in the view: the replay
-        // must reject (EgressStateCorruptError).
-        const bad = dbMaxOpSeq(H.db, "s3") + 1;
-        const plant = (table: string) =>
+        // A ghost state row: pos density breaks, the serving read notices.
+        const plantStateGhost = () =>
             H.db
-                .prepare(`INSERT INTO ${table} (session_id, op_seq, log_seq, row_type, msgid, payload, bytes, created_at) VALUES (?, ?, NULL, 'U', ?, ?, ?, ?)`)
-                .run("s3", bad, "ghost", JSON.stringify({ role: "user" }), "corrupt-bytes", 3);
+                .prepare(`INSERT INTO egress_state (session_id, rid, msgid, pos, log_seq, num, ref, tokens, type, role, ts, sys_in, bytes, created_at) VALUES (?, 99, 'ghost', 99, 0, 0, '', 0, 'text', 'user', 0, 0, 'x', 3)`)
+                .run("s3");
         // 1. only the SERVING COPY is damaged, the log itself is intact: the
         //    copy is rebuilt from the log and the session keeps its ids
         //    (#7574 — it used to fall back to the stale messages ledger for
         //    as long as the damaged row stayed).
-        plant("egress_state");
-        assert.throws(() => H.adapter.egressStateView("s3"), /corrupt|egress-state/i);
+        plantStateGhost();
+        const healed = H.adapter.egressStateView("s3");
+        assert.deepEqual(healed.map((r) => r.msgid), ["egress-system", "m1", "m2"], "the self-healing read replays the intact log");
         assert.deepEqual(H.store.snapPinLiveIds("s3"), ["m1", "m2"], "intact log → the copy is repaired, the ids come from the log");
-        assert.equal(dbMaxOpSeq(H.db, "s3"), bad - 1, "the damaged row is gone after the repair");
+        const stateCount = (H.db.prepare("SELECT COUNT(*) AS c FROM egress_state WHERE session_id = ?").get("s3") as { c: number }).c;
+        assert.equal(stateCount, 3, "the damaged row is gone after the repair");
         // 2. the LOG is corrupt too: the pin read falls back to the messages
-        //    ledger instead of throwing.
-        plant("egress_state");
-        plant("egress_flow");
+        //    ledger instead of throwing. Damage a flow I-row's payload (the
+        //    rebuild replay meets it) on top of a stray state row (which is
+        //    what sends the read onto the rebuild path).
+        H.db.prepare(`UPDATE egress_flow SET payload = ? WHERE session_id = ? AND row_type = 'I' AND msgid = 'm1'`).run('{"x":1}', "s3");
+        plantStateGhost();
         assert.throws(() => H.adapter.egressStateView("s3"), /corrupt|egress-state/i);
         assert.deepEqual(H.store.snapPinLiveIds("s3"), H.store.snapMsgIdLiveIds("s3"), "corrupt op log → messages ledger (stale-but-honest, never a pin-path throw)");
-        assert.ok(dbMaxOpSeq(H.db, "s3") >= bad, "a corrupt log is left for the operator — the read does not delete anything");
+        assert.ok(dbMaxOpSeq(H.db, "s3") >= 3, "a corrupt log is left for the operator — the read does not delete anything");
     } finally {
         cleanup(H);
     }
@@ -157,7 +159,7 @@ test("snapPinLiveIds: with the plane switched off the op log is not consulted, e
         // the session goes back to the messages ledger like any other.
         // GA (2026-11-24): "unset" resolves ON, so the rollback is forced "0".
         process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
-        assert.equal(featureEnabled("egressPlane"), false, "precondition: the plane is off");
+        assert.equal(egressPlaneGateOn(), false, "precondition: the plane is off");
         assert.deepEqual(H.store.snapPinLiveIds("s4"), H.store.snapMsgIdLiveIds("s4"), "plane off: messages ledger, the op log is ignored");
         // on again: the log is picked up where it was
         process.env.BILI_ROLLOUT_EGRESS_PLANE = "1";
@@ -170,5 +172,5 @@ test("snapPinLiveIds: with the plane switched off the op log is not consulted, e
 });
 
 function dbMaxOpSeq(db: ReturnType<typeof openSqliteDatabase>["db"], sid: string): number {
-    return (db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_state WHERE session_id = ?").get(sid) as { mx: number }).mx;
+    return (db.prepare("SELECT COALESCE(MAX(op_seq), 0) AS mx FROM egress_flow WHERE session_id = ?").get(sid) as { mx: number }).mx;
 }
