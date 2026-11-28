@@ -435,7 +435,10 @@ test("#475 G3: fake-completion buffering + streaming request answered with JSON 
         await h.close();
     }
 });
-test("#4204 side-lane continuation 429 remains scoped to its request model", async () => {
+// #6466 removed the side-lane continuation refetch (side lane ends as-is), so the
+// #4204 429-scoping mechanism is now exercised through a main-lane (non-side)
+// non-injected request, which still performs the continuation refetch.
+test("#4204 non-injected continuation 429 remains scoped to its request model", async () => {
     const previousThrottle = {
         BILI_THROTTLE_429: process.env.BILI_THROTTLE_429,
         BILI_THROTTLE_429_MAX_CONSECUTIVE: process.env.BILI_THROTTLE_429_MAX_CONSECUTIVE,
@@ -472,11 +475,11 @@ test("#4204 side-lane continuation 429 remains scoped to its request model", asy
         const side = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1/chat/completions`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "side-throttle-model", authorization: "Bearer same-key" },
-            body: JSON.stringify({ model: "model-a", max_tokens: 100, stream: true, messages: [{ role: "user", content: "title?" }] }),
+            body: JSON.stringify({ model: "model-a", max_tokens: 4096, stream: true, messages: [{ role: "user", content: "answer?" }] }),
         });
         assert.equal(side.status, 200);
         await side.text();
-        assert.equal(h.hits(), 2, "the empty side turn performs exactly one continuation refetch");
+        assert.equal(h.hits(), 2, "the empty non-injected turn performs exactly one continuation refetch");
         assert.equal(activeThrottleHolds().length, 1);
         assert.equal(activeThrottleHolds()[0].model, "model-a", "the continuation's exact KeyRing marker scopes the hold");
 
@@ -485,7 +488,7 @@ test("#4204 side-lane continuation 429 remains scoped to its request model", asy
             headers: { "content-type": "application/json", "x-acp-session": "side-throttle-other", authorization: "Bearer same-key" },
             body: JSON.stringify({ model: "model-b", max_tokens: 1024, stream: true, messages: [{ role: "user", content: "answer?" }] }),
         });
-        assert.equal(otherModel.status, 200, "the side retry must not widen its model-local hold to the shared credential");
+        assert.equal(otherModel.status, 200, "the model-B request must not widen model A's model-local hold to the shared credential");
         await otherModel.text();
         assert.equal(h.hits(), 3, "model B reaches the upstream instead of being locally blocked");
         assert.equal(activeThrottleHolds().length, 1);
@@ -500,7 +503,10 @@ test("#4204 side-lane continuation 429 remains scoped to its request model", asy
     }
 });
 
-test("#4204 Google side-lane stream keeps its path model through continuation throttling", async () => {
+// #6466 removed the side-lane continuation refetch (side lane ends as-is), so the
+// #4204 429-scoping mechanism is now exercised through a main-lane (non-side)
+// non-injected request, which still performs the continuation refetch.
+test("#4204 Google non-injected stream keeps its path model through continuation throttling", async () => {
     const previousThrottle = {
         BILI_THROTTLE_429: process.env.BILI_THROTTLE_429,
         BILI_THROTTLE_429_MAX_CONSECUTIVE: process.env.BILI_THROTTLE_429_MAX_CONSECUTIVE,
@@ -537,19 +543,19 @@ test("#4204 Google side-lane stream keeps its path model through continuation th
         const first = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1beta/models/path-side-a:streamGenerateContent?alt=sse`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "google-side-a", authorization: "Bearer google-side-key" },
-            body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "title?" }] }], generationConfig: { maxOutputTokens: 64 } }),
+            body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "answer?" }] }], generationConfig: { maxOutputTokens: 1024 } }),
         });
         assert.equal(first.status, 200);
         const firstText = await first.text();
-        assert.equal(firstText.includes(OPEN_MARK), false, "path-streamed side response still takes the render-tag strip pipe");
-        assert.equal(h.hits(), 2, "the tag-only side stream issues one continuation refetch");
+        assert.equal(firstText.includes(OPEN_MARK), false, "path-streamed non-injected response still takes the render-tag strip pipe");
+        assert.equal(h.hits(), 2, "the tag-only non-injected stream issues one continuation refetch");
         assert.equal(activeThrottleHolds().length, 1);
         assert.equal(activeThrottleHolds()[0].model, "path-side-a", "the continuation 429 uses the Gemini URL model");
 
         const second = await fetch(`http://127.0.0.1:${h.proxyPort}/bili/http://127.0.0.1:${h.upstreamPort}/v1beta/models/path-side-b:streamGenerateContent?alt=sse`, {
             method: "POST",
             headers: { "content-type": "application/json", "x-acp-session": "google-side-b", authorization: "Bearer google-side-key" },
-            body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "answer?" }] }], generationConfig: { maxOutputTokens: 64 } }),
+            body: JSON.stringify({ contents: [{ role: "user", parts: [{ text: "answer?" }] }], generationConfig: { maxOutputTokens: 1024 } }),
         });
         assert.equal(second.status, 200, "the model-A continuation hold does not block another model on the same credential");
         await second.text();
