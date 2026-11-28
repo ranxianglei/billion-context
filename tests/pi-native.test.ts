@@ -175,6 +175,34 @@ test("planNativePi: a preset BILLION_CONTEXT_PROXY is an attach target, not a st
     assert.deepEqual(planNativePi({ BILLION_CONTEXT_PROXY: "  " }), { mode: "inline" });
 });
 
+test("planNativePi: an inherited INLINE_ORIGIN placeholder is not an attach target (#5645)", () => {
+    // A pi-subagents acp_delegate child spawned with {...process.env} while its
+    // parent runs inline (the #5428 default) inherits
+    // BILLION_CONTEXT_PROXY=INLINE_ORIGIN — a process-local placeholder the host
+    // never listens on. It must NOT be treated as an announced attach target
+    // (attaching to the dead host degrades every request direct); instead it is
+    // discounted so the child resolves its own posture below — inline by
+    // default, i.e. it runs its OWN in-process engine exactly like the parent
+    // (no server), or spawn if the host opted out via config. A REAL launcher
+    // origin (`bili pi` sets a live proxy) is untouched.
+    assert.deepEqual(
+        planNativePi({ BILLION_CONTEXT_PROXY: INLINE_ORIGIN }),
+        { mode: "inline" },
+        "inherited placeholder discounted → child's own inline engine (#5428 default)",
+    );
+    assert.deepEqual(
+        planNativePi({ BILLION_CONTEXT_PROXY: INLINE_ORIGIN }, false),
+        { mode: "spawn" },
+        "explicit file opt-out still → spawn",
+    );
+    // a REAL launcher origin is untouched by the guard:
+    assert.deepEqual(
+        planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485" }),
+        { mode: "attach", attachOrigin: "http://127.0.0.1:36485" },
+        "real launcher origin still attaches",
+    );
+});
+
 test("planNativePi: explicit BILLION_CONTEXT_ATTACH wins over the env preset", () => {
     assert.deepEqual(
         planNativePi({ BILLION_CONTEXT_PROXY: "http://127.0.0.1:36485", BILLION_CONTEXT_ATTACH: "http://10.0.0.5:9000" }),
