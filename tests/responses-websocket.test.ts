@@ -719,7 +719,12 @@ test("Responses WS faults: refused handshake falls back to HTTP egress without l
         assert.equal((await response.json() as Item).status, "completed");
         assert.equal(f.rows.length, 1);
         assert.equal(f.rows[0].request.previous_response_id, undefined);
-        assert.match(log.join("\n"), /failed phase=handshake event=error close_code=none/);
+        // #6171: the opaque `event=error close_code=none` line is now two correlated
+        // lines — the error event names its class/message, and the synchronous
+        // follow-up close (undici fires it for every non-101 upgrade refusal) keeps
+        // its 1006/wasClean facts instead of being dropped by the old once-listeners.
+        assert.match(log.join("\n"), /failed phase=handshake event=error error_class=\w+ error_message=\S+ elapsed_ms=\d+/);
+        assert.match(log.join("\n"), /failed phase=handshake event=close close_code=1006 was_clean=false elapsed_ms=\d+/);
         assert.match(log.join("\n"), /egress mode=http reason=ws-handshake-refused/);
         assert.match(log.join("\n"), /checkpoint reset reason=ws-refused-http-fallback/);
         assert.doesNotMatch(log.join("\n"), /private-|secret|Bearer/);
