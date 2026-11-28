@@ -2983,7 +2983,24 @@ async function handleRequest(
             // model's real window. overflowArmTokens is set ONLY by an upstream
             // context-overflow 400 and cleared by the next real usage report.
             const armedForGuard = typeof session.stats.overflowArmTokens === "number" && session.stats.overflowArmTokens > 0 ? session.stats.overflowArmTokens : 0;
-            const guard = sideRequestGuard(parsed, protocol, reqConfig.modelContextLimit, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), imageTokenCapFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap, armedForGuard, imageReserveFor(session, protocol, parsed, opts, route?.rewrittenUrl ?? upstreamOrigin), shouldReserveOutputHeadroom(protocol, normalizeUpstreamOrigin(route?.rewrittenUrl ?? upstreamOrigin), requestModel));
+            let sideWindow = reqConfig.modelContextLimit;
+            let reserveSideOutput = shouldReserveOutputHeadroom(protocol, normalizeUpstreamOrigin(route?.rewrittenUrl ?? upstreamOrigin), reqModel);
+            if (protocol === "responses" && reqModel && nativeFromFallback && resolvedNativeWindow === undefined) {
+                // Alignment above can only shrink. With no native or operator
+                // window, a matched Codex model is better evidence for the side
+                // guard than the anonymous default (e.g. codex-auto-review).
+                const evidence = codexAlignedWindow(Infinity, reqModel, req.headers);
+                const netsOutput = codexWindowNetsOutputHeadroom(evidence.source);
+                if ((netsOutput || evidence.source === "bundled-snapshot") && evidence.limit > sideWindow) {
+                    sideWindow = evidence.limit;
+                    // A live catalog already reserves output. An operator cap
+                    // or a lower upstream overflow arm keeps the reservation.
+                    if (netsOutput && resolvedHeadroomCompress.outputHeadroomMaxPct === undefined && (armedForGuard === 0 || armedForGuard >= sideWindow)) {
+                        reserveSideOutput = false;
+                    }
+                }
+            }
+            const guard = sideRequestGuard(parsed, protocol, sideWindow, imageBillingFor(opts, route?.rewrittenUrl ?? upstreamOrigin), imageTokenCapFor(opts, route?.rewrittenUrl ?? upstreamOrigin), headroomCap, armedForGuard, imageReserveFor(session, protocol, parsed, opts, route?.rewrittenUrl ?? upstreamOrigin), reserveSideOutput);
             if (guard.blocked) {
                 log("warn", `[${session.id}] side request (~${guard.estimate} tokens) ≥ effective window ${guard.limit} (model=${reqModel ?? "?"}) — NOT forwarded: guaranteed upstream 400 (side requests bypass preflight by design, #388)`);
                 if (!res.headersSent && !res.writableEnded && !res.destroyed) {
