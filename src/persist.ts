@@ -533,6 +533,12 @@ export class SessionStore {
      *  sessions do not re-query the checkpoints table every flush. */
     private readonly forkBaseCut = new Set<string>();
     private readonly storageMode: StorageMode;
+    /** #5595/F4: constructor-time encryption hard-block (BILI_ENCRYPTION_KEY
+     *  active while a unified mode was requested). Stored so
+     *  configuredUnified() answers "did this instance resolve to run the
+     *  unified store" from construction facts alone — independent of sidecar
+     *  liveness. */
+    private readonly unifiedBlockedByEncryption: boolean;
     /** Phase 3 (#2960): true only when the JSON envelope is actually skipped —
      *  requires an explicit off request AND effective-full mode.
      *  writerOffActive() additionally needs a LIVE sidecar, so if the sidecar
@@ -663,8 +669,8 @@ export class SessionStore {
         // cleartext, so the sidecar refuses to open while BILI_ENCRYPTION_KEY
         // is active and the store stays legacy-only.
         const storageMode = resolveStorageModeSafe();
-        const unifiedBlockedByEncryption = storageMode !== "legacy" && key !== null;
-        if (unifiedBlockedByEncryption) {
+        this.unifiedBlockedByEncryption = storageMode !== "legacy" && key !== null;
+        if (this.unifiedBlockedByEncryption) {
             baseLog("warn", "[storage] unified sidecar DISABLED: BILI_ENCRYPTION_KEY is active and index.db would hold cleartext ingest payloads — staying legacy-only");
         }
         this.storageMode = storageMode;
@@ -672,7 +678,7 @@ export class SessionStore {
         // is an intentional opt-out — the runtime banner must say so instead of
         // fabricating a "no SQLite engine" degrade for a sidecar that was never
         // supposed to open.
-        recordRequestedMode(storageMode, unifiedBlockedByEncryption, !this.enabled);
+        recordRequestedMode(storageMode, this.unifiedBlockedByEncryption, !this.enabled);
         // Phase 3 (#2960) + pure-sqlite default: the JSON envelope writer is
         // OFF by default for pure-sqlite selections (storage.unified absent or
         // "sqlite") — the SQLite index is the only persistent copy. Explicit
@@ -684,7 +690,7 @@ export class SessionStore {
         // an async (network) shadow keeps the envelope as its sync read path
         // even when the env spells sqlite — writerOff stays sqlite-only.
         const writerBackendIsSqlite = opts?.shadow !== undefined ? !opts.shadow.isAsyncBackend : resolveBackendName(process.env, fileStorageBackend()) === "sqlite";
-        this.jsonWriterOff = knobEffectiveJsonWriterOff(process.env, fileStorageJsonWriter(), fileStorageUnified()) && storageMode === "full" && !unifiedBlockedByEncryption && writerBackendIsSqlite;
+        this.jsonWriterOff = knobEffectiveJsonWriterOff(process.env, fileStorageJsonWriter(), fileStorageUnified()) && storageMode === "full" && !this.unifiedBlockedByEncryption && writerBackendIsSqlite;
         if (this.jsonWriterOff && jsonWriterOffChoice === "unset") {
             baseLog("info", "[storage] json envelope writer off (pure-sqlite default — index.db is the only persistent copy; restore dual-write with storage.jsonWriter=on)");
         }
@@ -702,7 +708,7 @@ export class SessionStore {
             // #4942 test seam: a pre-built sidecar skips the env-driven open.
             this.shadow = opts.shadow;
             this.networkFullExpected = !!(opts.shadow.readsUnified && opts.shadow.isAsyncBackend);
-        } else if (this.enabled && !unifiedBlockedByEncryption && backendName === "mysql") {
+        } else if (this.enabled && !this.unifiedBlockedByEncryption && backendName === "mysql") {
             this.mysqlReady = UnifiedShadow.openAsync(
                 this.sessionsDir,
                 process.env,
@@ -724,7 +730,7 @@ export class SessionStore {
             this.shadow = undefined;
             this.networkFullExpected = storageMode === "full";
         } else {
-            if (this.enabled && !unifiedBlockedByEncryption) {
+            if (this.enabled && !this.unifiedBlockedByEncryption) {
                 // #5188: remember the open args when this sync attempt actually
                 // runs, so a failure here can be retried. Deliberately NO
                 // cooldown stamp at construction: the first RETRY must be
@@ -4315,6 +4321,18 @@ export class SessionStore {
         if (!this.enabled) return "legacy";
         if (!this.shadow || this.shadow.stats.disabled) return "legacy";
         return this.storageMode;
+    }
+
+    /** #5595/F4: did this instance RESOLVE to run the unified store — knob tier
+     *  non-legacy, persistence enabled, no encryption hard-block? A pure
+     *  constructor-time fact, independent of whether the sidecar is alive RIGHT
+     *  NOW. liveStorageStamp cannot make this call: by its definition it reads
+     *  "legacy" whenever replicasAvailable() is false — exactly the branch that
+     *  must tell a structurally legacy-only instance (change your config) apart
+     *  from a unified-configured one whose sidecar is down (3-strike latch or
+     *  corrupt-index boot-without-index — see sidecarDownReason). */
+    get configuredUnified(): boolean {
+        return this.enabled && this.storageMode !== "legacy" && !this.unifiedBlockedByEncryption;
     }
 
     /** Close the unified sidecar without flushing pending writes. Intended for

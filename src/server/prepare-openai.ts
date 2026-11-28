@@ -6,7 +6,7 @@ import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type 
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { effectivePromptCacheRouting } from "../config.js";
-import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
+import { currentCalibrationFactor, hardenOpenaiAssistantContent, hardenOpenaiToolCallArguments, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, MSGID_MODE_HEADER, applyMsgSeqStamps, incomingSeqsOf, validateMsgSeqs } from "../msgid-pin.js";
 import { pluginAgentHeader } from "../plugin.js";
@@ -748,7 +748,9 @@ export async function prepareOpenai(
             }
         }
         if (!egressServedFromLog) {
-            rebuiltMessages = hardenOpenaiAssistantContent(coreToOpenai(systemToUser(egressMessages, (m) => isRenderedSummaryMessage(m))));
+            const argsHardened = hardenOpenaiToolCallArguments(coreToOpenai(systemToUser(egressMessages, (m) => isRenderedSummaryMessage(m))));
+            if (argsHardened.replaced > 0) log("warn", `[${sessionId}] rebuilt ${argsHardened.replaced} empty/unrecoverable tool-call argument(s) with a parseable placeholder so the request stays sendable (#5595)`);
+            rebuiltMessages = hardenOpenaiAssistantContent(argsHardened.messages);
         }
         legacyCoreElements = rebuiltMessages;
         egressRecordSource = egressMessages;
