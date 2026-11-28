@@ -151,12 +151,13 @@ test("#1494 A+B: single-object content folds end-to-end through applyRanges", ()
 
 // #3780: the documented line-form string can arrive DOUBLE-ESCAPED — a model
 // serializing its args as text escapes the header/summary separator twice, so
-// `content` holds a LITERAL backslash+n instead of a real break. Undecoded the
-// kernel finds no newline, yields an empty summary, and rejects with
-// kind=content-not-array while hiding the real missing-summary reason. The host
-// salvage decodes once and retries, adopting the result only if it parses more
-// ranges (a no-real-newline string always yields zero undecoded, so a working
-// parse can never be degraded).
+// `content` holds a LITERAL backslash+n instead of a real break. Pre-#7821 the
+// undecoded string rejected with a missing summary and the host salvage
+// (decode once, retry, adopt on more ranges) recovered it. #7821's one-line
+// acceptance made the undecoded string parse "successfully" with the literal
+// backslash-n glued into the summary, so the salvage now also fires on a
+// successful parse of that shape and adopts on the same range count (the
+// decoded parse carries the real header/summary split).
 test("#3780: double-escaped line-form string (literal backslash-n separator) is decoded once and recovered", () => {
     // Runtime .content value: 'm00001–m00002 example topic' + <backslash>n + 'folded summary body'.
     const parsed = parseCompressInput({ content: "m00001–m00002 example topic\\nfolded summary body" });

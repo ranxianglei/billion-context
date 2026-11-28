@@ -511,7 +511,6 @@ function parseLineEntry(
 ): EntryOutcome {
   const nl = entry.indexOf("\n");
   const head = (nl === -1 ? entry : entry.slice(0, nl)).trim();
-  const summary = (nl === -1 ? "" : entry.slice(nl + 1)).trim();
   const pair = REF_PAIR_IN_LINE.exec(head);
   let startRef: string;
   let endRef: string;
@@ -537,13 +536,20 @@ function parseLineEntry(
     endRef = startRef;
     afterRefs = single.index + single[0].length;
   }
+  // Text after the refs on the header line. In a one-line entry (no newline)
+  // this IS the summary — the advertised contract ("summary on the same or the
+  // next line", #7821) requires accepting it; treating it as topic-only
+  // rejected the one-line form the tool description advertises. In a multi-line
+  // entry it is the optional topic; the summary is the remaining lines.
+  const headerText = head.slice(afterRefs).trim();
+  const summary = nl === -1 ? headerText : entry.slice(nl + 1).trim();
   if (summary.length === 0)
     // #4521: name the two most common shapes behind this parse error — a
     // stray note line about an already-folded range, and a block rewrite
     // written as refs — so the model fixes the entry instead of resending it
     // verbatim (each resend was a full failed round-trip).
     return { reason: "line entry: missing summary after the refs header line (every entry needs refs THEN its summary text on the same or the next line; a note about an already-folded range does not belong in the batch — drop it; to rewrite an existing block use a bN..bM block-id header entry)" };
-  const explicitTopic = head.slice(afterRefs).trim();
+  const explicitTopic = nl !== -1 ? headerText : "";
   const range: CompressRangeSpec = {
     startRef,
     endRef,

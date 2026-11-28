@@ -73,10 +73,12 @@ test("#2146: distinct-spec failure streak arms the circuit breaker at 3", () => 
     assert.match(f3, /STOP calling compress/, "breaker demands a full stop");
 
     const f4 = applyRanges(parseCompressInput(compressArgs("m00001", "m00002")), ctx).text;
-    assert.match(f4, /COMPRESS CIRCUIT BREAKER: 4 consecutive/, "count continues while armed");
+    // #7821: armed refusals no longer increment the streak (they would re-arm
+    // the decay timer and hide the cause). The count stays at the threshold
+    // while armed, so the decay can actually elapse.
+    assert.match(f4, /COMPRESS CIRCUIT BREAKER: 3 consecutive/, "count stays at threshold while armed (#7821)");
 
     assert.ok(logs.some((l) => l.includes("[warn: compress-loop] circuit breaker armed after 3 consecutive")), "arm event logged for operator diagnosis");
-    assert.ok(logs.some((l) => l.includes("[warn: compress-loop] failure 4 in armed streak")), "subsequent armed failures logged");
 });
 
 test("#2146: success clears the streak; later failures start fresh", () => {

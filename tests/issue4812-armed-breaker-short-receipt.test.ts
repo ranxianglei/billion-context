@@ -87,7 +87,10 @@ test("#4812: parse-failure receipts collapse per-repeat once the breaker climbs 
 
     const f4 = applyRanges(parseCompressInput(malformedArgs()), ctx).text;
     assert.ok(f4.startsWith("[Compression refused:"), `failure 4 collapses (got: ${f4.slice(0, 120)})`);
-    assert.match(f4, /still armed \(4 consecutive failures\)/, "names the armed count");
+    // #7821: armed refusals no longer increment the streak (they would re-arm
+    // the decay timer and hide the cause). The count stays at the threshold
+    // while armed, so the decay can actually elapse.
+    assert.match(f4, /still armed \(3 consecutive failures\)/, "count stays at threshold while armed (#7821)");
     assert.doesNotMatch(f4, /compress takes ONE 'content' STRING/, "no full lecture past the arm moment");
     assert.doesNotMatch(f4, /COMPRESS CIRCUIT BREAKER: 4 consecutive/, "no repeated verbatim paragraph either");
     assert.doesNotMatch(f4, /acp_status/, "no contradictory order beside the loop-noise stop (#2360)");
@@ -98,10 +101,10 @@ test("#4812: parse-failure receipts collapse per-repeat once the breaker climbs 
     assert.ok(f4.length < 700, `short refusal stays small (got ${f4.length} chars)`);
 
     const f5 = applyRanges(parseCompressInput(malformedArgs()), ctx).text;
-    assert.match(f5, /still armed \(5 consecutive failures\)/, "count keeps climbing while refused");
+    assert.match(f5, /still armed \(3 consecutive failures\)/, "count stays at threshold while refused (#7821)");
 
     const streak = ctx.session.metadata["compressFailStreak"] as { n: number };
-    assert.equal(streak.n, 5, "refused calls keep counting (lastAt refreshes — hammering cannot ride out the decay)");
+    assert.equal(streak.n, 3, "refused calls do NOT keep counting (#7821: lastAt is not refreshed — hammering CAN ride out the decay)");
 });
 
 test("#4812: a valid-parsing call while armed is never blocked — success clears the breaker", () => {
@@ -138,7 +141,9 @@ test("#4812: seeded substrate-destruction cause still gets the short refusal for
     ctx.session.metadata["compressFailStreak"] = { n: 3, lastAt: Date.now(), cause: "substrate-destruction — fold substrate destroyed by an out-of-band history rewrite" };
     const out = applyRanges(parseCompressInput(malformedArgs()), ctx).text;
     assert.ok(out.startsWith("[Compression refused:"), `substrate cause collapses too (got: ${out.slice(0, 120)})`);
-    assert.match(out, /still armed \(4 consecutive failures\)/, "count continues under the seeded cause");
+    // #7821: armed refusals no longer increment the streak. The count stays at
+    // the threshold while armed, so the decay can actually elapse.
+    assert.match(out, /still armed \(3 consecutive failures\)/, "count stays at threshold under the seeded cause (#7821)");
 });
 
 test("#4812: empty-companion and corrupt-args lectures collapse under the same rule", () => {
