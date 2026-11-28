@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import http from "node:http";
-import { mkdirSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,6 +47,7 @@ const { VERSION } = await import("../src/version.ts");
 const { _setReleaseNotesStateForTest, _resetReleaseNotesWatcherForTest } = await import("../src/update-notes.ts");
 const ua = await import("../src/server/update-actions.ts");
 const { forceInstallVersion, getLastInstall, readDiskVersion, lastUpdateCheckTime, _resetLastInstallForTest } = await import("../src/update.ts");
+const { pinFilePath } = await import("../src/update-pin.ts");
 const { rmrf } = await import("./tmp-rm.ts");
 
 /** Fresh fixture "install" — a plain dir whose package.json pins a version
@@ -410,6 +411,37 @@ test("admin routes: state surfaces notices; install enforces charset/auth gates 
         // The gate precedes validation: spoofed Origin → 403 even with a valid body.
         const spoofedPost = await call("POST", "/__bili/update/install", { ...spoofedHeaders, "content-type": "application/json" }, JSON.stringify({ version: "0.1.203" }));
         assert.equal(spoofedPost.status, 403, "gate must fire before body parsing");
+        // #6804: the pin endpoints ride the same gate and validation ladder.
+        // A garbage duration must 400 — it may not silently become "indefinite".
+        const pinGarbage = await call("POST", "/__bili/update/pin", { host: trustedHost, "content-type": "application/json" }, JSON.stringify({ duration: "banana" }));
+        assert.equal(pinGarbage.status, 400);
+        assert.match(JSON.stringify(pinGarbage.json), /duration must look like/);
+        const pinMalformed = await call("POST", "/__bili/update/pin", { host: trustedHost, "content-type": "application/json" }, "{nope");
+        assert.equal(pinMalformed.status, 400);
+        assert.match(JSON.stringify(pinMalformed.json), /expected JSON body/);
+        // A non-string duration or a non-object body must 400 too — it may
+        // not silently become an "indefinite" pin.
+        const pinNonString = await call("POST", "/__bili/update/pin", { host: trustedHost, "content-type": "application/json" }, JSON.stringify({ duration: 42 }));
+        assert.equal(pinNonString.status, 400);
+        assert.match(JSON.stringify(pinNonString.json), /expected JSON body/);
+        const pinNonObject = await call("POST", "/__bili/update/pin", { host: trustedHost, "content-type": "application/json" }, JSON.stringify("banana"));
+        assert.equal(pinNonObject.status, 400);
+        assert.match(JSON.stringify(pinNonObject.json), /expected JSON body/);
+        const pinSpoofed = await call("POST", "/__bili/update/pin", { ...spoofedHeaders, "content-type": "application/json" }, JSON.stringify({ duration: "1h" }));
+        assert.equal(pinSpoofed.status, 403, "gate must fire before body parsing on the pin route too");
+        // Unwired process still pins: the action falls back to the running
+        // version and writes the machine-level pin file (isolated cache dir).
+        const pinOk = await call("POST", "/__bili/update/pin", { host: trustedHost, "content-type": "application/json" }, JSON.stringify({ duration: "1h" }));
+        assert.equal(pinOk.status, 200);
+        const pinJson = pinOk.json as { ok: boolean; version: string; until: number };
+        assert.equal(pinJson.ok, true);
+        assert.equal(pinJson.version, VERSION);
+        assert.ok(pinJson.until > Date.now(), "a 1h pin must carry a future until");
+        assert.ok(existsSync(pinFilePath()), "the pin record must land in the machine cache dir");
+        const pinClear = await call("POST", "/__bili/update/pin/clear", { host: trustedHost });
+        assert.equal(pinClear.status, 200);
+        assert.deepEqual(pinClear.json, { ok: true });
+        assert.ok(!existsSync(pinFilePath()), "clear must remove the pin record");
     } finally {
         proxy.closeAllConnections?.();
         await new Promise<void>((resolve) => proxy.close(() => resolve()));

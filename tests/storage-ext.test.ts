@@ -7,6 +7,12 @@ import { SessionStore } from "../src/persist.ts";
 import { UnifiedStore } from "../src/storage/store.ts";
 import type { Session } from "../src/session.ts";
 
+// KDD #25: this suite contracts the LEGACY kv budget (4 MB byte limit on
+// every key). The eg-plane 256-char cap is covered by
+// tests/eg-sweep-egress-identity.test.ts (A4) with the flag on; pin the flag
+// off so host configs cannot flip the cap on and break these assertions.
+process.env.BILI_ROLLOUT_EGRESS_PLANE = "0";
+
 /**
  * #3069 extension namespaces (schema v4): session_ext (per-session
  * arbitrary state) and kv_store (namespaced cross-session state).
@@ -174,7 +180,7 @@ test("v3 databases migrate to v11 in place, idempotently", async () => {
         const migrated = UnifiedStore.open(dbPath);
         try {
             const ver = (migrated as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-            assert.equal(ver.user_version, 11, "open() runs migrateSchema: v3 → v11");
+            assert.equal(ver.user_version, 12, "open() runs migrateSchema: v3 → v12");
             migrated.setKv("probe", "alive", true);
             assert.deepEqual(migrated.getKv("probe", "alive"), true);
             assert.deepEqual(migrated.listSessionIds(), [], "existing v3 content untouched");
@@ -184,7 +190,7 @@ test("v3 databases migrate to v11 in place, idempotently", async () => {
         // Reopening a v11 database is a no-op (idempotent migration).
         const again = UnifiedStore.open(dbPath);
         const ver2 = (again as unknown as { db: { prepare(q: string): { get(): unknown } } }).db.prepare("PRAGMA user_version").get() as { user_version: number };
-        assert.equal(ver2.user_version, 11);
+        assert.equal(ver2.user_version, 12);
         again.close();
     } finally {
         fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });

@@ -166,11 +166,12 @@ export const WEB_CLIENT = `(function () {
         const pinMatch = /[?&]lang=([^&]*)/i.exec(search);
         const pinned = pinMatch && pinMatch[1] ? pinMatch[1] : null;
         if (pinned === "zh" || pinned === "zh-CN") locale = "zh-CN";
-        else if (pinned === "en") locale = "en";
+        else if (pinned === "en" || pinned === "ko") locale = pinned;
         else {
             const saved = localStorage.getItem("bili-language");
-            if (saved === "en" || saved === "zh-CN") locale = saved;
+            if (saved === "en" || saved === "zh-CN" || saved === "ko") locale = saved;
             else if (/^en([-_]|$)/i.test(navigator.language || "")) locale = "en";
+            else if (/^ko([-_]|$)/i.test(navigator.language || "")) locale = "ko";
         }
     } catch (e) {}
     // #3373: when the panel is served through a host relay under a path
@@ -212,8 +213,14 @@ export const WEB_CLIENT = `(function () {
         if (packSelEl && prev && packNames.includes(prev)) packSelEl.value = prev;
         if (rerenderQuick) rerenderQuick();
     }
+    const LOCALE_CYCLE = ["zh-CN", "en", "ko"];
+    const LOCALE_NAMES = { "zh-CN": "中文", en: "English", ko: "한국어" };
+    function nextLocale() {
+        return LOCALE_CYCLE[(LOCALE_CYCLE.indexOf(locale) + 1) % LOCALE_CYCLE.length];
+    }
     function t(key, vars) {
         let text = MESSAGES[locale][key];
+        if (text === undefined && locale === "ko") text = MESSAGES.en[key];
         if (text === undefined) text = MESSAGES["zh-CN"][key];
         if (text === undefined) text = key;
         if (vars) for (const name of Object.keys(vars)) text = text.split("{" + name + "}").join(String(vars[name]));
@@ -441,6 +448,7 @@ export const WEB_CLIENT = `(function () {
         if (typeof v === "string") return v;
         if (v && typeof v === "object") {
             if (v[locale] !== undefined && typeof v[locale] === "string") return v[locale];
+            if (locale === "ko" && typeof v.en === "string") return v.en;
             if (v["zh-CN"] !== undefined && typeof v["zh-CN"] === "string") return v["zh-CN"];
             if (v.en !== undefined && typeof v.en === "string") return v.en;
             const vals = Object.values(v);
@@ -636,7 +644,7 @@ export const WEB_CLIENT = `(function () {
         document.querySelectorAll("[data-i18n-ph]").forEach((el) => { el.setAttribute("placeholder", t(el.getAttribute("data-i18n-ph"))); });
         document.querySelectorAll("[data-i18n-title]").forEach((el) => { el.setAttribute("title", t(el.getAttribute("data-i18n-title"))); });
         const tog = $("language-toggle");
-        if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
+        if (tog) tog.textContent = LOCALE_NAMES[nextLocale()];
         bindSessionColumns();
     }
 
@@ -730,6 +738,7 @@ export const WEB_CLIENT = `(function () {
         const href = "#/session/" + encodeURIComponent(s.id);
         return '<a class="slink" href="' + href + '"><span class="row-title clip w-title' + (named ? "" : " faint") + '">' + escapeHtml(name) + "</span>"
             + (live ? ' <span class="badge live" title="' + escapeHtml(t("ses.badge_live_tip")) + '">' + t("common.live") + "</span>" : "")
+            + (s.parentSessionId ? ' <span class="badge proto" title="' + escapeHtml(t("ses.badge_child_tip")) + '">' + t("ses.badge_child") + "</span>" : "")
             + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
             + (s.autoModeForge ? ' <span class="badge live" style="background:#6d3b8a" title="' + escapeHtml(t("det.auto_mode_forge_tip")) + '">' + t("det.auto_mode_forge_short") + "</span>" : "")
 + (s.keepalive ? ' <span class="badge live" style="background:#3b6d8a" title="' + escapeHtml(t("det.keepalive_tip") + " · " + s.keepalive.tierLabel + " · " + (s.keepalive.cadenceMs >= 60_000 ? Math.round(s.keepalive.cadenceMs / 60_000) + "min" : Math.round(s.keepalive.cadenceMs / 1000) + "s") + (s.keepalive.lastHitAt ? " · " + t("det.keepalive_last_hit") + " " + timeAgo(new Date(s.keepalive.lastHitAt).toISOString()) : "")) + '">' + t("det.keepalive_short") + "×" + s.keepalive.pingCount + "</span>" : "")
@@ -805,8 +814,10 @@ export const WEB_CLIENT = `(function () {
                 : s.engineLane === "server" ? ' <span class="badge proto dim" title="' + escapeHtml(t("det.engine_lane_server")) + '">srv</span>' : "";
             // #7876: child (:side:/:sub:) sessions are one-shot auxiliary calls —
             // mark them so the row reads as a sub-call, not a top-level session.
-            const childChip = s.child
-                ? ' <span class="badge child" title="' + escapeHtml(t("ses.badge_child_tip")) + '">' + t("ses.badge_child") + "</span>"
+            // Declared-lineage children (parentSessionId) already carry the
+            // title-cell "child" badge — no second badge.
+            const childChip = s.child && !s.parentSessionId
+                ? ' <span class="badge child" title="' + escapeHtml(t("ses.badge_aux_tip")) + '">' + t("ses.badge_aux") + "</span>"
                 : "";
             const clientCell = clientHint
                 ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>" + laneChip + childChip
@@ -954,7 +965,7 @@ function changelogCatOf(rawLine) {
     let upBusyAction = false;
     let upReleases = [];
     function upSetButtons(on) {
-        [$("up-check"), $("up-upgrade-now"), $("up-install")].forEach((b) => {
+        [$("up-check"), $("up-upgrade-now"), $("up-install"), $("up-install-input"), $("up-pin"), $("up-unpin")].forEach((b) => {
             if (!b) return;
             b.classList.toggle("busy", on);
             b.disabled = on;
@@ -1040,6 +1051,37 @@ function changelogCatOf(rawLine) {
             if (cur) sel.value = cur;
         }
         applyUpdateButtons(st);
+        // #6804: local pin state line (+ the temp-build hint — a prerelease
+        // install is check-only for auto-upgrade even without a pin) and the
+        // duration select (rebuilt like up-select, preserving the selection).
+        const pstate = $("up-pin-state");
+        if (pstate) {
+            const p = (st && typeof st.pin === "object") ? st.pin : {};
+            let txt;
+            if (p.active) {
+                txt = p.until ? t("up.pin_active_until", { v: String(p.version || ""), until: new Date(p.until).toLocaleString() }) : t("up.pin_active_indef", { v: String(p.version || "") });
+            } else {
+                txt = t("up.pin_none");
+            }
+            if (p.tempBuild) txt += " " + t("up.pin_tempbuild");
+            // #7806: dev-install provenance (bili install <ref> pins carry the
+            // git ref + sha) — say WHAT is installed, not just that it is held.
+            if (p.source && p.source.kind === "git") txt += " " + t("up.pin_git", { ref: String(p.source.ref), sha: String(p.source.sha).slice(0, 8) });
+            pstate.textContent = txt;
+        }
+        const pdur = $("up-pin-duration");
+        if (pdur) {
+            const cur = pdur.value;
+            // #6804 follow-up: the DEFAULT duration is 7d — "forever" means
+            // "never auto-update", which must be an explicit choice, so it is
+            // kept as the last option but no longer the default selection.
+            const fresh = pdur.options.length === 0;
+            let opt = "";
+            ["1h", "12h", "1d", "7d", "30d"].forEach((d) => { opt += '<option value="' + d + '">' + d + "</option>"; });
+            opt += '<option value="">' + escapeHtml(t("up.pin_forever")) + "</option>";
+            pdur.innerHTML = opt;
+            pdur.value = fresh ? "7d" : cur;
+        }
         // A check/install started from another tab of this process shows in
         // the snapshot — keep the buttons held down until it settles.
         if (st.checking || st.installing) upSetButtons(true);
@@ -1172,6 +1214,57 @@ function changelogCatOf(rawLine) {
     }
     function upUpgradeNow() { upInstall(upNewestVersion(null).replace(/^v/, "")); }
     function upInstallSelected() { const sel = $("up-select"); if (sel && sel.value) upInstall(String(sel.value).replace(/^v/, "")); }
+    // #6804: free-text install — any published version (master temp builds
+    // included). Same upInstall path as the dropdown (rollback confirm, busy
+    // flag, result line); the server rejects anything outside semver chars.
+    function upInstallInput() {
+        const el = $("up-version-input");
+        if (!el) return;
+        const v = String(el.value || "").trim().replace(/^v/, "");
+        if (v) upInstall(v);
+    }
+    function showPinResult(msg, ok) {
+        const el = $("up-pin-result");
+        if (!el || !msg) return;
+        el.hidden = false;
+        el.textContent = msg;
+        el.style.color = ok ? "var(--green)" : "var(--red)";
+    }
+    async function upPin() {
+        if (upBusyAction) return;
+        const pdur = $("up-pin-duration");
+        const duration = pdur && pdur.value ? String(pdur.value) : undefined;
+        upBusyAction = true;
+        upSetButtons(true);
+        showPinResult(t("up.installing", {}), true);
+        try {
+            const r = await json(API_ROOT + "/update/pin", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(duration ? { duration } : {}) });
+            if (r.ok) showPinResult(t("up.pin_ok", { v: String(r.version || "") }), true);
+            else showPinResult(String(r.error || t("toast.failed", { msg: "pin failed" })), false);
+        } catch (e) {
+            showPinResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
+    }
+    async function upUnpin() {
+        if (upBusyAction) return;
+        upBusyAction = true;
+        upSetButtons(true);
+        try {
+            const r = await json(API_ROOT + "/update/pin/clear", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+            if (r.ok) showPinResult(t("up.unpin_ok"), true);
+            else showPinResult(String(r.error || t("toast.failed", { msg: "unpin failed" })), false);
+        } catch (e) {
+            showPinResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
+    }
     async function upCheckNow() {
         if (upBusyAction) return;
         upBusyAction = true;
@@ -1180,7 +1273,7 @@ function changelogCatOf(rawLine) {
             const r = await json(API_ROOT + "/update/check", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
             if (r.already) showUpdateResult(t("up.already_in_flight"), true);
             else if (!r.ok) showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
-            else if (r.status === "update-available") showUpdateResult(t("up.check_available", { v: String(r.candidate || r.latest || "") }), true);
+            else if (r.status === "update-available") showUpdateResult(t("up.check_available", { v: String(r.candidate || r.latest || "") }) + (r.note ? " · " + String(r.note) : ""), true);
             else if (r.status === "up-to-date") showUpdateResult(t("up.check_up_to_date"), true);
             else if (r.status === "blocked-advisory") showUpdateResult(t("up.check_blocked", { v: String(r.latest || "") }), true);
             else if (r.status === "deferred-advisory") showUpdateResult(t("up.check_deferred"), true);
@@ -1852,6 +1945,7 @@ function changelogCatOf(rawLine) {
         const protocol = filterValue("ses-protocol");
         const client = filterValue("ses-client");
         const state = filterValue("ses-state");
+        const kind = filterValue("ses-kind");
         const childrenEl = $("ses-children");
         const showChildren = Boolean(childrenEl && childrenEl.checked);
         return API_ROOT + "/sessions?page=" + page + "&pageSize=" + SES_PAGE_SIZE +
@@ -1859,6 +1953,7 @@ function changelogCatOf(rawLine) {
             (protocol ? "&protocol=" + encodeURIComponent(protocol) : "") +
             (client ? "&client=" + encodeURIComponent(client) : "") +
             (state ? "&state=" + encodeURIComponent(state) : "") +
+            (kind ? "&kind=" + encodeURIComponent(kind) : "") +
             (showChildren ? "&children=1" : "");
     }
     function filterValue(id) {
@@ -1902,7 +1997,7 @@ function changelogCatOf(rawLine) {
     function hasActiveFilters() {
         const q = (($("ses-search") && $("ses-search").value) || "").trim();
         const childrenEl = $("ses-children");
-        return Boolean(q || filterValue("ses-protocol") || filterValue("ses-client") || filterValue("ses-state") || (childrenEl && childrenEl.checked));
+        return Boolean(q || filterValue("ses-protocol") || filterValue("ses-client") || filterValue("ses-state") || filterValue("ses-kind") || (childrenEl && childrenEl.checked));
     }
     function updatePager() {
         const prev = $("ses-prev");
@@ -1930,7 +2025,7 @@ function changelogCatOf(rawLine) {
     function resetSessionFilters() {
         const search = $("ses-search");
         if (search) search.value = "";
-        ["ses-protocol", "ses-client", "ses-state"].forEach((id) => { const el = $(id); if (el) el.value = ""; });
+        ["ses-protocol", "ses-client", "ses-state", "ses-kind"].forEach((id) => { const el = $(id); if (el) el.value = ""; });
         const childrenEl = $("ses-children");
         if (childrenEl) childrenEl.checked = false;
         return refreshSessions(false, 1);
@@ -3347,7 +3442,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         // as legacy rather than a dash. Literal t() branches (not concat) keep
         // every catalog key statically referenceable for the #1024 dead-key gate.
         const sm = d.storageMode || "legacy";
-        const smLabel = sm === "full" ? t("det.storage_mode_full") : sm === "shadow" ? t("det.storage_mode_shadow") : t("det.storage_mode_legacy");
+        const smLabel = sm === "full" ? t("det.storage_mode_full") : sm === "shadow" ? t("det.storage_mode_shadow") : sm === "egress" ? t("det.storage_mode_egress") : t("det.storage_mode_legacy");
         kv(parts, t("det.storage_mode"), smLabel || sm, true);
         kv(parts, t("det.active_pack"), d.activePack || null, true);
         parts.push('<div class="k">' + t("det.log") + '</div><div class="v"><a href="#/logs?q=' + encodeURIComponent(d.id) + '">' + t("det.log_view") + "</a></div>");
@@ -3912,7 +4007,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (!mdBtn && !pngBtn) return;
         var safeId = String(d.id).replace(/[^A-Za-z0-9._-]/g, "_");
         var base = "billion-context-report-" + safeId;
-        var q = "session=" + encodeURIComponent(d.id) + "&mask=on&lang=" + (locale === "en" ? "en" : "zh-CN");
+        var q = "session=" + encodeURIComponent(d.id) + "&mask=on&lang=" + locale;
         if (mdBtn) mdBtn.addEventListener("click", async function () {
             busy(mdBtn, true);
             try {
@@ -4603,6 +4698,10 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             tsRow.inp.checked = cp ? cp.messageTimestamps !== false : true;
             const ab = (cp && cp.absorb && typeof cp.absorb === "object" && !Array.isArray(cp.absorb)) ? cp.absorb : null;
             abRow.inp.checked = ab ? ab.enabled === true : false;
+            // #7666: degenerate-retry budget + nudge sentences.
+            const dr = (cp && cp.degenerateRetry && typeof cp.degenerateRetry === "object" && !Array.isArray(cp.degenerateRetry)) ? cp.degenerateRetry : null;
+            degenMax.value = dr && typeof dr.maxAttempts === "number" ? String(dr.maxAttempts) : "";
+            degenNudges.value = dr && Array.isArray(dr.nudges) ? dr.nudges.join("\\n") : "";
             rnRow.inp.checked = cp ? cp.requireNudge === true : false;
             rrRow.inp.checked = cp ? cp.requireRecommendation === true : false;
             const pv = (cp && typeof cp.promptPack === "string") ? cp.promptPack : "default";
@@ -4806,6 +4905,66 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         rrHint.className = "dim small";
         rrHint.textContent = t("cfg.q_require_rec_hint");
         rrRow.ctl.appendChild(rrHint);
+        // #7666: degenerate-terminal retry — attempt count + custom nudge
+        // sentences (compress.degenerateRetry; resolved global→provider→model
+        // server-side). The nudge rides the retry request only, never context.
+        const degenMax = textRow("quick-degen-max", t("cfg.q_degen_retry_max"), t("cfg.q_degen_retry_max_ph"));
+        degenMax.type = "number";
+        degenMax.min = "0";
+        degenMax.max = "5";
+        degenMax.style.flex = "0 0 140px";
+        qCtrls.push(degenMax);
+        degenMax.addEventListener("change", () => commit((d) => {
+            const v = degenMax.value.trim();
+            const c = compressOf(d);
+            if (v === "" || v === "1") {
+                if (c) {
+                    const dr = (c.degenerateRetry && typeof c.degenerateRetry === "object" && !Array.isArray(c.degenerateRetry)) ? c.degenerateRetry : null;
+                    if (dr) { delete dr.maxAttempts; if (Object.keys(dr).length === 0) delete c.degenerateRetry; }
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+                return;
+            }
+            const n = Number(v);
+            if (!Number.isInteger(n) || n < 0 || n > 5) { degenMax.value = ""; return; }
+            if (!c) d.compress = {};
+            const dr = (d.compress.degenerateRetry && typeof d.compress.degenerateRetry === "object" && !Array.isArray(d.compress.degenerateRetry)) ? d.compress.degenerateRetry : {};
+            dr.maxAttempts = n;
+            d.compress.degenerateRetry = dr;
+        }));
+        const degenNudgesRow = document.createElement("div");
+        degenNudgesRow.style.cssText = "display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap";
+        const degenNudgesLab = document.createElement("label");
+        degenNudgesLab.htmlFor = "quick-degen-nudges";
+        degenNudgesLab.style.cssText = "flex:0 1 auto;max-width:520px;align-self:center";
+        degenNudgesLab.textContent = t("cfg.q_degen_retry_nudges");
+        const degenNudges = document.createElement("textarea");
+        degenNudges.id = "quick-degen-nudges";
+        degenNudges.className = "editor mono";
+        degenNudges.spellcheck = false;
+        degenNudges.rows = 3;
+        degenNudges.placeholder = t("cfg.q_degen_retry_nudges_ph");
+        degenNudges.style.cssText = "flex:1 1 480px;max-width:720px";
+        degenNudgesRow.appendChild(degenNudgesLab);
+        degenNudgesRow.appendChild(degenNudges);
+        box.appendChild(degenNudgesRow);
+        qCtrls.push(degenNudges);
+        degenNudges.addEventListener("change", () => commit((d) => {
+            const lines = degenNudges.value.split("\\n").map((s) => s.trim()).filter((s) => s.length > 0);
+            const c = compressOf(d);
+            if (lines.length === 0) {
+                if (c) {
+                    const dr = (c.degenerateRetry && typeof c.degenerateRetry === "object" && !Array.isArray(c.degenerateRetry)) ? c.degenerateRetry : null;
+                    if (dr) { delete dr.nudges; if (Object.keys(dr).length === 0) delete c.degenerateRetry; }
+                    if (Object.keys(c).length === 0) delete d.compress;
+                }
+                return;
+            }
+            if (!c) d.compress = {};
+            const dr = (d.compress.degenerateRetry && typeof d.compress.degenerateRetry === "object" && !Array.isArray(d.compress.degenerateRetry)) ? d.compress.degenerateRetry : {};
+            dr.nudges = lines.slice(0, 8);
+            d.compress.degenerateRetry = dr;
+        }));
         const packSel = document.createElement("select");
         packSel.className = "field-input mono";
         qCtrls.push(packSel);
@@ -5731,7 +5890,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     function initStaticHandlers() {
         const tog = $("language-toggle");
         if (tog) tog.addEventListener("click", () => {
-            locale = locale === "zh-CN" ? "en" : "zh-CN";
+            locale = nextLocale();
             try { localStorage.setItem("bili-language", locale); } catch (e) {}
             // #2321: a ?lang= pin would silently re-force the old language on a
             // plain reload — drop it so the manual choice sticks.
@@ -5750,7 +5909,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         }
         const sref = $("ses-refresh");
         if (sref) sref.addEventListener("click", () => refreshSessions(true, sesPage));
-        ["ses-protocol", "ses-client", "ses-state"].forEach((id) => {
+        ["ses-protocol", "ses-client", "ses-state", "ses-kind"].forEach((id) => {
             const el = $(id);
             if (el) el.addEventListener("change", () => refreshSessions(false, 1));
         });
@@ -5772,6 +5931,15 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const unins = $("up-install");
         if (usel) usel.addEventListener("change", () => { if (unins) unins.disabled = upBusyAction || !usel.value; focusChangelogRelease(usel.value); });
         if (unins) unins.addEventListener("click", () => upInstallSelected());
+        // #6804: free-text install + local version pin controls.
+        const uinsInp = $("up-install-input");
+        if (uinsInp) uinsInp.addEventListener("click", () => upInstallInput());
+        const uvinp = $("up-version-input");
+        if (uvinp) uvinp.addEventListener("keydown", (e) => { if (e.key === "Enter") upInstallInput(); });
+        const upin = $("up-pin");
+        if (upin) upin.addEventListener("click", () => upPin());
+        const uunpin = $("up-unpin");
+        if (uunpin) uunpin.addEventListener("click", () => upUnpin());
         let logTimer = null;
         const lsearch = $("log-search");
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });

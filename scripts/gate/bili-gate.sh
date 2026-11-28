@@ -112,8 +112,10 @@ mkdir -p "$OUT_DIR"
 # ---- docker run --------------------------------------------------------------
 RUN=(docker run --rm "${SRC_ARGS[@]}")
 if [ -n "$GIT_PROXY" ]; then RUN+=(-e GATE_GIT_PROXY="$GIT_PROXY"); fi
-# GATE_SNAPBASE: run the P/R lanes with the candidate's snapBase egress plane
-# ON in the gate's bili.json (value: "all" or openai,responses,anthropic,google).
+# GATE_SNAPBASE: run the P/R lanes with the candidate's egress op-log plane
+# ON (rollout.features.egressPlane in the gate's bili.json; the retired
+# storage.snapBase key no longer exists — ruling 7439, one switch for all
+# protocol lanes). Value: "all" or a cohort list (any on-value = plane on).
 # Must be appended AFTER the RUN=(...) init above — an earlier append is wiped
 # by the reassignment.
 if [ -n "$SNAPBASE" ]; then RUN+=(-e GATE_SNAPBASE="$SNAPBASE"); fi
@@ -156,7 +158,7 @@ fi
 # OLD image without a word. On failure we may reuse the existing image ONLY
 # after proving its lane scripts are byte-identical to this working tree;
 # any drift is FATAL — the gate must never run on stale lane logic.
-LIVE_FILES="entrypoint.sh docker-lanes.mjs plugin-lanes.mjs restart-lanes.mjs upstream-recorder.mjs patch-gate.mjs verdaccio.config.yaml"
+LIVE_FILES="entrypoint.sh docker-lanes.mjs plugin-lanes.mjs restart-lanes.mjs wire-lanes.mjs upstream-recorder.mjs patch-gate.mjs verdaccio.config.yaml"
 if ! docker build -q -t bili-gate . >/dev/null; then
   echo "WARN: docker build failed — verifying existing image before reuse" >&2
   stale_guard_ok=1

@@ -20,7 +20,7 @@ import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPON
 import { clearPostRebuildAnchor, markDirty, type Session } from "./session.js";
 import { isForeignMembership } from "./request-membership.js";
 import { billInputUsage } from "./billing.js";
-import { normalizeUpstreamOrigin } from "./util.js";
+import { CALIBRATION_PROVENANCE_TEXT_ONLY, normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
 // Render window for handleAcpCache's detail:"full" text view (#1489). The
@@ -529,6 +529,11 @@ type Capture = {
     sentBody?: SeamSlot;
     inBody?: InboundSlot;
     imageFacts?: ForwardedImageFacts;
+    // #5952: the calibration pair for THIS send — final wire text estimate
+    // (no image reserve) + the image reserve of the same body, noted at the
+    // relay main-lane send chokepoint. The settle that bills this body
+    // consumes exactly this entry instead of the shared prepare slot.
+    calibration?: { estimate: number; imageTokens: number; origin?: string; model?: string };
 };
 const captures = new AsyncLocalStorage<Capture>();
 let captureOrder = 0;
@@ -546,6 +551,7 @@ export async function withCacheCapture<T>(session: Session | undefined, fn: () =
                 delete capture.sentBody;
                 delete capture.inBody;
                 delete capture.imageFacts;
+                delete capture.calibration;
             }
         }
     });
@@ -859,6 +865,22 @@ export function noteForwardedImageFacts(session: Session, facts: ForwardedImageF
     const capture = captures.getStore();
     if (capture?.session === session) { capture.imageFacts = facts; return; }
     imageFactsLastSent.set(session, facts);
+}
+
+/** #5952: the per-request calibration pair for THIS send — the final wire
+ *  text estimate (textOverhead, no image reserve) + the image reserve of
+ *  the same body, noted at the relay main-lane send chokepoint next to
+ *  noteOutboundContextEstimates. The next settleUsageReport /
+ *  settleOverflowCalibration consumes exactly this entry (same pairing
+ *  guarantee as the seam forensics): a concurrent request's prepare can no
+ *  longer overwrite the estimate a settle reads, and an image-bearing
+ *  sample can no longer train the text multiplier. Outside a capture there
+ *  is no per-request owner for the pair, so it is dropped, never parked on
+ *  the session where a later settle could misread it as this request's —
+ *  lanes outside the capture (loop/plugin) keep the legacy shared slot. */
+export function noteCalibrationPair(session: Session, pair: { estimate: number; imageTokens: number; origin?: string; model?: string }): void {
+    const capture = captures.getStore();
+    if (capture?.session === session) { capture.calibration = pair; return; }
 }
 
 function settleImageLearning(session: Session, billedTotal: number): void {
@@ -1278,6 +1300,83 @@ export function getCacheLedger(session: Session): CacheLedger {
     return led;
 }
 
+// True when the session carries no ledger or a ledger with no recorded
+// samples/folds — the egress usage replay (load path) only runs into an
+// EMPTY ledger; a restored envelope ledger wins over the stream.
+export function cacheLedgerIsEmpty(session: Session): boolean {
+    const led = (session.metadata ?? {})[LEDGER_KEY] as CacheLedger | undefined;
+    return !led || (led.lines.length === 0 && led.folds.length === 0);
+}
+
+// ── Egress usage event stream (8th egress table, owner ruling 2026-11-27) ──
+// The ledger is in-memory; on a 7+1-table instance the ONLY restart-survival
+// source is this event stream, appended on the storage side by the registered
+// sink (persist.js import is forbidden here — circular). Row alphabet:
+//   M — boot boundary (preceding the first sample that carries rs=1); replay
+//       arms the restart sentinel so the fresh-cause fires exactly as live.
+//   S — one usage settlement: payload = { s: the EXACT recordCacheSample
+//       arguments, model: session.metadata.lastModel at settle time }. Replay
+//       re-runs recordCacheSample verbatim.
+//   F — one fold pushed into the ledger: payload = the base fields of the
+//       fold row (at/S/sigma/X/V/Vp/bid). Replay re-pushes via pushFold.
+// Append order = LIVE mutation order (the eager stream site may land after a
+// settle — the replayed state machine then sees the same fold availability
+// the live one did), so re-applying the stream reconstructs the ledger.
+// Documented replay boundaries (see docs/egress-plane.md): seam-forensics
+// counters, per-line body-evidence fields, the #2202 coverage fraction (it
+// uses the load-time coverage map) and the #4731 seam LCP xMeasured
+// adjustment need the raw per-request bodies / live context and are not
+// reconstructed — every other line/fold/agg field is byte-identical.
+type UsageSample = { at: number; input: number; cached: number | null; output?: number; protocol?: string; upstream?: string; keyFp?: string; sysFp?: string; canonFp?: string; mode?: "plugin" | "proxy"; effFp?: string };
+type UsageForkRow = { at: number; S: number; sigma: number; X?: number; V?: number; Vp?: number; bid: string };
+export type EgressUsageEvent =
+    | { type: "M"; at: number }
+    | { type: "S"; at: number; payload: { s: UsageSample; model?: string } }
+    | { type: "F"; at: number; payload: UsageForkRow };
+type UsageSink = (sessionId: string, events: EgressUsageEvent[]) => void;
+type UsageStatsSink = (sessionId: string, json: string) => void;
+let usageSink: UsageSink | null = null;
+let usageStatsSink: UsageStatsSink | null = null;
+let usageSinkWarned = false;
+export function setEgressUsageSink(fn: UsageSink | null): void { usageSink = fn; }
+export function setEgressUsageStatsSink(fn: UsageStatsSink | null): void { usageStatsSink = fn; }
+function emitUsageEvents(session: Session, events: EgressUsageEvent[]): void {
+    if (!usageSink || events.length === 0) return;
+    try {
+        usageSink(session.id, events);
+    } catch (err) {
+        // The in-memory ledger stays authoritative; a storage failure must
+        // never kill a request — warn once per process.
+        if (!usageSinkWarned) {
+            usageSinkWarned = true;
+            loggerLog("warn", `[${session.id}] [cache-ledger] egress usage sink failed (${err instanceof Error ? err.message : String(err)}) — the in-memory ledger keeps the truth; the stream lags until the sink recovers`);
+        }
+    }
+}
+/** The bounded materialized stats row (session_ext "usage:stats", <=1024
+ *  chars on the storage side) — the fast read for web UI / admin; the
+ *  stream is truth. */
+function usageStatsJson(led: CacheLedger): string | null {
+    if (led.lines.length === 0 && led.folds.length === 0) return null;
+    const last = led.lines[led.lines.length - 1];
+    const obj: Record<string, unknown> = {
+        requests: led.agg.requests,
+        input: Math.round(led.agg.input),
+        cached: Math.round(led.agg.cached),
+        output: Math.round(led.agg.output),
+        nc: Math.round(led.agg.nc),
+        cr: Math.round(led.agg.cr),
+        tr: Math.round(led.agg.tr),
+        folds: led.folds.length,
+    };
+    if (last !== undefined) {
+        obj.lastAt = last.at;
+        if (last.hitPct !== null) obj.hitPct = last.hitPct;
+        if (typeof last.input === "number" && last.input > 0) obj.finalContext = Math.round(last.input);
+    }
+    return JSON.stringify(obj);
+}
+
 function pushFold(led: CacheLedger, f: Omit<LedgerFold, "seq" | "T" | "hPct" | "requestsAfter" | "k">, closeFrom: number): void {
     // Freeze k = samples since each open fold (#1286): samples arrive in
     // order, so at this instant the count equals the batch-path
@@ -1346,14 +1445,18 @@ function recordFoldRecovery(led: CacheLedger, at: number, S: number, seq: number
 /** Record compression folds materialized as new kernel blocks. Proxy mode
  *  calls this eagerly at the applyCompression site; plugin mode folds are
  *  caught lazily by detectNewFolds() via the blockId high-water mark. */
-export function recordCacheFoldsFromBlocks(session: Session, blocks: CompressionBlock[], geo?: { V?: number; Vp?: number }): void {
-    if (blocks.length === 0) return;
+export function recordCacheFoldsFromBlocks(session: Session, blocks: CompressionBlock[], geo?: { V?: number; Vp?: number }): EgressUsageEvent[] {
+    if (blocks.length === 0) return [];
     const led = getCacheLedger(session);
     let closeFrom = 0;
+    const emitted: EgressUsageEvent[] = [];
     for (const b of blocks) {
         const id = refNum(b.blockId);
         if (id <= led.lastBlockId) continue;
-        pushFold(led, {
+        // Emit the F row BEFORE pushFold: pushFold mutates fold state
+        // (k-freeze via recordFoldRecovery), so the pristine pre-push row is
+        // the only payload replay can re-apply byte-exactly.
+        const foldRow: UsageForkRow = {
             at: b.createdAt || Date.now(),
             S: b.compressedTokens,
             sigma: Math.ceil(b.summary.length / 4),
@@ -1361,12 +1464,16 @@ export function recordCacheFoldsFromBlocks(session: Session, blocks: Compression
             V: geo?.V,
             Vp: geo?.Vp,
             bid: b.blockId,
-        }, closeFrom);
+        };
+        pushFold(led, foldRow, closeFrom);
+        emitted.push({ type: "F", at: foldRow.at, payload: foldRow });
         // The first new fold closes every older open record. Within this
         // synchronous batch, only the just-appended record can remain open.
         closeFrom = led.folds.length - 1;
         led.lastBlockId = Math.max(led.lastBlockId, id);
     }
+    if (emitted.length > 0) emitUsageEvents(session, emitted);
+    return emitted;
 }
 
 function detectNewFolds(session: Session, led: CacheLedger): void {
@@ -1831,10 +1938,25 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
     const settleOrigin = normalizeUpstreamOrigin(upstream);
     const pendingCalibOrigin = session.stats.lastCalibrationPolicyOrigin !== undefined ? normalizeUpstreamOrigin(session.stats.lastCalibrationPolicyOrigin) : undefined;
     const calibPolicy = pendingCalibOrigin === settleOrigin ? session.stats.lastCalibrationPolicy : undefined;
-    const pendingEst = session.stats.lastLocalTextEstimate;
-    const pendingOrigin = normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
+    // #5952: the per-request capture pair wins over the shared prepare slot —
+    // it is the final wire estimate of the request THIS report bills, noted
+    // at the send chokepoint. Consumed once: the settle that reads it owns
+    // it, so a concurrent settle can never re-read it as its own.
+    const capture = captures.getStore();
+    const capturePair = capture?.session === session ? capture.calibration : undefined;
+    if (capture?.session === session) delete capture.calibration;
+    // An image-bearing sample carries no text-only signal: it must not train
+    // the text multiplier at all — not even through the legacy slot, which a
+    // concurrent prepare may have left holding another request's estimate.
+    if (capturePair !== undefined && capturePair.imageTokens > 0) return;
+    const pendingEst = capturePair !== undefined ? capturePair.estimate : session.stats.lastLocalTextEstimate;
+    const pendingOrigin = capturePair !== undefined ? normalizeUpstreamOrigin(capturePair.origin) : normalizeUpstreamOrigin(session.stats.lastLocalTextEstimateOrigin);
     if (pendingEst !== undefined && pendingEst >= CALIBRATION_MIN_ESTIMATE && settleOrigin !== undefined && pendingOrigin === settleOrigin) {
         const rawSample = billed / pendingEst;
+        // #5952: provenance of THIS sample — text-only only when it arrived
+        // on a capture pair. A legacy shared-slot sample carries none, so a
+        // ring holding one stays mixed until the window flushes it out.
+        const sampleProvenance = capturePair !== undefined ? CALIBRATION_PROVENANCE_TEXT_ONLY : undefined;
         // #2117 B: the ring is keyed by route AND model — tokenizers bill
         // differently across models, so a mid-session model switch starts a
         // FRESH ring instead of blending two models' billing scales into one
@@ -1844,8 +1966,10 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
         // whose load whitelist drops the model fields (#2141) — continues
         // and ADOPTS the first known model. Discarding it would clear a
         // provenance-matched published k̂ on the first post-restart settle
-        // (the #2129 regression class).
-        const settleModel = typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined;
+        // (the #2129 regression class). The capture pair's model, when
+        // known, is this request's own — it outranks the session's
+        // last-known model (#5952).
+        const settleModel = capturePair?.model !== undefined ? capturePair.model : (typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined);
         let ring = session.stats.calibrationRing;
         if (!ring || ring.origin !== settleOrigin || (ring.model !== undefined && settleModel !== undefined && ring.model !== settleModel)) {
             ring = { origin: settleOrigin, model: settleModel, values: [] };
@@ -1854,7 +1978,16 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
         }
         if (rawSample >= CALIBRATION_SAMPLE_MIN && rawSample <= CALIBRATION_SAMPLE_MAX) {
             ring.values.push(rawSample);
-            if (ring.values.length > CALIBRATION_SAMPLE_WINDOW) ring.values.shift();
+            // #5952: provenances ride in lockstep with values — a legacy
+            // ring restored without the array pads with undefined, so the
+            // publish verdict below stays aligned with the window.
+            if (ring.provenances === undefined) ring.provenances = [];
+            while (ring.provenances.length < ring.values.length - 1) ring.provenances.push(undefined);
+            ring.provenances.push(sampleProvenance);
+            if (ring.values.length > CALIBRATION_SAMPLE_WINDOW) {
+                ring.values.shift();
+                ring.provenances.shift();
+            }
             const spread = Math.max(...ring.values) / Math.min(...ring.values);
             if (ring.values.length >= 2 && spread <= CALIBRATION_CONSISTENCY_RATIO) {
                 const mean = ring.values.reduce((a, b) => a + b, 0) / ring.values.length;
@@ -1864,6 +1997,7 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
                     delete session.stats.calibratedEstimate;
                     delete session.stats.calibratedEstimateOrigin;
                     delete session.stats.calibratedEstimateModel;
+                    delete session.stats.calibratedEstimateProvenance;
                 } else {
                     const clamped = Math.min(CALIBRATION_CLAMP_MAX, Math.max(CALIBRATION_CLAMP_MIN, mean));
                     session.stats.calibratedEstimate = calibPolicy?.max !== undefined ? Math.min(clamped, calibPolicy.max) : clamped;
@@ -1871,14 +2005,22 @@ function ingestCalibrationPair(session: Session, billed: number, upstream: strin
                     // Provenance is the ring's model key, not this sample's stamp —
                     // an unknown-model settle continues a model-keyed ring without
                     // blanking the established provenance. Stays inside the publish
-                    // branch: the disabled path above clears all three fields and
+                    // branch: the disabled path above clears all four fields and
                     // must not re-stamp one of them (#3211 review).
                     session.stats.calibratedEstimateModel = ring.model;
+                    // #5952: the published factor's provenance is the ring's —
+                    // "text-only-v1" only when every value in the window
+                    // carries it. A single legacy sample in the window keeps
+                    // the factor inert until the window flushes it out.
+                    const ringProvenance = ring.provenances !== undefined && ring.provenances.length === ring.values.length && ring.provenances.every((p) => p === CALIBRATION_PROVENANCE_TEXT_ONLY) ? CALIBRATION_PROVENANCE_TEXT_ONLY : undefined;
+                    if (ringProvenance !== undefined) session.stats.calibratedEstimateProvenance = ringProvenance;
+                    else delete session.stats.calibratedEstimateProvenance;
                 }
             } else {
                 delete session.stats.calibratedEstimate;
                 delete session.stats.calibratedEstimateOrigin;
                 delete session.stats.calibratedEstimateModel;
+                delete session.stats.calibratedEstimateProvenance;
             }
         }
         session.stats.calibrationRing = ring;
@@ -1932,7 +2074,7 @@ export function noteOutboundContextEstimates(
 
 export function settleUsageReport(
     session: Session,
-    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number },
+    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number; model?: string; context?: number },
     localTextEstimate?: number,
 ): void {
     // #793: a zero-total sample carries no information (gateway placeholder or
@@ -1960,7 +2102,9 @@ export function settleUsageReport(
         // Net out this turn's compress credit: the post-compress re-request
         // re-sends the unfolded history, so its usage report over-reports the
         // context the NEXT request will actually carry (see stream.ts applyRanges).
-        session.stats.lastInputTokens = Math.max(0, s.total - (session.stats.compressCreditTokens ?? 0));
+        // An advisor reply bills several model calls; the context is what its last one read.
+        const contextTotal = s.context !== undefined && s.context > 0 ? s.context : s.total;
+        session.stats.lastInputTokens = Math.max(0, contextTotal - (session.stats.compressCreditTokens ?? 0));
         // #1569: calibration anchor for estimate-grade turns — written ONLY by
         // real upstream usage reports (all three response shapes funnel here),
         // never by estimate-grade samples or arming paths; dropped at native-
@@ -1980,6 +2124,56 @@ export function settleUsageReport(
         // it to demote the baseline when the current request routes elsewhere.
         const settleOrigin = normalizeUpstreamOrigin(s.upstream);
         if (settleOrigin !== undefined) session.stats.lastInputTokensOrigin = settleOrigin;
+        // Identity-fast-path: stamp which MODEL measured this baseline — the
+        // gate refuses to trust acceptance evidence across a model switch.
+        // Lanes that settle without an explicit model (streamed plugin pipes)
+        // fall back to metadata.lastModel: prepare re-covers it with the
+        // CURRENT request's model on every request, so in the normal case it
+        // is exactly this request's model (a concurrent interleaving can only
+        // produce one conservative demotion — the safe direction).
+        const stampedModel = typeof s.model === "string" && s.model !== "" ? s.model
+            : typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel
+            : undefined;
+        if (stampedModel !== undefined) session.stats.lastInputTokensModel = stampedModel;
+        // C4 (PR #7684): window ratchet — this session judged `stampedModel` on
+        // the anonymous DEFAULT window (recorded per request in
+        // metadata.windowFallbackModels, C4 site in src/server/handle.ts). A
+        // successful report that BILLed input beyond the window it was judged
+        // on proves the upstream window is bigger: raise the session-local
+        // window to 2× the observation, monotonically (never down, never below
+        // a previous raise). Declared / registry / operator windows are never
+        // in windowFallbackModels, so they are never touched. No ledgerSeq /
+        // table write — this is session metadata only.
+        if (stampedModel !== undefined) {
+            const fallbackWindows = (session.metadata.windowFallbackModels ?? {}) as Record<string, number>;
+            const judged = fallbackWindows[stampedModel];
+            // The proof is a bill BEYOND the judged window: an upstream that
+            // ACCEPTED more input than the window we judged on must be bigger
+            // than it. A bill inside the window (60% of a 200k default) proves
+            // nothing — ratcheting on 2× of any mid-window bill silently
+            // inflates every anonymous model's window past half-usage (#971
+            // e2e red: 120k billed vs 200k judged raised the session window to
+            // 240k and killed the output-headroom nudge).
+            if (typeof judged === "number" && Number.isFinite(judged) && session.stats.lastInputTokens > judged) {
+                const ratchet = (session.metadata.windowRatchet ?? {}) as Record<string, number>;
+                const current = Math.max(ratchet[stampedModel] ?? judged, judged);
+                // One anomalous giant bill (e.g. #6781's 43.3MB full resend) must not
+                // turn the session window into a permanent 2× of it in a single leap:
+                // a bill FAR beyond what even a 4×-judged window could contain is
+                // clamped to the 4× bound (the next over-window bill — judged against
+                // the raised value — re-raises monotonically within the same bound, so
+                // a genuinely large window still converges in bounded steps); a bill
+                // INSIDE the 4× bound is trusted at full 2× strength.
+                const trustedCeiling = 4 * judged;
+                let raised = Math.max(2 * session.stats.lastInputTokens, ratchet[stampedModel] ?? 0);
+                if (session.stats.lastInputTokens > trustedCeiling) raised = Math.min(raised, trustedCeiling);
+                if (raised > current) {
+                    ratchet[stampedModel] = raised;
+                    session.metadata.windowRatchet = ratchet;
+                    loggerLog("info", `[${session.id}] [window-ratchet] model=${stampedModel} billed ${session.stats.lastInputTokens} input beyond the judged window ${judged} — session window raised to ${raised} (${session.stats.lastInputTokens > trustedCeiling ? `clamped to the ${4}×-judged bound ${trustedCeiling} against one anomalous bill` : "2× the observation"}; monotonic, session-local)`);
+                }
+            }
+        }
         // #1933 F1: consume the pending pair — the local text estimate of the
         // payload THIS report bills, recorded at prepare time. Same route
         // required. Admitted samples (plausibility band) accumulate in a
@@ -1992,7 +2186,7 @@ export function settleUsageReport(
         // only ever overflows never settles a usage report, so without this the
         // local estimator's calibre never self-corrects and the same "fits"
         // verdict re-forwards the same doomed body forever.
-        ingestCalibrationPair(session, s.total, s.upstream);
+        ingestCalibrationPair(session, contextTotal, s.upstream);
         // #1820: a real usage-grade sample supersedes the post-rebuild meter
         // anchor immediately — no need to wait out its prepare budget.
         clearPostRebuildAnchor(session);
@@ -2036,7 +2230,29 @@ export function settleUsageReport(
     // responses request's label into an inert-but-misleading line field.
     const lastMode = s.protocol === "responses" ? (session.metadata?.[METADATA_LAST_RESPONSES_MODE] as unknown) : undefined;
     const led = getCacheLedger(session);
-    recordCacheSample(session, { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream, keyFp: curKeyFp, sysFp: curSysFp, canonFp: curCanonFp, effFp: curEffFp, mode: lastMode === "plugin" || lastMode === "proxy" ? lastMode : undefined });
+    const usageSample: UsageSample = { at: Date.now(), input: s.total, cached: s.reportedCached, output: s.output, protocol: s.protocol, upstream: s.upstream, keyFp: curKeyFp, sysFp: curSysFp, canonFp: curCanonFp, effFp: curEffFp, mode: lastMode === "plugin" || lastMode === "proxy" ? lastMode : undefined };
+    recordCacheSample(session, usageSample);
+    // Egress usage stream: the S row carries the EXACT sample arguments plus
+    // the model baseline as seen at settle time (replay re-runs the same
+    // call on the same ledger surface). M precedes S when this sample is the
+    // first known one after a boot boundary (rs=1). Append order == live
+    // mutation order — a fold that was ingested lazily inside THIS settle
+    // arrived earlier (detectNewFolds runs inside recordCacheSample), so its
+    // F row already precedes this S row; the eager stream site may land
+    // after a settle and then its F row correctly trails that S.
+    {
+        const usageLine = led.lines[led.lines.length - 1];
+        const usageEvents: EgressUsageEvent[] = [];
+        if (usageLine !== undefined && usageLine.rs === 1) usageEvents.push({ type: "M", at: usageLine.at });
+        if (usageLine !== undefined) {
+            usageEvents.push({ type: "S", at: usageLine.at, payload: { s: usageSample, model: typeof session.metadata?.lastModel === "string" && session.metadata.lastModel !== "" ? session.metadata.lastModel : undefined } });
+            const stats = usageStatsJson(led);
+            if (stats !== null && usageStatsSink) {
+                try { usageStatsSink(session.id, stats); } catch { /* the stream is truth — the stats row degrades, never the request */ }
+            }
+        }
+        emitUsageEvents(session, usageEvents);
+    }
     const capture = captures.getStore();
     const sample = led.lines[led.lines.length - 1];
     if (capture?.session === session && sample) {
@@ -2768,4 +2984,82 @@ function formatInvalidation(r: BiliCacheReport): string {
         out.push(`  initial bills (no prior baseline): ${r.initialBills.samples} sample(s) · ${fmtTok(r.initialBills.inputTokens)} tok — first request(s) of a session; booked as new content, not a prefix re-pay`);
     }
     return out.join("\n");
+}
+
+// ── Egress usage replay: reconstruct the ledger from the event stream ──
+// Called on session load for egress-on sessions whose in-memory ledger is
+// empty (fresh process). Re-applies the stream verbatim:
+//   M — arm the boot sentinel (any value ≠ BOOT_ID) so the following sample
+//       fires rs=1 exactly as it did live;
+//   F — re-push the fold via pushFold with closeFrom=0 (processing in
+//       op_seq order keeps "only the last push stays open", which is the
+//       live invariant across and within batches), then advance
+//       lastBlockId past the fold's block so detectNewFolds (inside the
+//       S re-run) finds nothing already-observed;
+//   S — re-run recordCacheSample with the recorded arguments, after
+//       temporarily pinning metadata.lastModel to the recorded model
+//       (a model switch mid-stream must replay the per-sample baseline,
+//       not the load-time value).
+// Returns the rebuilt ledger; the caller replaces whatever was under
+// LEDGER_KEY (which the bootstrap inside getCacheLedger would otherwise
+// seed with the current blocks' high-water — exactly what F replay then
+// walks back, but we start clean).
+const REPLAY_PRE_BOOT = "egress-usage-replay";
+export function rebuildCacheLedgerFromUsageEvents(
+    session: Session,
+    events: Array<{ type: "M" | "S" | "F"; at: number; payload?: unknown }>,
+): { lines: number; folds: number } {
+    const meta = session.metadata ?? (session.metadata = {});
+    const led: CacheLedger = {
+        v: 1,
+        lastBlockId: 0,
+        consumedFoldSeq: 0,
+        sampleSeq: 0,
+        foldSeqCounter: 0,
+        folds: [],
+        lines: [],
+        agg: { requests: 0, input: 0, cached: 0, output: 0, nc: 0, cr: 0, tr: 0, switches: 0, switchMissed: 0, effSwitches: 0, effSwitchMissed: 0, keySwitches: 0, keySwitchMissed: 0, promptSwitches: 0, promptSwitchMissed: 0, projSwitches: 0, projSwitchMissed: 0, wireSwitches: 0, wireSwitchMissed: 0, upstreamSwitches: 0, upstreamSwitchMissed: 0, restartDrops: 0, restartDropMissed: 0, attributedMissed: 0, unknownSamples: 0, unknownInput: 0, nbSamples: 0, nbInput: 0, seamSuspects: 0, seamMissed: 0, providerSideMisses: 0, providerSideMissed: 0, providerTtlMisses: 0, providerTtlMissed: 0, rewinds: 0, rewindMissed: 0, abortCorrelated: 0, clientInserts: 0, clientInsertMissed: 0, orphanSweepSeams: 0, orphanSweepMissed: 0 },
+    };
+    meta[LEDGER_KEY] = led;
+    // The loaded session's state.blocks is ALREADY fully materialized (the
+    // egress projection hands the whole history to load), so a replayed S
+    // would let detectNewFolds re-derive every block the stream is about to
+    // deliver — and deliver it twice (re-derived row with no geo, then the
+    // stored F row). Pre-seed the high-water from the stream's F rows: the
+    // ledger learns blocks from the STREAM, state.blocks is just their
+    // source of truth for prefixTokensBeforeRef.
+    for (const ev of events) {
+        if (ev.type === "F") {
+            const bid = (ev.payload as { bid?: unknown } | undefined)?.bid;
+            if (typeof bid === "string") led.lastBlockId = Math.max(led.lastBlockId, refNum(bid));
+        }
+    }
+    let appliedS = 0;
+    for (const ev of events) {
+        if (ev.type === "M") {
+            led.lastBoot = REPLAY_PRE_BOOT;
+            continue;
+        }
+        if (ev.type === "F") {
+            const p = ev.payload as UsageForkRow | undefined;
+            if (!p || typeof p.S !== "number" || typeof p.bid !== "string") continue;
+            pushFold(led, { at: typeof p.at === "number" ? p.at : ev.at, S: p.S, sigma: typeof p.sigma === "number" ? p.sigma : 0, X: typeof p.X === "number" ? p.X : undefined, V: typeof p.V === "number" ? p.V : undefined, Vp: typeof p.Vp === "number" ? p.Vp : undefined, bid: p.bid }, 0);
+            led.lastBlockId = Math.max(led.lastBlockId, refNum(p.bid));
+            continue;
+        }
+        if (ev.type !== "S") continue;
+        const p = ev.payload as { s?: UsageSample; model?: string } | undefined;
+        if (!p || !p.s || typeof p.s.input !== "number" || typeof p.s.at !== "number") continue;
+        const prevModel = meta.lastModel;
+        if (typeof p.model === "string" && p.model !== "") meta.lastModel = p.model;
+        try {
+            recordCacheSample(session, p.s);
+            appliedS += 1;
+        } finally {
+            if (typeof prevModel === "string" && prevModel !== "") meta.lastModel = prevModel;
+            else delete meta.lastModel;
+        }
+    }
+    if (appliedS > 0) led.lastBoot = BOOT_ID;
+    return { lines: led.lines.length, folds: led.folds.length };
 }

@@ -75,7 +75,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <section id="page-sessions" class="page" hidden>
 <div id="sessions-list-view">
 <div class="page-head"><div><h1 data-i18n="ses.title">${zh("ses.title")}</h1><div class="sub" data-i18n="ses.sub">${zh("ses.sub")}</div></div>
-<div class="ses-toolbar"><input id="ses-search" type="search" class="search" placeholder="${zh("ses.search_ph")}" data-i18n-ph="ses.search_ph"><select id="ses-protocol" class="ses-filter" data-i18n-title="ses.filter_protocol_tip" title="${zh("ses.filter_protocol_tip")}"></select><select id="ses-client" class="ses-filter" data-i18n-title="ses.filter_client_tip" title="${zh("ses.filter_client_tip")}"></select><select id="ses-state" class="ses-filter" data-i18n-title="ses.filter_state_tip" title="${zh("ses.filter_state_tip")}"><option value="" data-i18n="ses.filter_state_all">${zh("ses.filter_state_all")}</option><option value="live" data-i18n="ses.filter_state_live">${zh("ses.filter_state_live")}</option><option value="history" data-i18n="ses.filter_state_history">${zh("ses.filter_state_history")}</option></select><label class="ses-toggle" data-i18n-title="ses.filter_children_tip" title="${zh("ses.filter_children_tip")}"><input id="ses-children" type="checkbox"><span data-i18n="ses.filter_children">${zh("ses.filter_children")}</span></label><button id="ses-reset-filters" class="btn sm" data-i18n="ses.reset_filters">${zh("ses.reset_filters")}</button><button id="ses-refresh" class="btn sm"><span data-i18n="ses.refresh">${zh("ses.refresh")}</span></button></div></div>
+<div class="ses-toolbar"><input id="ses-search" type="search" class="search" placeholder="${zh("ses.search_ph")}" data-i18n-ph="ses.search_ph"><select id="ses-protocol" class="ses-filter" data-i18n-title="ses.filter_protocol_tip" title="${zh("ses.filter_protocol_tip")}"></select><select id="ses-client" class="ses-filter" data-i18n-title="ses.filter_client_tip" title="${zh("ses.filter_client_tip")}"></select><select id="ses-state" class="ses-filter" data-i18n-title="ses.filter_state_tip" title="${zh("ses.filter_state_tip")}"><option value="" data-i18n="ses.filter_state_all">${zh("ses.filter_state_all")}</option><option value="live" data-i18n="ses.filter_state_live">${zh("ses.filter_state_live")}</option><option value="history" data-i18n="ses.filter_state_history">${zh("ses.filter_state_history")}</option></select><select id="ses-kind" class="ses-filter" data-i18n-title="ses.filter_kind_tip" title="${zh("ses.filter_kind_tip")}"><option value="" data-i18n="ses.filter_kind_all">${zh("ses.filter_kind_all")}</option><option value="top" data-i18n="ses.filter_kind_top">${zh("ses.filter_kind_top")}</option><option value="child" data-i18n="ses.filter_kind_child">${zh("ses.filter_kind_child")}</option></select><label class="ses-toggle" data-i18n-title="ses.filter_children_tip" title="${zh("ses.filter_children_tip")}"><input id="ses-children" type="checkbox"><span data-i18n="ses.filter_children">${zh("ses.filter_children")}</span></label><button id="ses-reset-filters" class="btn sm" data-i18n="ses.reset_filters">${zh("ses.reset_filters")}</button><button id="ses-refresh" class="btn sm"><span data-i18n="ses.refresh">${zh("ses.refresh")}</span></button></div></div>
 <div class="ses-meta"><span id="ses-count" class="dim small"></span><span id="ses-empty-hint" class="dim small" hidden></span></div>
 <div class="card"><div class="card-b flush"><div class="twrap twide"><table class="data"><colgroup><col><col style="width:52px"><col style="width:84px"><col style="width:104px"><col style="width:48px"><col style="width:62px"><col style="width:62px"><col style="width:62px"><col style="width:190px"><col style="width:72px"><col style="width:48px"><col style="width:48px"><col style="width:56px"></colgroup><thead><tr>
 <th data-i18n="ses.th_title">${zh("ses.th_title")}</th><th data-i18n="ses.th_client">${zh("ses.th_client")}</th><th data-i18n="ses.th_proto">${zh("ses.th_proto")}</th><th data-i18n="ses.th_upstream">${zh("ses.th_upstream")}</th><th class="num" data-i18n="ses.th_reqs">${zh("ses.th_reqs")}</th><th class="num" data-i18n="ses.th_ctx">${zh("ses.th_ctx")}</th><th class="num" data-i18n="ses.th_input">${zh("ses.th_input")}</th><th class="num" data-i18n="ses.th_saved">${zh("ses.th_saved")}</th><th class="num" data-i18n="ses.th_hit">${zh("ses.th_hit")}</th><th class="num" title="${zh("ses.th_switches_tip")}" data-i18n-title="ses.th_switches_tip" data-i18n="ses.th_switches">${zh("ses.th_switches")}</th><th class="num" data-i18n="ses.th_folds">${zh("ses.th_folds")}</th><th class="num" data-i18n="ses.th_blocks">${zh("ses.th_blocks")}</th><th data-i18n="ses.th_seen">${zh("ses.th_seen")}</th>
@@ -162,14 +162,35 @@ export function renderPage(origin: string, version: string, embed = false, theme
 </dl>
 <p id="up-pending-hint" class="small" style="margin-top:10px;color:var(--amber)" hidden data-i18n="up.pending_hint">${zh("up.pending_hint")}</p>
 </div></div>
-<div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="up.notices">${zh("up.notices")}</span></div><div class="card-b"><div id="up-notices" class="dim small">—</div></div></div>
+<!-- #6804 follow-up: the notices list is long — collapsible card, OPEN by
+default (user request); only #up-notices is re-rendered on refresh, so the
+user's expand/collapse choice survives after the first toggle. -->
+<details class="card cl-card" open style="margin-top:16px"><summary class="cl-summary" data-i18n="up.notices">${zh("up.notices")}</summary><div class="card-b"><div id="up-notices" class="dim small">—</div></div></details>
 <div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="up.install">${zh("up.install")}</span></div><div class="card-b">
 <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
 <button id="up-upgrade-now" class="btn"><span id="up-upgrade-now-label" data-i18n="up.upgrade_none">${zh("up.upgrade_none")}</span></button>
 <select id="up-select" class="ses-filter"></select>
 <button id="up-install" class="btn" disabled><span data-i18n="up.install_selected">${zh("up.install_selected")}</span></button>
 </div>
+<!-- #6804: free-text install — any published version (master temp builds
+included); the dropdown above stays as the quick path. -->
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+<input id="up-version-input" class="field-input mono" type="text" placeholder="0.1.215 · 0.1.215-pr.202.1" spellcheck="false" style="min-width:240px">
+<button id="up-install-input" class="btn"><span data-i18n="up.install_input">${zh("up.install_input")}</span></button>
+</div>
 <p id="up-result" class="small" style="margin:0" hidden></p>
+</div></div>
+<!-- #6804: local version pin — hold the installed version; the auto-updater
+keeps checking + reporting but never installs. Temp builds are check-only
+even without a pin (the state line says so). -->
+<div class="card" style="margin-top:16px"><div class="card-h"><span data-i18n="up.pin">${zh("up.pin")}</span></div><div class="card-b">
+<div id="up-pin-state" class="small dim">—</div>
+<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px">
+<select id="up-pin-duration" class="ses-filter"></select>
+<button id="up-pin" class="btn"><span data-i18n="up.pin_now">${zh("up.pin_now")}</span></button>
+<button id="up-unpin" class="btn"><span data-i18n="up.unpin">${zh("up.unpin")}</span></button>
+</div>
+<p id="up-pin-result" class="small" style="margin:0" hidden></p>
 </div></div>
 <!-- #3719 phase 2: changelog card moved here from the overview page — same
 rendering/linkify in client.js into #changelog-body (collapsed by default). -->

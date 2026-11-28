@@ -17,6 +17,7 @@ operators with a real model endpoint and takes ~4-5h per round.
 | I | install | `npm i -g <tarball> --install-links` = **true copy** (no symlink leak, #1225), CLI reports candidate version | `docker-lanes.mjs` |
 | X | auto-update | publish a fake-newer build of the same commit → `bili update` **installs it** through `update.registry`, CLI lands on the new version | `docker-lanes.mjs` |
 | P | host lanes | real host CLIs (dsh/dsh-google/pi/opencode/codex/claude — four client-side wires: openai-chat, google, responses, anthropic) through bili **plugin mode**: traffic hits the upstream, compress tools are live on the wire, nudge lands on-wire, fold fires + markers recalled (details below) | `plugin-lanes.mjs` |
+| W | wire switch | the egress plane's single-model single-wire assumption is the one the gate never covered (#7439; symptom issues #6781/#7102/#6957/#4920 are all sessions that switched). Lane W drives the candidate plugin-mode like a switching host (wire-aligned `biliMsgIds`, per-request window) against the REAL model and changes the wire MID-SESSION on the same conversation: t1 big-window corpus with 12 markers (must echo) → t2 small-window fold pressure (no 500/422) → t3 switch to `/v1/messages` — markers must be recalled THROUGH the switch (cross-lane rendering + flow replay on real bytes) → t4 switch to `/v1/responses` (switch #2, same contract). Hard assertions: 200 only, the recorder saw the target wire's POST (wire truth, not bili's log), `[lane-switch]` line with the right from→to pair, no pin-rejection/unreadable line. A missing upstream door degrades that one switch to env-blocked (same rule as the dsh wire variants) | `wire-lanes.mjs` |
 | R | restart | a long session is first forced over its context wall (default 16384-token small window ⇒ fold with headroom; smaller walls are structurally infeasible — the folded steady state sits around ~20k tokens and preflight refuses turns it cannot bring under) while a real model answers; **claude** (opt-in via `agentsR`) adds the anthropic wire to the matrix — a prefix-topology lane where the harness-managed proxy child is killed and re-established on the same port, and the session must resume; then it is killed repeatedly and must keep working: **dsh** — the self-spawned proxy child is killed via kill -15 / kill -9 / clean shutdown, each respawn resumes the same session from disk, outbound stays well below raw-history size *and* above a bare-greeting floor (compact AND non-empty), exactly one live proxy holds the session (no split-brain); **pi** — the engine runs inline inside the pi CLI, so the kill matrix hits the pi host process itself mid-turn. A marker word from the recent zone is re-asked after every kill (evidence line — verbatim-through-fold quality is Lane A's assertion), and upstream `cached_tokens` must recover ≥50% of prior prompt tokens when reported | `restart-lanes.mjs` |
 
 ## The secret/endpoint contract
@@ -53,10 +54,11 @@ clones from — keeps container egress at zero and works behind host git
 proxies), `gitProxy`, `npmRegistry` (deps mirror for the build; unrelated to
 the in-container lane registry), `turnTimeoutMs`, `agents` (Lane P set),
 `agentsR` (Lane R set; default `dsh,pi`, add `claude` for the anthropic-wire lane),
-`snapBase` (P/R lanes only: run the candidate's snapBase egress plane ON in the
-gate's bili.json — `"all"` = every protocol cohort, `"openai,responses,anthropic,google"`
-subset = explicit cohorts, absent/`"off"` = off, byte-identical gate; for
-candidate-branch verification, e.g. #6785), `laneScript` (P lanes only: force a
+`snapBase` (P/R lanes only: run the candidate's EGRESS op-log plane ON in the
+gate's bili.json — writes `rollout.features.egressPlane=true`; `storage.snapBase`
+was retired in bc51c9445 and the plane has no per-protocol cohort, so any
+on-value turns the whole plane on; absent/`"off"` = off, byte-identical gate;
+for candidate-branch verification, e.g. #6785), `laneScript` (P lanes only: force a
 specific harness-script copy, e.g. the bundled `/gate-tools/plugin-lanes.mjs` —
 needed when the candidate checkout predates a harness fix; default is the
 candidate's OWN `scripts/gate/plugin-lanes.mjs`, bundled copy as fallback),
