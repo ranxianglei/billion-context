@@ -283,3 +283,64 @@ test("e2e #4079 both-ways: bodies under the doom bars still forward — includin
         rmrf(root);
     }
 });
+
+test("e2e #6844 (re-pinned #7537/#7168): a model-hidden DSH field is stripped before the meter, and an oversized unknown field is forwarded to the upstream's verdict", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "bili-6844-"));
+    const { ctx, calls, close } = await setup();
+    try {
+        // Incident #6844's shape: DSH attaches `dsh_session_log` (up to 8 MiB,
+        // documented as staying outside model input) as a top-level body field.
+        // No `model` in the body → preflight skipped → forward() is the last
+        // line. Pre-#6844 the meter counted the hidden field into `other` and
+        // the egress fuse 413'd a normal request. Two master changes since then
+        // make the false-refusal impossible at BOTH layers: #7168/#7439 strips
+        // top-level `dsh_*` before the body is measured or forwarded (default
+        // intercept, `passDshExtensions` 0%), and #7537 retired the local size
+        // refusal — the meter now only logs evidence, the upstream decides. So
+        // a model-hidden DSH field can no longer doom a request: it is stripped
+        // and the small visible content forwards.
+        const r = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers },
+            body: JSON.stringify({
+                stream: true,
+                messages: [{ role: "user", content: "hello" }],
+                dsh_session_log: "L".repeat(5_000_000),
+            }),
+        });
+        assert.equal(r.status, 200, `a model-hidden DSH field must not doom the request (got ${r.status})`);
+        await r.text();
+        assert.equal(calls.length, 1, "the body forwarded to the upstream");
+        // THE strip under test: the 5MB dsh_session_log never rides upstream —
+        // the forwarded call is the small visible content, not the log.
+        assert.ok(calls[0]!.bytes < 2_000_000, `the dsh_session_log was stripped before forward (upstream saw ${calls[0]!.bytes}B)`);
+
+        // Gate discipline (#3617): an UNKNOWN top-level field is NOT stripped —
+        // the intercept is a documented `dsh_*` allowlist, not a hole — so it
+        // rides to the upstream byte-exact and the upstream's own size verdict
+        // passes through annotated (#7537). The meter exempts no unknown field.
+        const doomed = await fetch(ctx.url, {
+            method: "POST",
+            headers: { ...ctx.headers },
+            body: JSON.stringify({
+                stream: true,
+                messages: [{ role: "user", content: "hello" }],
+                custom_extension: "E".repeat(5_000_000),
+            }),
+        });
+        assert.equal(doomed.status, 413, `an oversized unknown field is forwarded and the upstream's size verdict passes through (got ${doomed.status})`);
+        const body = await doomed.text();
+        const parsed = JSON.parse(body) as { error?: { code?: string; message?: string } };
+        assert.match(parsed.error?.message ?? "", /upstream says: request entity too large/, "the 413 is the UPSTREAM's message, not a local refusal");
+        assert.equal(doomed.headers.get("x-bili-cause"), "upstream-size", "the annotation names the size verdict");
+        assert.equal(doomed.headers.get("x-bili-retryable"), "false", "non-retryable — the unknown field won't change on retry");
+        // THE behavior under test: the unknown-field body WAS forwarded (the
+        // meter is an evidence logger, not a judge, #7537) — exactly one call
+        // carries the full 5MB body (the first call was the stripped small one).
+        const forwardedFull = calls.filter((c) => c.bytes >= 2_000_000);
+        assert.equal(forwardedFull.length, 1, `upstream must see the full unknown-field body exactly once (got calls: ${JSON.stringify(calls.map((c) => c.bytes))})`);
+    } finally {
+        await close();
+        rmrf(root);
+    }
+});
